@@ -17,6 +17,7 @@ from maths_ai.pln_inference.metta.translator.translator_modules.runner import Dy
 
 from maths_ai.hybrid_reasoner.hypergraph import ProofHypergraph, ProofNode, TacticExecutor, TacticOutcome
 from maths_ai.core.config import settings
+from maths_ai.gnn_inference.atp_lean_gnn.reporting import console_print
 
 _INACCESSIBLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*✝[⁰-⁹¹²³]*")
 
@@ -458,7 +459,18 @@ async def main(
     top_k_subgoals: int = 3,
 
 ) -> None:
-    server = await Server.create()
+    # Use Mathlib project if available
+    mathlib_project = settings.root_dir / "maths_ai" / "lean_mathlib"
+    server_kwargs = {}
+    if (mathlib_project / "lakefile.lean").exists():
+        server_kwargs["project_path"] = str(mathlib_project)
+        server_kwargs["imports"] = ["Init", "Mathlib"]
+        console_print(f"  Using Mathlib project: {mathlib_project}")
+    else:
+        console_print("  No Mathlib project found. Only core Lean theorems supported.")
+        console_print(f"  To enable Mathlib: cd {mathlib_project} && lake update && lake build")
+    
+    server = await Server.create(**server_kwargs)
     
     # Auto-load DTS state from default location if not specified
     if dts_state_input is None and settings.dts_state_file.exists():
