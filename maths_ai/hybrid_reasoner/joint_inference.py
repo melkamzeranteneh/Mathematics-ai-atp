@@ -460,7 +460,7 @@ async def main(
 
 ) -> None:
     # Use Mathlib project if available
-    mathlib_project = settings.root_dir / "maths_ai" / "lean_mathlib"
+    mathlib_project = settings.root_dir / "lean_mathlib"
     server_kwargs = {}
     if (mathlib_project / "lakefile.lean").exists():
         server_kwargs["project_path"] = str(mathlib_project)
