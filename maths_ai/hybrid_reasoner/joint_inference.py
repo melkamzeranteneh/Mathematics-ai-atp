@@ -515,13 +515,27 @@ async def main(
         print(repr(h))
     try:
         proof_graph = await hybrid_reasoner.prove(goal_statement, hypotheses=hypotheses)
-        print(proof_graph.summary())
         if proof_graph.is_solved():
-            print("Proof found!")
+            print("\n✅ Proof found!")
             print(proof_graph.proof_trace())
         else:
+            print("\n❌ Proof NOT found.")
+            # Print the deepest path tried
+            deepest = max(proof_graph.nodes.values(), key=lambda n: n.depth)
+            path = proof_graph.tactic_path(deepest.id)
+            print(f"\nDeepest node: {deepest.id} (depth {deepest.depth})")
+            print(f"Goal: {deepest.goal.expression}")
+            if path:
+                print(f"\nTactic path ({len(path)} steps):")
+                for i, step in enumerate(path):
+                    print(f"  {i+1}. {step}")
+            else:
+                print("  (root — no tactics applied)")
+            print(f"\nStatus: {deepest.status.value}")
+            if deepest.note:
+                print(f"Note: {deepest.note}")
+            print(proof_graph.summary())
             plot_hypergraph(proof_graph)
-            print("Proof not found within the given limits.")
     except Exception as e:
         print(f"An error occurred during proof search: {e}")
     finally:
