@@ -1,3 +1,5 @@
--- This file exists to make the project buildable
--- The actual imports are handled by Pantograph at runtime
 import Init
+
+def main (args : List String) : IO UInt32 := do
+  IO.println "MathlibAtp environment initialized successfully!"
+  return 0
