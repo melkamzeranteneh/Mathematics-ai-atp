@@ -184,14 +184,13 @@ class DAGBuilder:
 
                 if binder_kind != BINDER_KIND_UNKNOWN:
                     # This is App(∀/∃/λ, body)
-                    # The variable is in the second child's subtree
-                    # e.g., App(∀, App(App(q, :), Prop))
-                    #   kids[0] = ∀ (binder symbol)
-                    #   kids[1] = App(App(q, :), Prop) (variable + type + body)
-                    # Variable is at depth+1 inside the binder
+                    # kids[0] = binder symbol (∀/∃/λ)
+                    # kids[1] = the variable+type subtree, whose body may
+                    #            contain nested foralls that also need annotating.
                     self._annotate_binder_var(kids[1], depth + 1, binder_kind, children_of)
-                    # Continue into the body (skip the variable subtree entirely)
-                    # The body is the second child, which we just annotated
+                    # Continue into ALL children so nested foralls and the body are reached
+                    for kid in kids:
+                        _walk(kid, depth + 1)
                     return
 
             # Regular node: recurse into children
@@ -210,59 +209,122 @@ class DAGBuilder:
         self, node_id: int, depth: int, binder_kind: int,
         children_of: dict[int, list[int]]
     ) -> None:
-        """Annotate the variable node inside a binder (∀/∃/λ).
+        """Annotate variable nodes inside a binder (∀/∃/λ).
 
-        For ``∀ (q : Prop)``, the structure is:
+        Handles both single-variable ``(q : Prop)`` and multi-variable
+        ``(A B : Set α)`` declarations.
+
+        For single-variable ``∀ (q : Prop)``:
             App(∀, App(App(q, :), Prop))
-            └─ ∀ is the first child of the App node
-               └─ App(App(q, :), Prop) is the second child
-                  └─ App(q, :) is the first child
-                     └─ q is the variable being bound (leaf node)
+            q is annotated with depth and binder_kind.
 
-        We need to find the leaf variable node and annotate it.
+        For multi-variable ``∀ (A B : Set α)``:
+            App(∀, App(App(App(A, B), :), App(Set, α)))
+            Both A and B are annotated.
         """
-        node = self.nodes[node_id]
-        kids = children_of.get(node_id, [])
-
-        # If this is a leaf var node (the variable name), annotate it
-        # Exclude ':' and structural labels
         _EXCLUDE = {":", "App", "Arrow", "∀", "∃", "λ", "let", ","}
-        if (node.node_type == "var" and not kids
-                and node.label not in _EXCLUDE):
-            self.nodes[node_id] = GraphNode(
-                id=node.id,
-                label=node.label,
-                node_type=node.node_type,
-                children=node.children,
-                is_bound=1,
-                binder_depth=depth,
-                binder_kind=binder_kind,
-            )
+
+        # Step 1: Find the ':' node to split vars from type
+        colon_id: int | None = None
+
+        def _find_colon(nid: int) -> None:
+            nonlocal colon_id
+            n = self.nodes[nid]
+            if n.label == ":" and n.node_type == "var":
+                colon_id = nid
+                return
+            for k in children_of.get(nid, []):
+                if colon_id is not None:
+                    return
+                _find_colon(k)
+
+        _find_colon(node_id)
+
+        if colon_id is None:
+            # No colon found — try simple leaf annotation
+            node = self.nodes[node_id]
+            kids = children_of.get(node_id, [])
+            if (node.node_type == "var" and not kids
+                    and node.label not in _EXCLUDE):
+                self.nodes[node_id] = GraphNode(
+                    id=node.id, label=node.label,
+                    node_type=node.node_type, children=node.children,
+                    is_bound=1, binder_depth=depth, binder_kind=binder_kind,
+                )
             return
 
-        # If this is an App wrapping the variable (e.g., App(q, :)), recurse
-        for kid in kids:
-            kid_node = self.nodes[kid]
-            kid_kids = children_of.get(kid, [])
-            if kid_node.node_type == "var" and kid_node.label not in _EXCLUDE:
-                # This is likely the variable name - check if it's a leaf
-                if not kid_kids:
-                    # Leaf variable - annotate it
-                    self.nodes[kid] = GraphNode(
-                        id=kid_node.id,
-                        label=kid_node.label,
-                        node_type=kid_node.node_type,
-                        children=kid_node.children,
-                        is_bound=1,
-                        binder_depth=depth,
-                        binder_kind=binder_kind,
-                    )
-                else:
-                    # Non-leaf var - recurse to find the actual variable
-                    self._annotate_binder_var(kid, depth, binder_kind, children_of)
-            elif kid_node.label == "App":
-                # App node - recurse to find the variable inside
-                self._annotate_binder_var(kid, depth, binder_kind, children_of)
+        # Step 2: Collect all leaf variable names on the LEFT side of ':'
+        # These are the bound variables (A, B in App(App(A, B), :))
+        # Note: _classify_label may label short uppercase names as "type",
+        # but in a binder context they are bound variables.
+        var_ids: list[int] = []
+        _BINDER_VAR_TYPES = {"var", "type"}
+
+        def _collect_vars_left(nid: int) -> None:
+            """Collect leaf variable nodes from the binder declaration subtree.
+
+            Only collects variables from the side of ``:`` that contains them,
+            ignoring type-annotation siblings like ``Set α``.
+            """
+            if nid == colon_id:
+                return
+            n = self.nodes[nid]
+            nk = children_of.get(nid, [])
+
+            if (n.node_type in _BINDER_VAR_TYPES
+                    and n.label not in _EXCLUDE and not nk):
+                var_ids.append(nid)
+                return
+
+            if not nk:
+                return
+
+            # If colon is a direct child, collect other leaf var children
+            if colon_id in nk:
+                for k in nk:
+                    if k == colon_id:
+                        continue
+                    kn = self.nodes[k]
+                    kk = children_of.get(k, [])
+                    if (kn.node_type in _BINDER_VAR_TYPES
+                            and kn.label not in _EXCLUDE and not kk):
+                        var_ids.append(k)
+                    elif kk:
+                        _collect_vars_left(k)
+                return
+
+            # Find which child subtree contains the colon, and only recurse there
+            def _contains_colon(nid_: int) -> bool:
+                if nid_ == colon_id:
+                    return True
+                for k in children_of.get(nid_, []):
+                    if _contains_colon(k):
+                        return True
+                return False
+
+            found = False
+            for k in nk:
+                if _contains_colon(k):
+                    _collect_vars_left(k)
+                    found = True
+                    break
+
+            # Fallback: if no child contains the colon, collect all leaf var descendants
+            # (handles App(App(a,b), c) at the variable level)
+            if not found:
+                for k in nk:
+                    _collect_vars_left(k)
+
+        _collect_vars_left(node_id)
+
+        # Step 3: Annotate all collected variable nodes
+        for vid in var_ids:
+            n = self.nodes[vid]
+            self.nodes[vid] = GraphNode(
+                id=n.id, label=n.label,
+                node_type=n.node_type, children=n.children,
+                is_bound=1, binder_depth=depth, binder_kind=binder_kind,
+            )
 
     def stats(self) -> GraphStats:
         return graph_stats(self)
