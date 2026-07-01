@@ -41,12 +41,17 @@ def _resolve_local_node_name(node: GraphNode, dag: DAGBuilder) -> str:
 
 
 def _extract_fresh_names_from_dag(dag: DAGBuilder) -> list[str]:
-    """Walk the DAG and collect fresh variable names from ∀-bound leaf nodes."""
+    """Walk the DAG and collect fresh variable names from ∀-bound leaf nodes.
+
+    Only returns variables at binder_depth == 1 (the outermost forall),
+    excluding variables nested inside type annotations like ``Set α``.
+    """
     from .graph import BINDER_KIND_FORALL
     return [
         node.label for node in dag.nodes
         if node.is_bound == 1 and node.binder_kind == BINDER_KIND_FORALL
-        and not node.children  # leaf variable node
+        and node.binder_depth == 1
+        and not node.children
     ]
 
 
