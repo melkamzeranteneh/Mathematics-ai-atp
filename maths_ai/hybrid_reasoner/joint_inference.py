@@ -531,7 +531,7 @@ async def main(
                     print(f"  {i+1}. {step}")
             else:
                 print("  (root — no tactics applied)")
-            print(f"\nStatus: {deepest.status.value}")
+            print(f"\nStatus: {deepest.status}")
             if deepest.note:
                 print(f"Note: {deepest.note}")
             print(proof_graph.summary())
