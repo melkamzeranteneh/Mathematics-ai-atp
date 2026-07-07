@@ -58,6 +58,52 @@
    )
 )
 !(compileadd kb 
+   (: (no_inverse rule-induction) 
+      (Implication 
+         (Premises 
+            (Implication 
+               (Premises ($chi)) 
+               (Conclusions ($phi))
+            )
+            (Implication 
+               (Premises ($chi)) 
+               (Conclusions ($psi))
+            )
+         ) 
+         (Conclusions 
+            (Implication 
+               (Premises ($phi)) 
+               (Conclusions ($psi))
+            )
+         )
+      ) 
+      (STV 0.5 0.4) 
+   )
+)
+!(compileadd kb 
+   (: (no_inverse rule-abduction) 
+      (Implication 
+         (Premises 
+            (Implication 
+               (Premises ($phi)) 
+               (Conclusions ($chi))
+            )
+            (Implication 
+               (Premises ($psi)) 
+               (Conclusions ($chi))
+            )
+         ) 
+         (Conclusions 
+            (Implication 
+               (Premises ($phi)) 
+               (Conclusions ($psi))
+            )
+         )
+      ) 
+      (STV 0.5 0.4)
+   )
+)
+!(compileadd kb 
    (: (no_inverse ax-2) 
       (Implication 
          (Premises (Implication 
