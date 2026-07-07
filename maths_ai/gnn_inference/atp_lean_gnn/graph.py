@@ -141,7 +141,6 @@ class DAGBuilder:
     def stats(self) -> GraphStats:
         return graph_stats(self)
 
-
 def graph_stats(dag: DAGBuilder) -> GraphStats:
     child_counts = dag.incoming_counts()
     parent_uses = dag.outgoing_counts()
@@ -156,7 +155,6 @@ def graph_stats(dag: DAGBuilder) -> GraphStats:
         max_children=max((child_counts[node.id] for node in dag.nodes), default=0),
         max_parent_uses=max((parent_uses[node.id] for node in dag.nodes), default=0),
     )
-
 
 # ---------------------------------------------------------------------------
 # S-expression → DAG conversion
@@ -217,10 +215,10 @@ def _sexp_walk(sexp, ctx: list[str], dag: DAGBuilder) -> int:
             binder_kind=binder_kind,
         )
 
-        # Type is evaluated BEFORE name is bound (standard de Bruijn)
-        ty_id = _sexp_walk(ty, ctx, dag)
-        # Body is evaluated AFTER name is bound (prepend: newest = index 0)
-        body_id = _sexp_walk(body, [name] + ctx, dag)
+        # Type and body — both may reference this binder via de Bruijn
+        ctx_with_var = ctx + [name]
+        ty_id = _sexp_walk(ty, ctx_with_var, dag)
+        body_id = _sexp_walk(body, ctx_with_var, dag)
 
         # (:forall name type body) — 3 children
         return dag.get_or_create(head, (var_id, ty_id, body_id))
@@ -278,15 +276,22 @@ def proof_state_to_dag(state: str | ProofState, *, sexp: str | None = None) -> D
     if sexp is not None:
         # New path: S-expression from pantograph
         dag = sexp_to_dag(sexp)
-        root_ids: list[int] = []
+        # The last node is the goal expression from _sexp_walk
+        goal_expr_id = dag.num_nodes - 1
 
+        # Hypothesis types are text strings from the text parser.
+        # Use ExprParser to decompose them into sub-expression nodes.
+        from .parser import ExprParser
+        _hyp_parser = ExprParser(dag)
+
+        root_ids: list[int] = []
         for hypothesis in parsed.hypotheses:
             name_node = dag.get_or_create(hypothesis.name, ())
-            type_node = dag.get_or_create(hypothesis.type_expr, ()) if hypothesis.type_expr else dag.get_or_create("?", ())
+            type_node = _hyp_parser.parse(hypothesis.type_expr) if hypothesis.type_expr else dag.get_or_create("?", ())
             hyp_node = dag.get_or_create("Hyp", (name_node, type_node))
             root_ids.append(hyp_node)
 
-        goal_node = dag.get_or_create("Goal", (dag.num_nodes - 1,))
+        goal_node = dag.get_or_create("Goal", (goal_expr_id,))
         root_ids.append(goal_node)
         dag.get_or_create("State", tuple(root_ids))
         return dag
