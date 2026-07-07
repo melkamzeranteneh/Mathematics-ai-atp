@@ -73,8 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     model.load_state_dict(adjusted_state_dict, strict=False)
     model = model.to(device)
 
-
-    # Build scorer and optionally load trained weights
+    # Build scorer and load trained weights
     scorer = PremiseScorer(hidden_dim=config.model.hidden_dim, mode=args.scorer_mode).to(device)
     if args.scorer_checkpoint:
         scorer_ckpt_path = Path(args.scorer_checkpoint)

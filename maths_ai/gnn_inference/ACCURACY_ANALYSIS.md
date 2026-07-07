@@ -115,6 +115,8 @@ In a hash-consed DAG, multiple nodes share labels. The ground-truth may referenc
 
 **Impact**: Noisy training signal for argument selection.
 
+**Fix**: Add global mean/max pooling alongside State node readout, or use attention-based readout.
+
 ---
 
 ### Issue 8: Inference bypasses TacticWithArgsClassifier.forward
