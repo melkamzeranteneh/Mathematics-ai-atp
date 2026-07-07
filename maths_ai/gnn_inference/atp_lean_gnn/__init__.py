@@ -14,7 +14,7 @@ from .analysis import analyze_saved_run, compare_saved_runs, load_metrics_histor
 from .cache import SplitReport, build_failure_record, build_json_payload
 from .cli import DEMO_STATE
 from .dataset import DatasetRow, iter_dataset_rows
-from .graph import DAGBuilder, GraphNode, GraphStats, dag_to_dict, graph_stats, lemma_statement_to_dag, proof_state_to_dag, write_dag_json
+from .graph import DAGBuilder, GraphNode, GraphStats, dag_to_dict, get_node_labels, graph_stats, lemma_statement_to_dag, proof_state_to_dag, sexp_to_dag, write_dag_json
 from .inference import InferencePipeline
 from .lemma_corpus import LemmaRecord, load_lemma_corpus, load_lemma_name_index
 from .labels import (
@@ -107,6 +107,7 @@ __all__ = [
     "dag_to_dict",
     "dag_to_pyg",
     "encode_tactic_name",
+    "get_node_labels",
     "evaluate_baseline_run",
     "evaluate_model",
     "evaluate_model_with_args",
@@ -131,6 +132,7 @@ __all__ = [
     "resolve_arg_targets_to_padded",
     "run_parser_audit",
     "run_preprocessing",
+    "sexp_to_dag",
     "train_baseline",
     "train_one_epoch_with_args",
     "train_one_epoch_with_premises",
