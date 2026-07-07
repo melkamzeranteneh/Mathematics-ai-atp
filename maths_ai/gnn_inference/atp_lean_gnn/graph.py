@@ -217,10 +217,10 @@ def _sexp_walk(sexp, ctx: list[str], dag: DAGBuilder) -> int:
             binder_kind=binder_kind,
         )
 
-        # Type and body — both may reference this binder via de Bruijn
-        ctx_with_var = ctx + [name]
-        ty_id = _sexp_walk(ty, ctx_with_var, dag)
-        body_id = _sexp_walk(body, ctx_with_var, dag)
+        # Type is evaluated BEFORE name is bound (standard de Bruijn)
+        ty_id = _sexp_walk(ty, ctx, dag)
+        # Body is evaluated AFTER name is bound (prepend: newest = index 0)
+        body_id = _sexp_walk(body, [name] + ctx, dag)
 
         # (:forall name type body) — 3 children
         return dag.get_or_create(head, (var_id, ty_id, body_id))
