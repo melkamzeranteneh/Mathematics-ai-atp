@@ -339,7 +339,7 @@ def proof_state_to_dag(
         for hyp, (hyp_name, hyp_sexp) in zip(parsed.hypotheses, hyp_sexps):
             name_node = dag.get_or_create(hyp_name or hyp.name, ())
             if hyp_sexp:
-                type_node = _sexp_walk(hyp_sexp, [], dag)
+                type_node = _sexp_walk(parse_sexp_string(hyp_sexp), [], dag)
             elif hyp.type_expr:
                 from .parser import ExprParser
                 _hyp_parser = ExprParser(dag)
