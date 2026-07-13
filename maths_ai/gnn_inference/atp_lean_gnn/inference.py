@@ -12,7 +12,7 @@ import torch
 from torch_geometric.data import Batch
 
 from .argument_selector import TacticWithArgsClassifier
-from .graph import DAGBuilder, GraphNode, proof_state_to_dag
+from .graph import DAGBuilder, GraphNode, proof_state_to_dag, goal_state_to_proof_state
 from .labels import get_tactic_arity
 from .lemma_corpus import LemmaRecord
 from .lemma_index import LemmaIndex
@@ -41,12 +41,17 @@ def _resolve_local_node_name(node: GraphNode, dag: DAGBuilder) -> str:
 
 
 def _extract_fresh_names_from_dag(dag: DAGBuilder) -> list[str]:
-    """Walk the DAG and collect fresh variable names from ∀-bound leaf nodes."""
+    """Walk the DAG and collect fresh variable names from ∀-bound leaf nodes.
+
+    Only returns variables at binder_depth == 1 (the outermost forall),
+    excluding variables nested inside type annotations like ``Set α``.
+    """
     from .graph import BINDER_KIND_FORALL
     return [
         node.label for node in dag.nodes
         if node.is_bound == 1 and node.binder_kind == BINDER_KIND_FORALL
-        and not node.children  # leaf variable node
+        and node.binder_depth == 1
+        and not node.children
     ]
 
 
@@ -160,6 +165,24 @@ class InferencePipeline:
         
         # 1. Graph construction
         dag = proof_state_to_dag(state)
+        return self._predict_from_dag(dag, top_k=top_k)
+
+    @torch.no_grad()
+    def predict_from_goal_state(self, goal_state, *, top_k: int = 1) -> InferenceResult:
+        """Predict tactics from a Pantograph GoalState with S-expressions.
+
+        This method extracts S-expressions from the GoalState (requires
+        patch_pantograph_for_sexp() to have been called) and builds the DAG
+        directly from S-expressions for both goal and hypothesis types.
+        """
+        from .graph import goal_state_to_proof_state, proof_state_to_dag
+        
+        text_state, hyp_sexps, goal_sexp = goal_state_to_proof_state(goal_state)
+        dag = proof_state_to_dag(text_state, goal_sexp=goal_sexp, hyp_sexps=hyp_sexps)
+        return self._predict_from_dag(dag, top_k=top_k)
+
+    def _predict_from_dag(self, dag: DAGBuilder, *, top_k: int = 1) -> InferenceResult:
+        """Core prediction logic from a pre-built DAG."""
         data = dag_to_pyg(dag, self.node_vocab)
         
         try:
@@ -348,3 +371,17 @@ class InferencePipeline:
             selected_argument_details=list(top1["selected_argument_details"]) if top1 else [],
             top_tactic_predictions=top_tactic_predictions,
         )
+
+    def predict_from_goal_state(
+        self, goal_state, *, top_k: int = 1
+    ) -> InferenceResult:
+        """Predict tactics from a Pantograph GoalState using S-expressions.
+
+        Requires Pantograph to be patched with `patch_pantograph_for_sexp()`
+        and Server created with `options={'printExprAST': True}`.
+        """
+        from .graph import goal_state_to_proof_state, proof_state_to_dag
+
+        text_state, hyp_sexps, goal_sexp = goal_state_to_proof_state(goal_state)
+        dag = proof_state_to_dag(text_state, goal_sexp=goal_sexp, hyp_sexps=hyp_sexps)
+        return self._predict_from_dag(dag, top_k=top_k)

@@ -17,6 +17,7 @@ from maths_ai.pln_inference.metta.translator.translator_modules.runner import Dy
 
 from maths_ai.hybrid_reasoner.hypergraph import ProofHypergraph, ProofNode, TacticExecutor, TacticOutcome
 from maths_ai.core.config import settings
+from maths_ai.gnn_inference.atp_lean_gnn.reporting import console_print
 
 _INACCESSIBLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*✝[⁰-⁹¹²³]*")
 
@@ -458,7 +459,18 @@ async def main(
     top_k_subgoals: int = 3,
 
 ) -> None:
-    server = await Server.create()
+    # Use Mathlib project if available
+    mathlib_project = settings.root_dir / "lean_mathlib"
+    server_kwargs = {}
+    if (mathlib_project / "lakefile.lean").exists():
+        server_kwargs["project_path"] = str(mathlib_project)
+        server_kwargs["imports"] = ["Init", "Mathlib"]
+        console_print(f"  Using Mathlib project: {mathlib_project}")
+    else:
+        console_print("  No Mathlib project found. Only core Lean theorems supported.")
+        console_print(f"  To enable Mathlib: cd {mathlib_project} && lake update && lake build")
+    
+    server = await Server.create(**server_kwargs)
     
     # Auto-load DTS state from default location if not specified
     if dts_state_input is None and settings.dts_state_file.exists():
@@ -503,13 +515,27 @@ async def main(
         print(repr(h))
     try:
         proof_graph = await hybrid_reasoner.prove(goal_statement, hypotheses=hypotheses)
-        print(proof_graph.summary())
         if proof_graph.is_solved():
-            print("Proof found!")
+            print("\n✅ Proof found!")
             print(proof_graph.proof_trace())
         else:
+            print("\n❌ Proof NOT found.")
+            # Print the deepest path tried
+            deepest = max(proof_graph.nodes.values(), key=lambda n: n.depth)
+            path = proof_graph.tactic_path(deepest.id)
+            print(f"\nDeepest node: {deepest.id} (depth {deepest.depth})")
+            print(f"Goal: {deepest.goal.expression}")
+            if path:
+                print(f"\nTactic path ({len(path)} steps):")
+                for i, step in enumerate(path):
+                    print(f"  {i+1}. {step}")
+            else:
+                print("  (root — no tactics applied)")
+            print(f"\nStatus: {deepest.status}")
+            if deepest.note:
+                print(f"Note: {deepest.note}")
+            print(proof_graph.summary())
             plot_hypergraph(proof_graph)
-            print("Proof not found within the given limits.")
     except Exception as e:
         print(f"An error occurred during proof search: {e}")
     finally:
