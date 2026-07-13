@@ -11,6 +11,52 @@ from maths_ai.pln_inference.metta.translator.translator_modules.parser import (
 )
 
 
+def patch_pantograph_for_sexp() -> None:
+    """Monkey-patch Pantograph to return S-expressions instead of pretty-printed strings.
+
+    After calling this, ``Goal.target`` and ``Variable.t`` will contain the
+    Lean S-expression (e.g. ``((:c Eq) (:c Nat) ...)``) instead of the
+    human-readable ``n = n`` form.
+
+    Must be called BEFORE creating a Server instance.
+    """
+    import pantograph.expr as expr_mod
+    import pantograph.server as server_mod
+
+    def _parse_expr_sexp(payload: dict) -> str:
+        return payload.get("sexp") or payload["pp"]
+
+    expr_mod.parse_expr = _parse_expr_sexp
+    server_mod.parse_expr = _parse_expr_sexp
+
+
+def goal_state_to_proof_state(goal_state) -> tuple[str, list[tuple[str, str | None]], str | None]:
+    """Extract proof state components from a Pantograph GoalState.
+
+    Returns (text_state, hyp_sexps, goal_sexp) where:
+
+    - ``text_state``: human-readable text for the proof state (backward compat)
+    - ``hyp_sexps``: list of ``(name, type_sexp)`` for each hypothesis
+    - ``goal_sexp``: S-expression of the goal type, or None
+
+    Requires ``patch_pantograph_for_sexp()`` to have been called first.
+    """
+    if not goal_state.goals:
+        return "", [], None
+
+    goal = goal_state.goals[0]
+    goal_sexp = goal.target  # Already an S-expression after patching
+    hyp_sexps = [(v.name or "_", v.t) for v in goal.variables]
+
+    # Build text representation for backward compatibility
+    lines = []
+    for v in goal.variables:
+        lines.append(f"{v.name or '_'} : {v.t}")
+    text_state = "\n".join(lines) + f"\n⊢ {goal_sexp}" if lines else f"⊢ {goal_sexp}"
+
+    return text_state, hyp_sexps, goal_sexp
+
+
 BINDER_KIND_UNKNOWN = -1
 BINDER_KIND_NONE = 0      # context variable (not bound in this goal)
 BINDER_KIND_FORALL = 1    # ∀ binder
@@ -265,22 +311,54 @@ def _sexp_leaf(token: str, ctx: list[str], dag: DAGBuilder) -> int:
 # Proof state → DAG (supports both old text parser and new S-expression path)
 # ---------------------------------------------------------------------------
 
-def proof_state_to_dag(state: str | ProofState, *, sexp: str | None = None) -> DAGBuilder:
+def proof_state_to_dag(
+    state: str | ProofState,
+    *,
+    sexp: str | None = None,
+    goal_sexp: str | None = None,
+    hyp_sexps: list[tuple[str, str | None]] | None = None,
+) -> DAGBuilder:
     """Build a DAG from a proof state.
 
-    If *sexp* is provided (S-expression from pantograph), uses the new
-    Lean AST parser.  Otherwise falls back to the old text-based parser.
+    Three calling conventions:
+
+    1. ``state`` is a text string → parse with ExprParser (old path).
+    2. ``sexp`` is provided → goal type parsed via ``_sexp_walk``.
+    3. ``goal_sexp`` + ``hyp_sexps`` are provided → both goal and hypothesis
+       types parsed via ``_sexp_walk`` (preferred path when Pantograph is
+       available with ``printExprAST: true``).
     """
     parsed = state if isinstance(state, ProofState) else parse_state(state)
 
-    if sexp is not None:
-        # New path: S-expression from pantograph
-        dag = sexp_to_dag(sexp)
-        # The last node is the goal expression from _sexp_walk
+    if goal_sexp is not None and hyp_sexps is not None:
+        # Best path: S-expressions for both goal and hypothesis types
+        dag = sexp_to_dag(goal_sexp)
         goal_expr_id = dag.num_nodes - 1
 
-        # Hypothesis types are text strings from the text parser.
-        # Use ExprParser to decompose them into sub-expression nodes.
+        root_ids: list[int] = []
+        for hyp, (hyp_name, hyp_sexp) in zip(parsed.hypotheses, hyp_sexps):
+            name_node = dag.get_or_create(hyp_name or hyp.name, ())
+            if hyp_sexp:
+                type_node = _sexp_walk(hyp_sexp, [], dag)
+            elif hyp.type_expr:
+                from .parser import ExprParser
+                _hyp_parser = ExprParser(dag)
+                type_node = _hyp_parser.parse(hyp.type_expr)
+            else:
+                type_node = dag.get_or_create("?", ())
+            hyp_node = dag.get_or_create("Hyp", (name_node, type_node))
+            root_ids.append(hyp_node)
+
+        goal_node = dag.get_or_create("Goal", (goal_expr_id,))
+        root_ids.append(goal_node)
+        dag.get_or_create("State", tuple(root_ids))
+        return dag
+
+    if sexp is not None:
+        # Goal has S-expression, hypothesis types use text parser
+        dag = sexp_to_dag(sexp)
+        goal_expr_id = dag.num_nodes - 1
+
         from .parser import ExprParser
         _hyp_parser = ExprParser(dag)
 
