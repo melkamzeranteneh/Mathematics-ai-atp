@@ -5,10 +5,11 @@ import torch
 
 from maths_ai.data_models.proof_components import TacticCandidate
 from maths_ai.gnn_inference.atp_lean_gnn.argument_selector import TacticWithArgsClassifier
+from maths_ai.gnn_inference.atp_lean_gnn.actor_critic import ActorCriticWithArgsClassifier, load_from_pointer_checkpoint
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import load_lemma_corpus
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import LemmaIndex
 from maths_ai.gnn_inference.atp_lean_gnn.premise_scoring import PremiseScorer
-from maths_ai.gnn_inference.atp_lean_gnn.training import load_baseline_config, load_prepared_metadata
+from maths_ai.gnn_inference.atp_lean_gnn.training import load_baseline_config, load_prepared_metadata, load_actor_critic_config
 
 from .model import GNNPredictor
 
@@ -20,6 +21,7 @@ class GNNModelEngine:
         tactic_predictor_model_path: Path,
         argument_predictor_model_path: Path,
         *,
+        model_type: str = "pointer",
         index_path: Optional[Path] = None,
         corpus_path: Optional[Path] = None,
         scorer_mode: str = "dot",
@@ -39,20 +41,44 @@ class GNNModelEngine:
         """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
-        config = load_baseline_config(config_path)
+        if model_type == "actor_critic":
+            config = load_actor_critic_config(config_path)
+        else:
+            config = load_baseline_config(config_path)
+
         metadata = load_prepared_metadata(config.prepared_root)
 
-        tactic_model = TacticWithArgsClassifier(
-            num_node_labels=len(metadata.node_vocab),
-            num_tactics=len(metadata.tactic_vocab),
-            hidden_dim=config.model.hidden_dim,
-            num_layers=config.model.num_layers,
-            dropout=config.model.dropout,
-            use_node_type=config.use_node_type,
-            max_args=getattr(config, "max_args", 3),
-        )
+        if model_type == "actor_critic":
+            tactic_model = ActorCriticWithArgsClassifier(
+                num_node_labels=len(metadata.node_vocab),
+                num_tactics=len(metadata.tactic_vocab),
+                hidden_dim=config.model.hidden_dim,
+                num_layers=config.model.num_layers,
+                dropout=config.model.dropout,
+                use_node_type=config.use_node_type,
+                max_args=getattr(config, "max_args", 3),
+            )
+        else:
+            tactic_model = TacticWithArgsClassifier(
+                num_node_labels=len(metadata.node_vocab),
+                num_tactics=len(metadata.tactic_vocab),
+                hidden_dim=config.model.hidden_dim,
+                num_layers=config.model.num_layers,
+                dropout=config.model.dropout,
+                use_node_type=config.use_node_type,
+                max_args=getattr(config, "max_args", 3),
+            )
+
         tactic_checkpoint = torch.load(tactic_predictor_model_path, map_location=self.device, weights_only=False)
-        tactic_model.load_state_dict(tactic_checkpoint.get("model_state_dict", tactic_checkpoint))
+        if model_type == "actor_critic":
+            state_dict = tactic_checkpoint.get("model_state_dict", tactic_checkpoint)
+            if any(k.startswith("actor.") for k in state_dict.keys()):
+                tactic_model.load_state_dict(state_dict)
+            else:
+                load_from_pointer_checkpoint(tactic_model, tactic_predictor_model_path, self.device)
+        else:
+            tactic_model.load_state_dict(tactic_checkpoint.get("model_state_dict", tactic_checkpoint))
+
         tactic_model = tactic_model.to(self.device)
         tactic_model.eval()
 

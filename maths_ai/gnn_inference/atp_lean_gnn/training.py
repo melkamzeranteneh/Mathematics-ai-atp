@@ -25,10 +25,14 @@ from .labels import UNKNOWN_TACTIC, get_tactic_arity
 from .model import GraphSAGEClassifierConfig, GraphSAGEStateClassifier
 from .pyg import NODE_TYPE_TO_ID
 from .reporting import console_print
+from .actor_critic import ActorCriticWithArgsClassifier, load_from_pointer_checkpoint
+from .actor_critic_training import build_param_groups, train_one_epoch_actor_critic, evaluate_model_actor_critic
+from .reward import MockRewardSource
 
 
 DEFAULT_BASELINE_CONFIG_PATH = Path("configs") / "baseline_graphsage_state.json"
 DEFAULT_POINTER_CONFIG_PATH = Path("configs") / "pointer_graphsage_state.json"
+DEFAULT_ACTOR_CRITIC_CONFIG_PATH = Path("configs") / "actor_critic_graphsage_state.json"
 REQUIRED_DATA_FIELDS = ("x", "node_type", "edge_index", "y", "split", "row_index", "tactic_name")
 REQUIRED_POINTER_DATA_FIELDS = REQUIRED_DATA_FIELDS + ("premise_mask", "arg_node_indices")
 
@@ -271,6 +275,135 @@ class PointerConfig:
 
 
 @dataclass(frozen=True)
+class ActorCriticConfig:
+    prepared_root: Path
+    run_root: Path
+    seed: int = 42
+    device: str = "auto"
+    edge_mode: str = "bidirectional"
+    use_node_type: bool = True
+    max_args: int = 3
+    arg_loss_weight: float = 0.5
+    critic_weight: float = 0.5
+    entropy_weight: float = 0.01
+    arg_lr_multiplier: float = 0.1
+    pretrained_pointer_checkpoint: str | None = None
+    model: TacticWithArgsConfig = field(default_factory=TacticWithArgsConfig)
+    training: TrainingLoopConfig = field(default_factory=TrainingLoopConfig)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ActorCriticConfig":
+        if "prepared_root" not in payload:
+            raise ValueError("Training config is missing the required 'prepared_root' field.")
+
+        model_payload = payload.get("model", {})
+        training_payload = payload.get("training", {})
+        return cls(
+            prepared_root=Path(payload["prepared_root"]),
+            run_root=Path(payload.get("run_root", "runs/actor_critic_gnn")),
+            seed=int(payload.get("seed", 42)),
+            device=str(payload.get("device", "auto")),
+            edge_mode=str(payload.get("edge_mode", "bidirectional")),
+            use_node_type=bool(payload.get("use_node_type", True)),
+            max_args=int(payload.get("max_args", 3)),
+            arg_loss_weight=float(payload.get("arg_loss_weight", 0.5)),
+            critic_weight=float(payload.get("critic_weight", 0.5)),
+            entropy_weight=float(payload.get("entropy_weight", 0.01)),
+            arg_lr_multiplier=float(payload.get("arg_lr_multiplier", 0.1)),
+            pretrained_pointer_checkpoint=payload.get("pretrained_pointer_checkpoint"),
+            model=TacticWithArgsConfig(
+                hidden_dim=int(model_payload.get("hidden_dim", 128)),
+                num_layers=int(model_payload.get("num_layers", 4)),
+                dropout=float(model_payload.get("dropout", 0.2)),
+                max_args=int(model_payload.get("max_args", 3)),
+                arg_loss_weight=float(model_payload.get("arg_loss_weight", 0.5)),
+            ),
+            training=TrainingLoopConfig(
+                batch_size=int(training_payload.get("batch_size", 32)),
+                epochs=int(training_payload.get("epochs", 20)),
+                learning_rate=float(training_payload.get("learning_rate", 1e-3)),
+                weight_decay=float(training_payload.get("weight_decay", 1e-4)),
+                grad_clip=float(training_payload.get("grad_clip", 1.0)),
+                log_every_batches=int(training_payload.get("log_every_batches", 100)),
+                num_workers=int(training_payload.get("num_workers", 2)),
+                pin_memory=bool(training_payload.get("pin_memory", True)),
+                persistent_workers=bool(training_payload.get("persistent_workers", True)),
+                prefetch_factor=int(training_payload.get("prefetch_factor", 2)),
+                use_amp=bool(training_payload.get("use_amp", True)),
+            ),
+        ).normalized()
+
+    def normalized(self) -> "ActorCriticConfig":
+        edge_mode = self.edge_mode.lower().strip()
+        if edge_mode not in {"forward", "bidirectional"}:
+            raise ValueError("Training config field 'edge_mode' must be either 'forward' or 'bidirectional'.")
+
+        device = self.device.lower().strip()
+        if device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("Training config field 'device' must be one of: auto, cpu, cuda.")
+
+        if self.model.hidden_dim < 1:
+            raise ValueError("Training config field 'model.hidden_dim' must be positive.")
+        if self.model.num_layers < 1:
+            raise ValueError("Training config field 'model.num_layers' must be positive.")
+        if self.max_args < 1:
+            raise ValueError("Training config field 'max_args' must be positive.")
+        if self.arg_loss_weight < 0:
+            raise ValueError("Training config field 'arg_loss_weight' cannot be negative.")
+        if self.critic_weight < 0:
+            raise ValueError("Training config field 'critic_weight' cannot be negative.")
+        if self.entropy_weight < 0:
+            raise ValueError("Training config field 'entropy_weight' cannot be negative.")
+        if self.arg_lr_multiplier < 0:
+            raise ValueError("Training config field 'arg_lr_multiplier' cannot be negative.")
+        if self.training.batch_size < 1:
+            raise ValueError("Training config field 'training.batch_size' must be positive.")
+        if self.training.epochs < 1:
+            raise ValueError("Training config field 'training.epochs' must be positive.")
+        if self.training.learning_rate <= 0:
+            raise ValueError("Training config field 'training.learning_rate' must be positive.")
+        if self.training.weight_decay < 0:
+            raise ValueError("Training config field 'training.weight_decay' cannot be negative.")
+        if self.training.grad_clip <= 0:
+            raise ValueError("Training config field 'training.grad_clip' must be positive.")
+
+        return ActorCriticConfig(
+            prepared_root=self.prepared_root.resolve(),
+            run_root=self.run_root.resolve(),
+            seed=self.seed,
+            device=device,
+            edge_mode=edge_mode,
+            use_node_type=self.use_node_type,
+            max_args=self.max_args,
+            arg_loss_weight=self.arg_loss_weight,
+            critic_weight=self.critic_weight,
+            entropy_weight=self.entropy_weight,
+            arg_lr_multiplier=self.arg_lr_multiplier,
+            pretrained_pointer_checkpoint=self.pretrained_pointer_checkpoint,
+            model=self.model,
+            training=self.training,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "prepared_root": str(self.prepared_root),
+            "run_root": str(self.run_root),
+            "seed": self.seed,
+            "device": self.device,
+            "edge_mode": self.edge_mode,
+            "use_node_type": self.use_node_type,
+            "max_args": self.max_args,
+            "arg_loss_weight": self.arg_loss_weight,
+            "critic_weight": self.critic_weight,
+            "entropy_weight": self.entropy_weight,
+            "arg_lr_multiplier": self.arg_lr_multiplier,
+            "pretrained_pointer_checkpoint": self.pretrained_pointer_checkpoint,
+            "model": self.model.to_dict(),
+            "training": self.training.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class PreparedMetadata:
     root: Path
     node_vocab: dict[str, int]
@@ -353,6 +486,27 @@ def load_pointer_config(
     if epochs_override is not None:
         payload.setdefault("training", {})["epochs"] = epochs_override
     return PointerConfig.from_dict(payload)
+
+
+def load_actor_critic_config(
+    config_path: str | Path = DEFAULT_ACTOR_CRITIC_CONFIG_PATH,
+    *,
+    prepared_root_override: str | Path | None = None,
+    run_root_override: str | Path | None = None,
+    epochs_override: int | None = None,
+) -> ActorCriticConfig:
+    config_file = Path(config_path)
+    if not config_file.exists():
+        raise FileNotFoundError(f"Training config file '{config_file}' does not exist.")
+
+    payload = _read_json(config_file)
+    if prepared_root_override is not None:
+        payload["prepared_root"] = str(prepared_root_override)
+    if run_root_override is not None:
+        payload["run_root"] = str(run_root_override)
+    if epochs_override is not None:
+        payload.setdefault("training", {})["epochs"] = epochs_override
+    return ActorCriticConfig.from_dict(payload)
 
 
 def load_prepared_metadata(prepared_root: str | Path) -> PreparedMetadata:
@@ -640,7 +794,20 @@ def build_pointer_model(metadata: PreparedMetadata, config: PointerConfig) -> Ta
     )
 
 
-def _use_cuda_amp(device: torch.device, config: BaselineConfig | PointerConfig) -> bool:
+def build_actor_critic_model(metadata: PreparedMetadata, config: ActorCriticConfig) -> ActorCriticWithArgsClassifier:
+    return ActorCriticWithArgsClassifier(
+        num_node_labels=len(metadata.node_vocab),
+        num_tactics=len(metadata.tactic_vocab),
+        num_node_types=len(NODE_TYPE_TO_ID),
+        hidden_dim=config.model.hidden_dim,
+        num_layers=config.model.num_layers,
+        dropout=config.model.dropout,
+        use_node_type=config.use_node_type,
+        max_args=config.max_args,
+    )
+
+
+def _use_cuda_amp(device: torch.device, config: BaselineConfig | PointerConfig | ActorCriticConfig) -> bool:
     return config.training.use_amp and device.type == "cuda"
 
 
@@ -803,9 +970,9 @@ def _create_run_dir(run_root: Path) -> Path:
 def _save_checkpoint(
     path: Path,
     *,
-    model: GraphSAGEStateClassifier | TacticWithArgsClassifier,
+    model: GraphSAGEStateClassifier | TacticWithArgsClassifier | ActorCriticWithArgsClassifier,
     optimizer: AdamW,
-    config: BaselineConfig | PointerConfig,
+    config: BaselineConfig | PointerConfig | ActorCriticConfig,
     epoch: int,
     val_metrics: dict[str, float | int],
 ) -> Path:
@@ -1254,6 +1421,171 @@ def train_pointer(
     return summary
 
 
+def train_actor_critic(
+    config: ActorCriticConfig,
+    *,
+    resume_run_dir: str | Path | None = None,
+) -> dict[str, object]:
+    """Train actor-critic GNN tactic predictor via Actor-Critic RL."""
+    metadata = load_prepared_metadata(config.prepared_root)
+    set_seed(config.seed)
+    device = resolve_device(config.device)
+    use_amp = _use_cuda_amp(device, config)
+    datasets, loaders = build_dataloaders(metadata, config, required_fields=REQUIRED_POINTER_DATA_FIELDS)
+
+    if resume_run_dir is None:
+        run_dir = _create_run_dir(config.run_root)
+        config_path = _write_json(run_dir / "config.json", config.to_dict())
+        start_epoch = 1
+        best_epoch = 0
+        best_val_loss = float("inf")
+    else:
+        run_dir = Path(resume_run_dir).resolve()
+        if not run_dir.exists():
+            raise FileNotFoundError(f"Resume run directory '{run_dir}' does not exist.")
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"Resume run path '{run_dir}' is not a directory.")
+        config_path = run_dir / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Resume run directory '{run_dir}' is missing 'config.json'.")
+        start_epoch = 1
+        best_epoch = 0
+        best_val_loss = float("inf")
+
+    metrics_path = run_dir / "metrics.jsonl"
+    best_checkpoint_path = run_dir / "best.pt"
+    last_checkpoint_path = run_dir / "last.pt"
+
+    model = build_actor_critic_model(metadata, config).to(device)
+
+    if config.pretrained_pointer_checkpoint is not None:
+        console_print(f"  Loading pretrained pointer checkpoint: {config.pretrained_pointer_checkpoint}")
+        load_from_pointer_checkpoint(model, config.pretrained_pointer_checkpoint, device)
+
+    param_groups = build_param_groups(model, config.training.learning_rate, config.arg_lr_multiplier)
+    optimizer = AdamW(
+        param_groups,
+        lr=config.training.learning_rate,
+        weight_decay=config.training.weight_decay,
+    )
+    grad_scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+
+    if resume_run_dir is not None:
+        if not last_checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"Resume run directory '{run_dir}' is missing 'last.pt', so training cannot resume."
+            )
+        last_checkpoint = _load_checkpoint(last_checkpoint_path, device=device)
+        model.load_state_dict(last_checkpoint["model_state_dict"])
+        optimizer.load_state_dict(last_checkpoint["optimizer_state_dict"])
+        start_epoch = int(last_checkpoint["epoch"]) + 1
+        if best_checkpoint_path.exists():
+            best_checkpoint = _load_checkpoint(best_checkpoint_path, device=device)
+            best_epoch = int(best_checkpoint["epoch"])
+            best_val_loss = float(
+                dict(best_checkpoint.get("val_metrics", {})).get("total_loss", float("inf"))
+            )
+
+    console_print(f"\n  Training Actor-Critic run in : {run_dir}")
+    console_print(f"  Prepared cache              : {config.prepared_root}")
+    console_print(f"  Device                      : {device}")
+    console_print(f"  AMP enabled                 : {use_amp}")
+    console_print(
+        f"  Split sizes                 : train={len(datasets['train'])}, "
+        f"val={len(datasets['val'])}, test={len(datasets['test'])}"
+    )
+
+    reward_source = MockRewardSource()
+
+    for epoch in range(start_epoch, config.training.epochs + 1):
+        train_metrics = train_one_epoch_actor_critic(
+            model,
+            loaders["train"],
+            reward_source=reward_source,
+            optimizer=optimizer,
+            grad_scaler=grad_scaler,
+            device=device,
+            grad_clip=config.training.grad_clip,
+            epoch=epoch,
+            total_epochs=config.training.epochs,
+            log_every_batches=config.training.log_every_batches,
+            use_amp=use_amp,
+            pin_memory=config.training.pin_memory,
+            critic_weight=config.critic_weight,
+            entropy_weight=config.entropy_weight,
+            arg_loss_weight=config.arg_loss_weight,
+        )
+        val_metrics = evaluate_model_actor_critic(
+            model,
+            loaders["val"],
+            reward_source=reward_source,
+            device=device,
+            split_name="val",
+            log_every_batches=config.training.log_every_batches,
+            use_amp=use_amp,
+            pin_memory=config.training.pin_memory,
+            critic_weight=config.critic_weight,
+            entropy_weight=config.entropy_weight,
+            arg_loss_weight=config.arg_loss_weight,
+        )
+
+        _append_jsonl(metrics_path, {"epoch": epoch, "train": train_metrics, "val": val_metrics})
+        _save_checkpoint(
+            last_checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            config=config,
+            epoch=epoch,
+            val_metrics=val_metrics,
+        )
+
+        val_loss = val_metrics["total_loss"]
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            _save_checkpoint(
+                best_checkpoint_path,
+                model=model,
+                optimizer=optimizer,
+                config=config,
+                epoch=epoch,
+                val_metrics=val_metrics,
+            )
+            console_print(f"    --> Saved new best checkpoint (epoch={epoch}, total_loss={val_loss:.4f})")
+
+    # Evaluate test split with best checkpoint
+    console_print(f"\n  Training completed. Loading best checkpoint from epoch {best_epoch} for test evaluation...")
+    best_checkpoint = _load_checkpoint(best_checkpoint_path, device=device)
+    model.load_state_dict(best_checkpoint["model_state_dict"])
+    test_metrics = evaluate_model_actor_critic(
+        model,
+        loaders["test"],
+        reward_source=reward_source,
+        device=device,
+        split_name="test",
+        log_every_batches=config.training.log_every_batches,
+        use_amp=use_amp,
+        pin_memory=config.training.pin_memory,
+        critic_weight=config.critic_weight,
+        entropy_weight=config.entropy_weight,
+        arg_loss_weight=config.arg_loss_weight,
+    )
+    _write_eval_file(run_dir, split="test", metrics={"split": "test", "epoch": best_epoch, **test_metrics})
+    _write_eval_file(run_dir, split="val", metrics={"split": "val", "epoch": best_epoch, **val_metrics})
+
+    summary = {
+        "best_epoch": best_epoch,
+        "best_val_metrics": val_metrics,
+        "test_metrics": test_metrics,
+    }
+    _write_json(run_dir / "summary.json", summary)
+
+    console_print(f"  Validation eval summary     : {run_dir / 'eval_val.json'}")
+    console_print(f"  Test eval summary           : {run_dir / 'eval_test.json'}")
+    console_print(f"  Training summary            : {run_dir / 'summary.json'}")
+    return summary
+
+
 def evaluate_baseline_run(run_dir: str | Path, *, split: str) -> dict[str, object]:
     run_directory = Path(run_dir)
     if not run_directory.exists():
@@ -1304,9 +1636,9 @@ def build_train_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-type",
         type=str,
-        choices=["baseline", "pointer"],
+        choices=["baseline", "pointer", "actor_critic"],
         default="baseline",
-        help="Which model type to train (baseline GraphSAGE or pointer argument selector)",
+        help="Which model type to train (baseline GraphSAGE, pointer argument selector, or actor critic)",
     )
     parser.add_argument(
         "--config",
@@ -1389,6 +1721,20 @@ def train_main(argv: list[str] | None = None) -> int:
                     epochs_override=args.epochs,
                 )
                 train_pointer(config)
+        elif model_type == "actor_critic":
+            config_path = args.config or DEFAULT_ACTOR_CRITIC_CONFIG_PATH
+            if args.resume_run_dir:
+                resume_config_path = Path(args.resume_run_dir) / "config.json"
+                config = load_actor_critic_config(resume_config_path, epochs_override=args.epochs)
+                train_actor_critic(config, resume_run_dir=args.resume_run_dir)
+            else:
+                config = load_actor_critic_config(
+                    config_path,
+                    prepared_root_override=args.prepared_root,
+                    run_root_override=args.run_root,
+                    epochs_override=args.epochs,
+                )
+                train_actor_critic(config)
         else:
             console_print(f"  ERROR: Unknown model type '{model_type}'")
             return 1

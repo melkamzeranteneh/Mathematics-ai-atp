@@ -2,6 +2,7 @@ import asyncio
 import argparse
 import random
 import re
+import json
 from graphviz import Digraph
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -151,10 +152,10 @@ class HybridReasoner:
         dts_c: float = None,
         dts_random_seed: Optional[int] = None,
     ) -> None:
-        self.gnn_engine = GNNModelEngine(
+        self.gnn_engine = self._build_gnn_engine(
             config_path=config_path,
-            tactic_predictor_model_path=tactic_model_path,
-            argument_predictor_model_path=argument_model_path,
+            tactic_model_path=tactic_model_path,
+            argument_model_path=argument_model_path,
             index_path=index_path,
             corpus_path=corpus_path,
         )
@@ -197,10 +198,39 @@ class HybridReasoner:
         self.max_nodes = max_nodes
 
     # GNN side
-    def predict_next_tactic(self, sub_goal: str) -> List[TacticCandidate]:
+    def _build_gnn_engine(
+        self,
+        *,
+        config_path: Path,
+        tactic_model_path: Path,
+        argument_model_path: Path,
+        index_path: Optional[Path],
+        corpus_path: Optional[Path],
+    ) -> Optional[GNNModelEngine]:
+        """Construct the tactic-prediction engine.
+
+        Split out of ``__init__`` so subclasses can substitute a different
+        policy source: ``RLHybridReasoner`` overrides this to return ``None``
+        and instead drives ``predict_next_tactic`` from a live
+        ``ActorCriticTacticModel`` whose sampled actions must stay attached
+        to the training graph.
+        """
+        return GNNModelEngine(
+            config_path=config_path,
+            tactic_predictor_model_path=tactic_model_path,
+            argument_predictor_model_path=argument_model_path,
+            index_path=index_path,
+            corpus_path=corpus_path,
+        )
+
+    def predict_next_tactic(self, sub_goal: Goal) -> List[TacticCandidate]:
         """
             Args:
-                sub_goal: a string expression of the target sub_goal for which tactics are predicated for
+                sub_goal: the sanitized target sub_goal (expression plus its
+                    local hypotheses) for which tactics are predicted. The
+                    base engine only consumes ``sub_goal.expression``; the RL
+                    subclass featurizes the full ``Goal`` so its sampled
+                    arguments resolve against the same DAG the encoder saw.
             Returns:
                 up to `top_k_tactics` TacticCandidate(tactic_name, arguments, probability),
                 ranked by predicted probability, descending.
@@ -210,7 +240,7 @@ class HybridReasoner:
                 edge case) — callers must treat that as a dead branch, which
                 `_expand` below does via `graph.mark_node_exhausted`.
         """
-        return self.gnn_engine.inference(sub_goal, top_k=self.top_k_tactics)
+        return self.gnn_engine.inference(sub_goal.expression, top_k=self.top_k_tactics)
 
     # PLN side
     def _make_dts_key(self, parent_goal: str, tactic: TacticCandidate, subgoal: Goal) -> str:
@@ -231,7 +261,7 @@ class HybridReasoner:
         subgoal_trunc = subgoal.expression[:max_len] + "..." if len(subgoal.expression) > max_len else subgoal.expression
         return f"{parent_trunc} --[{tactic_str}]--> {subgoal_trunc}"
 
-    def rank_subgoals(
+    async def rank_subgoals(
         self,
         goal: str,
         sub_goals: List[Goal],
@@ -240,6 +270,11 @@ class HybridReasoner:
         gnn_probability: float = 1.0,
     ) -> List[RankedSubgoal]:
         """Score ``sub_goals`` with PLN and rank them best-first.
+
+        Now async: the per-subgoal PLN queries (blocking ``subprocess.run`` inside
+        ``PLNInference.evaluate``) are dispatched concurrently via ``evaluate_async`` +
+        ``asyncio.gather``, so scoring N subgoals overlaps their process waits instead of
+        serializing them, and the event loop stays free for other concurrent searches.
 
         Args:
             goal: the parent goal's expression — passed to PLN as extra
@@ -264,13 +299,20 @@ class HybridReasoner:
         they're true), not a guarantee that the subgoal is actually provable.
         It is the best automatic heuristic available, not ground truth.
         """
-        ranked: List[RankedSubgoal] = []
-        for subgoal in sub_goals:
-            result = self.petta_chainer.evaluate(
-                subgoal.expression,
-                hypotheses=[goal, *subgoal.hypotheses],
+        # Dispatch all PLN queries concurrently (off the event-loop thread).
+        results = await asyncio.gather(
+            *(
+                self.petta_chainer.evaluate_async(
+                    subgoal.expression,
+                    hypotheses=[goal, *subgoal.hypotheses],
+                )
+                for subgoal in sub_goals
             )
+        )
 
+        # DTS bookkeeping is cheap and stateful — process results sequentially, in order.
+        ranked: List[RankedSubgoal] = []
+        for subgoal, result in zip(sub_goals, results):
             stv = result.stv
             if (
                 self.pln_fallback_strategy == "thompson"
@@ -358,6 +400,25 @@ class HybridReasoner:
             state = await self.server.goal_tactic_async(state, f"intro {names}")
         return state
 
+    def _link(
+        self,
+        graph: ProofHypergraph,
+        node: ProofNode,
+        tactic: TacticCandidate,
+        ranked_subgoals: list,
+    ):
+        """Link one successful tactic application into the hypergraph and
+        return the created hyperedge (or ``None`` when ``add_edge`` refuses
+        the link, e.g. on cycle detection).
+
+        This is the single seam between search and training data collection:
+        ``RLHybridReasoner`` overrides it to associate the returned edge id
+        with the sampled action indices that produced ``tactic``, so the
+        train phase can recompute log-probabilities for exactly the edges
+        that made it into the graph.
+        """
+        return graph.add_edge(node.id, tactic, ranked_subgoals=ranked_subgoals)
+
     async def _expand(self, graph: ProofHypergraph, node: ProofNode) -> None:
         """Try each of the GNN's top-k tactics on ``node`` and link whatever
         survives (executor success) into the hypergraph as new hyperedges.
@@ -368,7 +429,7 @@ class HybridReasoner:
 
         sanitized = _sanitize_inaccessible_names(node.goal)
         print(f"  [GNN Input] goal={sanitized.expression}  hyps={sanitized.hypotheses}")
-        candidates = self.predict_next_tactic(sanitized.expression)
+        candidates = self.predict_next_tactic(sanitized)
         if not candidates:
             graph.mark_node_exhausted(node.id, note="GNN returned no viable tactic")
             return
@@ -388,11 +449,11 @@ class HybridReasoner:
             if not outcome.subgoals:
                 # "no-goal": this tactic fully discharges the goal (QED for this branch)
                 print(f"  [Tactic QED] no subgoals — branch closed!")
-                graph.add_edge(node.id, tactic, ranked_subgoals=[])
+                self._link(graph, node, tactic, ranked_subgoals=[])
                 continue
 
             print(f"  [PLN Ranking] scoring {len(outcome.subgoals)} subgoal(s)...")
-            ranked = self.rank_subgoals(
+            ranked = await self.rank_subgoals(
                 node.goal.expression, outcome.subgoals, tactic, gnn_probability=tactic.probability
             )
             print(f"  [PLN Done] ranked {len(ranked)} subgoal(s)")
@@ -400,15 +461,16 @@ class HybridReasoner:
                 print(f"    subgoal {i}: {rs.goal.expression} | stv=({rs.stv.strength:.3f}, {rs.stv.confidence:.3f}) | combined_rank={rs.combined_rank:.4f}")
 
             chosen = ranked[: self.top_k_subgoals]
-            graph.add_edge(
-                node.id,
+            self._link(
+                graph,
+                node,
                 tactic,
                 ranked_subgoals=[(candidate.goal, candidate.stv) for candidate in chosen],
             )
 
         if not any_applied:
             print(f"  [PLN Fallback] evaluating goal: {node.goal.expression}  hyps: {node.goal.hypotheses}")
-            pln_result = self.petta_chainer.evaluate(
+            pln_result = await self.petta_chainer.evaluate_async(
                 node.goal.expression,
                 hypotheses=[*node.goal.hypotheses],
             )

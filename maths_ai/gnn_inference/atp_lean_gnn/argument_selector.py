@@ -56,6 +56,98 @@ class ArgumentSelector(nn.Module):
         ``selected_emb`` — shape ``[B, H]``, the embedding of the argmax node
                            (used as context for the next autoregressive step).
         """
+        scores, padded_keys = self._score_nodes(
+            state_emb, tactic_emb, node_embeddings, premise_mask, batch_index, prev_arg_emb
+        )
+        batch_size = state_emb.size(0)
+        device = state_emb.device
+        with torch.no_grad():
+            selected_idx = scores.argmax(dim=1)  # [B]
+        selected_emb = padded_keys[torch.arange(batch_size, device=device), selected_idx]  # [B, H]
+        return scores, selected_emb
+
+    def sample_step(
+        self,
+        state_emb: Tensor,
+        tactic_emb: Tensor,
+        node_embeddings: Tensor,
+        premise_mask: Tensor,
+        batch_index: Tensor,
+        prev_arg_emb: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Sampling variant for on-policy RL (B2).
+
+        Return ``(arg_logits, selected_idx, log_prob, selected_emb)`` where ``selected_idx``
+        is SAMPLED from ``softmax(arg_logits)`` (not argmax), ``log_prob`` is its log-prob
+        under the pointer policy (carries gradient — this is the argument policy gradient),
+        and ``selected_emb`` is the sampled node's embedding for the next autoregressive step.
+        """
+        scores, padded_keys = self._score_nodes(
+            state_emb, tactic_emb, node_embeddings, premise_mask, batch_index, prev_arg_emb
+        )
+        batch_size = state_emb.size(0)
+        device = state_emb.device
+
+        dist = torch.distributions.Categorical(logits=scores)
+        selected_idx = dist.sample()          # [B]
+        log_prob = dist.log_prob(selected_idx)  # [B] — differentiable w.r.t. pointer params
+        selected_emb = padded_keys[torch.arange(batch_size, device=device), selected_idx]  # [B, H]
+        return scores, selected_idx, log_prob, selected_emb
+
+    def forced_step(
+        self,
+        state_emb: Tensor,
+        tactic_emb: Tensor,
+        node_embeddings: Tensor,
+        premise_mask: Tensor,
+        batch_index: Tensor,
+        forced_idx: Tensor,        # [B] long; -1 = no argument at this step for that sample
+        prev_arg_emb: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Teacher-forced variant for the train-phase log-prob recompute.
+
+        The collect phase stores only the sampled argument indices (ints); the train
+        phase re-runs the pointer under the CURRENT parameters and evaluates
+        ``log π(forced_idx)`` at each step, feeding the stored index's embedding
+        forward autoregressively — so the gradient matches the action actually
+        executed, without holding the search-time autograd graph.
+
+        Return ``(log_prob, selected_emb)``. Rows with ``forced_idx == -1`` (that
+        sample has fewer arguments than this step) or an out-of-range/masked index
+        contribute log-prob 0 and a zero embedding.
+        """
+        scores, padded_keys = self._score_nodes(
+            state_emb, tactic_emb, node_embeddings, premise_mask, batch_index, prev_arg_emb
+        )
+        batch_size = state_emb.size(0)
+        device = state_emb.device
+        max_nodes = scores.size(1)
+
+        valid = (forced_idx >= 0) & (forced_idx < max_nodes)
+        safe_idx = forced_idx.clamp(min=0, max=max_nodes - 1)
+        log_probs = torch.log_softmax(scores, dim=1)
+        gathered = log_probs.gather(1, safe_idx.unsqueeze(1)).squeeze(1)  # [B]
+        # A stored index landing on a masked (-inf) position yields -inf/NaN; drop it too.
+        valid = valid & torch.isfinite(gathered)
+        log_prob = torch.where(valid, gathered, torch.zeros_like(gathered))
+
+        selected_emb = padded_keys[torch.arange(batch_size, device=device), safe_idx]  # [B, H]
+        selected_emb = selected_emb * valid.unsqueeze(1).to(selected_emb.dtype)
+        return log_prob, selected_emb
+
+    def _score_nodes(
+        self,
+        state_emb: Tensor,        # [B, H]
+        tactic_emb: Tensor,        # [B, H]
+        node_embeddings: Tensor,   # [total_nodes, H]
+        premise_mask: Tensor,      # [total_nodes]  bool
+        batch_index: Tensor,       # [total_nodes]
+        prev_arg_emb: Tensor | None,  # [B, H] or None
+    ) -> tuple[Tensor, Tensor]:
+        """Shared scoring core: return ``(scores [B, N_max], padded_keys [B, N_max, H])``.
+
+        Non-premise / padding positions in ``scores`` are set to -inf.
+        """
         batch_size = state_emb.size(0)
         hidden_dim = state_emb.size(1)
         device = state_emb.device
@@ -98,13 +190,7 @@ class ArgumentSelector(nn.Module):
         # Mask out non-premise positions
         scores = scores.masked_fill(~padded_mask, float("-inf"))
 
-        # --- 4. Selected node embedding for autoregressive context ----
-        with torch.no_grad():
-            selected_idx = scores.argmax(dim=1)  # [B]
-
-        selected_emb = padded_keys[torch.arange(batch_size, device=device), selected_idx]  # [B, H]
-
-        return scores, selected_emb
+        return scores, padded_keys
 
 
 # ---------------------------------------------------------------------------

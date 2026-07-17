@@ -9,11 +9,13 @@ a directory of ``.metta``/``.log`` files.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import random
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -72,6 +74,7 @@ class PLNInference:
         fallback_high: float = 1.0,
         random_seed: Optional[int] = None,
         normalize_variables: bool = False,
+        max_concurrency: int = 8,
     ) -> None:
         self.petta_bin = petta_bin or os.environ.get("PETTA_BIN") or shutil.which("petta")
         self.axioms_path = Path(axioms_path) if axioms_path else _DEFAULT_AXIOMS_FILE
@@ -84,10 +87,36 @@ class PLNInference:
         self.fallback_high = fallback_high
         self._rng = random.Random(random_seed)
         self._normalizer = VariableNormalizer(normalize=normalize_variables)
+        # Bounded pool for off-loop execution of the blocking ``evaluate`` (see
+        # ``evaluate_async``). Bounded so concurrent proof searches cannot spawn an
+        # unbounded number of ``petta`` subprocesses. Created lazily.
+        self._max_concurrency = max_concurrency
+        self._executor: Optional[ThreadPoolExecutor] = None
 
-     
+
     # Public API
-     
+
+    async def evaluate_async(
+        self,
+        expression: str,
+        hypotheses: Optional[Sequence[str]] = None,
+        *,
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> PLNResult:
+        """Non-blocking ``evaluate``: run the blocking subprocess in a bounded thread pool.
+
+        ``evaluate`` calls ``subprocess.run`` (up to ``timeout`` seconds), which does not
+        yield and would freeze the event loop — stalling every other concurrent proof
+        search. ``subprocess.run`` releases the GIL while waiting on the ``petta`` process,
+        so a thread executor gives genuine concurrency here. The pool is bounded by
+        ``max_concurrency`` so many searches cannot spawn unbounded ``petta`` processes.
+        """
+        loop = loop or asyncio.get_running_loop()
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=self._max_concurrency)
+        hyps = list(hypotheses) if hypotheses is not None else None
+        return await loop.run_in_executor(self._executor, self.evaluate, expression, hyps)
+
     def evaluate(self, expression: str, hypotheses: Optional[Sequence[str]] = None) -> PLNResult:
         """Score ``expression``'s provability given ``hypotheses``.
 

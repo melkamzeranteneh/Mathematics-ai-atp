@@ -4,13 +4,14 @@ from maths_ai.gnn_inference.atp_lean_gnn.inference import InferencePipeline
 from maths_ai.gnn_inference.atp_lean_gnn.premise_scoring import PremiseScorer
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import LemmaIndex
 from maths_ai.gnn_inference.atp_lean_gnn.argument_selector import TacticWithArgsClassifier
+from maths_ai.gnn_inference.atp_lean_gnn.actor_critic import ActorCriticWithArgsClassifier
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import LemmaRecord
 
 
 class GNNPredictor:
     def __init__(
         self,
-        tactic_model: TacticWithArgsClassifier,
+        tactic_model: TacticWithArgsClassifier | ActorCriticWithArgsClassifier,
         argument_model: PremiseScorer,
         lemma_index: LemmaIndex,
         node_vocab: dict[str, int],

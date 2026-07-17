@@ -11,6 +11,7 @@ import torch
 from torch_geometric.data import Batch
 
 from .argument_selector import TacticWithArgsClassifier
+from .actor_critic import ActorCriticWithArgsClassifier
 from .graph import DAGBuilder, GraphNode, proof_state_to_dag
 from .labels import get_tactic_arity
 from .lemma_corpus import LemmaRecord
@@ -103,7 +104,7 @@ class InferencePipeline:
 
     def __init__(
         self,
-        model: TacticWithArgsClassifier,
+        model: TacticWithArgsClassifier | ActorCriticWithArgsClassifier,
         scorer: PremiseScorer,
         lemma_index: LemmaIndex,
         node_vocab: dict[str, int],
@@ -156,7 +157,10 @@ class InferencePipeline:
         node_embeddings = self.model.backbone.encode_nodes(batch)
         state_emb = self.model.backbone.readout(node_embeddings, batch)
         
-        tactic_logits = self.model.backbone.classifier(state_emb)
+        if hasattr(self.model, "actor"):
+            tactic_logits = self.model.actor(state_emb)
+        else:
+            tactic_logits = self.model.backbone.classifier(state_emb)
         tactic_probs = torch.softmax(tactic_logits.squeeze(0), dim=-1)
         top_candidates = _top_tactic_candidates(tactic_probs, self.id_to_tactic, top_k=top_k)
 
