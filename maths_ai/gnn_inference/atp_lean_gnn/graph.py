@@ -115,6 +115,7 @@ class GraphStats:
 def _classify_label(label: str) -> str:
     if not label:
         return "var"
+    # Text parser labels
     if label in ("App", "Arrow", "Forall", "Explicit"):
         return "app"
     if label in ("Hyp", "Goal", "State"):
@@ -125,6 +126,16 @@ def _classify_label(label: str) -> str:
         return "predicate"
     if label in ("+", "-", "*", "/", "=", "\u2264", "\u2265", "<", ">", "\u2227", "\u2228", "\u00ac"):
         return "operator"
+    # Pantograph S-expression labels
+    if label.startswith(":"):
+        if label in (":forall", ":lambda", ":let"):
+            return "sbinder"
+        if label in (":c", ":fv", ":sort", ":lit", ":app"):
+            return "sconst"
+        return "sconst"
+    # Pantograph application node
+    if label == "App":
+        return "sapp"
     return "var"
 
 

@@ -61,6 +61,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "splits": "train,val,test",
         "sample_per_split": None,
         "force": False,
+        "use_sexpr": False,
+        "project_path": "maths_ai/lean_mathlib",
     },
 
     "baseline": {
@@ -196,6 +198,8 @@ def run_prepare(config: dict[str, Any]) -> dict[str, Any]:
         output_root=output_root,
         sample_per_split=prepare_cfg["sample_per_split"],
         force=prepare_cfg["force"],
+        use_sexpr=prepare_cfg.get("use_sexpr", False),
+        project_path=prepare_cfg.get("project_path", "maths_ai/lean_mathlib"),
     )
 
     summary = run_preprocessing(cfg)

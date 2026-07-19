@@ -22,3 +22,8 @@ PeTTaChainer/
 
 .lake/
 
+thompson_sampler_state.json
+_*.py
+_mathlib_src_clean/
+_tmp_build/
+_work/

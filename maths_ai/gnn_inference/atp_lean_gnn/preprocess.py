@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 if __package__ in {None, ""}:
     repo_root = Path(__file__).resolve().parents[1]
@@ -26,8 +28,12 @@ from .cache import (
     write_summary_markdown,
     write_vocab,
 )
-from .dataset import DATASET_NAME, canonicalize_split_name, iter_dataset_rows
-from .preparation import prepare_example
+from .dataset import DATASET_NAME, DatasetRow, canonicalize_split_name, iter_dataset_rows
+from .preparation import (
+    prepare_example,
+    SExprCache,
+    replay_batch_sexpr,
+)
 from .labels import build_tactic_vocab, encode_tactic_name
 from .lemma_corpus import load_lemma_name_index
 from .pyg import build_vocab_from_labels, dag_to_pyg
@@ -39,12 +45,14 @@ DEFAULT_OUTPUT_ROOT = Path("artifacts") / "prepared" / "v1"
 
 @dataclass(frozen=True)
 class PreprocessConfig:
-    dataset_name: str = DATASET_NAME
+    dataset_name: str = "cat-searcher/leandojo-benchmark-4-random"
     splits: tuple[str, ...] = ("train", "val", "test")
-    output_root: Path = DEFAULT_OUTPUT_ROOT
+    output_root: Path = Path("artifacts") / "prepared" / "v1"
     sample_per_split: int | None = None
     lemma_corpus_path: Path | None = None
     force: bool = False
+    use_sexpr: bool = False
+    project_path: str = "maths_ai/lean_mathlib"
 
 
 def _normalize_splits(raw_splits: str | list[str] | tuple[str, ...]) -> list[str]:
@@ -68,22 +76,112 @@ def _normalize_splits(raw_splits: str | list[str] | tuple[str, ...]) -> list[str
     return ["train", *[split for split in splits if split != "train"]]
 
 
+def _load_rows(
+    dataset_name: str,
+    split: str,
+    sample_limit: int | None = None,
+) -> list[DatasetRow]:
+    """Load all rows for a split into memory, grouped by order."""
+    return list(iter_dataset_rows(
+        dataset_name=dataset_name,
+        split=split,
+        sample_limit=sample_limit,
+    ))
+
+
+def _group_by_theorem(rows: list[DatasetRow]) -> dict[str, list[DatasetRow]]:
+    """Group rows by theorem name, preserving order within each group."""
+    groups: dict[str, list[DatasetRow]] = defaultdict(list)
+    for row in rows:
+        groups[row.theorem].append(row)
+    return dict(groups)
+
+
+def _build_sexpr_map(
+    rows: list[DatasetRow],
+    project_path: str,
+    use_sexpr: bool,
+    sexpr_cache: Optional[SExprCache] = None,
+    split_label: str = "",
+) -> dict[int, dict]:
+    """Build a mapping from row_index → sexpr_data for all rows.
+
+    Loads cached S-expressions first, then batch-replays all missing theorems
+    on a SINGLE Pantograph server.
+    """
+    if not use_sexpr:
+        return {}
+
+    sexpr_map: dict[int, dict] = {}
+
+    if sexpr_cache is not None:
+        for row in rows:
+            cached = sexpr_cache.load(split_label, row.row_index)
+            if cached is not None:
+                sexpr_map[row.row_index] = cached
+
+    theorems = _group_by_theorem(rows)
+
+    missing_theorems: dict[str, list[DatasetRow]] = {}
+    for full_name, theorem_rows in theorems.items():
+        first_idx = theorem_rows[0].row_index
+        if first_idx not in sexpr_map and full_name:
+            missing_theorems[full_name] = theorem_rows
+
+    if missing_theorems:
+        tactics_map: dict[str, list[str]] = {
+            name: [row.tactic for row in trows]
+            for name, trows in missing_theorems.items()
+        }
+
+        console_print(f"    Batch replay: {len(missing_theorems)} theorems on one server...")
+        try:
+            batch_results = replay_batch_sexpr(project_path, tactics_map)
+        except Exception as e:
+            console_print(f"    [WARN] Batch replay failed: {e}")
+            batch_results = {}
+
+        replayed_count = 0
+        for full_name, sexpr_list in batch_results.items():
+            theorem_rows = missing_theorems[full_name]
+            for i, row in enumerate(theorem_rows):
+                if i < len(sexpr_list):
+                    sexpr_map[row.row_index] = sexpr_list[i]
+                    if sexpr_cache is not None:
+                        sexpr_cache.save(split_label, row.row_index, sexpr_list[i])
+            if sexpr_list:
+                replayed_count += 1
+
+        console_print(f"    Replay done: {replayed_count}/{len(missing_theorems)} theorems, {len(sexpr_map)} total states with S-exprs")
+
+    return sexpr_map
+
+
 def scan_train_split(
     *,
     dataset_name: str,
     sample_per_split: int | None,
+    output_root: Path,
+    sexpr_cache: Optional[SExprCache],
+    project_path: str = "maths_ai/lean_mathlib",
+    use_sexpr: bool = False,
 ) -> tuple[dict[str, int], dict[str, int], SplitReport]:
     node_labels: set[str] = set()
     tactic_names: list[str] = []
     report = SplitReport(split="train")
 
-    for row in iter_dataset_rows(
-        dataset_name=dataset_name,
-        split="train",
-        sample_limit=sample_per_split,
-    ):
+    rows = _load_rows(dataset_name, "train", sample_per_split)
+    sexpr_map = _build_sexpr_map(rows, project_path, use_sexpr, sexpr_cache, "train")
+
+    for row in rows:
         try:
-            example = prepare_example(row)
+            sd = sexpr_map.get(row.row_index)
+            dag, tactic_name = prepare_example(
+                row,
+                sexpr_cache=sexpr_cache,
+                sexpr_data=sd,
+                use_sexpr=use_sexpr,
+            )
         except Exception as exc:
             failure_record = build_failure_record(row, exc)
             report.record_failure(
@@ -92,9 +190,9 @@ def scan_train_split(
             )
             continue
 
-        report.record_success(dag=example.dag, tactic_name=example.tactic_name)
-        node_labels.update(node.label for node in example.dag.nodes)
-        tactic_names.append(example.tactic_name)
+        report.record_success(dag=dag, tactic_name=tactic_name)
+        node_labels.update(node.label for node in dag.nodes)
+        tactic_names.append(tactic_name)
 
     if report.success_count == 0:
         raise RuntimeError("The train split produced zero successful examples while building vocabularies.")
@@ -139,20 +237,30 @@ def process_split(
     node_vocab: dict[str, int],
     tactic_vocab: dict[str, int],
     lemma_name_index: dict[str, int] | None,
+    sexpr_cache: Optional[SExprCache],
+    project_path: str = "maths_ai/lean_mathlib",
+    use_sexpr: bool = False,
 ) -> tuple[SplitReport, dict[str, object]]:
     import torch
 
     from .labels import parse_tactic_arguments
     from .pyg import build_premise_mask
+    from .state import parse_state
 
     report = SplitReport(split=split)
-    for row in iter_dataset_rows(
-        dataset_name=dataset_name,
-        split=split,
-        sample_limit=sample_per_split,
-    ):
+
+    rows = _load_rows(dataset_name, split, sample_per_split)
+    sexpr_map = _build_sexpr_map(rows, project_path, use_sexpr, sexpr_cache, split)
+
+    for row in rows:
         try:
-            example = prepare_example(row)
+            sd = sexpr_map.get(row.row_index)
+            dag, tactic_name = prepare_example(
+                row,
+                sexpr_cache=sexpr_cache,
+                sexpr_data=sd,
+                use_sexpr=use_sexpr,
+            )
         except Exception as exc:
             failure_record = build_failure_record(row, exc)
             append_failure_record(output_root, split=split, record=failure_record)
@@ -162,37 +270,38 @@ def process_split(
             )
             continue
 
+        parsed_state = parse_state(row.state)
         json_payload = build_json_payload(
-            example.row,
-            parsed_state=example.parsed_state,
-            dag=example.dag,
-            tactic_name=example.tactic_name,
+            row,
+            parsed_state=parsed_state,
+            dag=dag,
+            tactic_name=tactic_name,
         )
         write_json_artifact(
             output_root,
             split=split,
-            row_index=example.row.row_index,
+            row_index=row.row_index,
             payload=json_payload,
         )
 
-        data = dag_to_pyg(example.dag, node_vocab)
+        data = dag_to_pyg(dag, node_vocab)
         data.y = torch.tensor(
-            [encode_tactic_name(example.tactic_name, tactic_vocab)],
+            [encode_tactic_name(tactic_name, tactic_vocab)],
             dtype=torch.long,
         )
         data.split = split
-        data.row_index = example.row.row_index
-        data.dataset_name = example.row.dataset_name
-        data.theorem = example.row.theorem
-        data.tactic_raw = example.row.tactic
-        data.tactic_name = example.tactic_name
+        data.row_index = row.row_index
+        data.dataset_name = row.dataset_name
+        data.theorem = row.theorem
+        data.tactic_raw = row.tactic
+        data.tactic_name = tactic_name
 
         # --- Argument-selection ground truth (additive) ---------------
-        premise_mask = build_premise_mask(example.dag)
+        premise_mask = build_premise_mask(dag)
         data.premise_mask = torch.tensor(premise_mask, dtype=torch.bool)
 
-        _, arg_tokens = parse_tactic_arguments(example.row.tactic)
-        arg_indices = _resolve_arg_node_indices(example.dag, arg_tokens)
+        _, arg_tokens = parse_tactic_arguments(row.tactic)
+        arg_indices = _resolve_arg_node_indices(dag, arg_tokens)
         arg_lemma_ids = _resolve_arg_lemma_ids(arg_tokens, lemma_name_index)
         for idx, node_id in enumerate(arg_indices):
             if node_id >= 0 and idx < len(arg_lemma_ids):
@@ -205,11 +314,11 @@ def process_split(
         write_pyg_artifact(
             output_root,
             split=split,
-            row_index=example.row.row_index,
+            row_index=row.row_index,
             data=data,
         )
 
-        report.record_success(dag=example.dag, tactic_name=example.tactic_name)
+        report.record_success(dag=dag, tactic_name=tactic_name)
 
     if report.success_count == 0:
         raise RuntimeError(f"Split '{split}' produced zero successful examples.")
@@ -231,12 +340,21 @@ def run_preprocessing(config: PreprocessConfig) -> dict[str, object]:
             f"Output root '{output_root}' already exists. Re-run with --force to overwrite it."
         )
 
+    sexpr_cache = None
+    if config.use_sexpr:
+        console_print(f"  S-expression mode: proof replay per theorem via Pantograph")
+        sexpr_cache = SExprCache(config.output_root, config.project_path, enabled=True)
+
     console_print(
         f"\n  Scanning train split from {config.dataset_name} to build train-only vocabularies..."
     )
     node_vocab, tactic_vocab, train_scan = scan_train_split(
         dataset_name=config.dataset_name,
         sample_per_split=config.sample_per_split,
+        output_root=config.output_root,
+        sexpr_cache=sexpr_cache,
+        project_path=config.project_path,
+        use_sexpr=config.use_sexpr,
     )
     console_print(
         f"  Train scan complete: attempted={train_scan.attempted_count}, "
@@ -263,6 +381,9 @@ def run_preprocessing(config: PreprocessConfig) -> dict[str, object]:
             node_vocab=node_vocab,
             tactic_vocab=tactic_vocab,
             lemma_name_index=lemma_name_index,
+            sexpr_cache=sexpr_cache,
+            project_path=config.project_path,
+            use_sexpr=config.use_sexpr,
         )
         split_reports[split] = report
         manifests[split] = manifest
@@ -299,6 +420,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-per-split", type=int, default=None, help="Optional limit of examples to process per split")
     parser.add_argument("--lemma-corpus", type=str, default=None, help="Optional lemma corpus JSONL for library premise labels")
     parser.add_argument("--force", action="store_true", help="Overwrite the output root if it already exists")
+    parser.add_argument("--use-sexpr", action="store_true", default=False, help="Use S-expressions from Pantograph (default: False, text parser only for training)")
+    parser.add_argument("--no-sexpr", action="store_false", dest="use_sexpr", help="Disable S-expressions, use text parser only")
+    parser.add_argument("--project-path", type=str, default="maths_ai/lean_mathlib", help="Path to Lean project for Pantograph")
     return parser
 
 
@@ -314,6 +438,8 @@ def main(argv: list[str] | None = None) -> int:
             sample_per_split=args.sample_per_split,
             lemma_corpus_path=None if args.lemma_corpus is None else Path(args.lemma_corpus),
             force=args.force,
+            use_sexpr=args.use_sexpr,
+            project_path=args.project_path,
         )
         run_preprocessing(config)
     except (FileExistsError, RuntimeError, ValueError) as exc:
