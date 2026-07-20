@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -544,15 +545,56 @@ class PreparedGraphDataset(Dataset):
         return data
 
 
+def _shm_bytes() -> int:
+    """Return available shared-memory size in bytes (0 if unknown)."""
+    try:
+        stats = os.statvfs("/dev/shm")
+        return stats.f_bavail * stats.f_frsize
+    except OSError:
+        return 0
+
+
+def _safe_num_workers(requested: int, *, pin_memory: bool) -> tuple[int, str | None]:
+    """Cap DataLoader workers to avoid exhausting ``/dev/shm``.
+
+    PyTorch's DataLoader workers pass tensors between processes via shared
+    memory; in containers with a tiny ``/dev/shm`` (common in Jupyter/Docker)
+    this causes "Bus error ... out of shared memory". When ``/dev/shm`` is
+    small we cap workers to a safe value and report a warning message.
+    """
+    if requested <= 0:
+        return 0, None
+    shm = _shm_bytes()
+    # 256 MiB headroom per worker is a conservative floor for graph batches.
+    safe = max(0, min(requested, (shm // (256 * 1024 * 1024)) if shm else requested))
+    if safe == 0 and shm:
+        return 0, (
+            f"/dev/shm is too small ({shm // (1024 * 1024)} MiB); "
+            "using num_workers=0 to avoid shared-memory exhaustion."
+        )
+    if safe < requested:
+        return safe, (
+            f"/dev/shm is small ({shm // (1024 * 1024)} MiB); "
+            f"capped DataLoader workers to {safe} (requested {requested})."
+        )
+    return requested, None
+
+
 def build_dataloaders(
     metadata: PreparedMetadata,
     config: BaselineConfig | PointerConfig,
     required_fields: tuple[str, ...] = REQUIRED_DATA_FIELDS,
 ) -> tuple[dict[str, PreparedGraphDataset], dict[str, DataLoader]]:
-    use_workers = config.training.num_workers > 0
+    requested_workers = config.training.num_workers
+    num_workers, shm_warning = _safe_num_workers(
+        requested_workers, pin_memory=config.training.pin_memory
+    )
+    if shm_warning:
+        console_print(f"  [warn] {shm_warning}")
+    use_workers = num_workers > 0
     loader_kwargs: dict[str, object] = {
         "batch_size": config.training.batch_size,
-        "num_workers": config.training.num_workers,
+        "num_workers": num_workers,
         "pin_memory": config.training.pin_memory,
     }
     if use_workers:

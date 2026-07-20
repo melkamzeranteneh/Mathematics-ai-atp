@@ -20,6 +20,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.training import (
 from maths_ai.gnn_inference.atp_lean_gnn.argument_selector import TacticWithArgsClassifier
 from maths_ai.gnn_inference.atp_lean_gnn.training import (
     PyGBatchDataParallel,
+    _safe_num_workers,
     _unwrap_model,
     maybe_wrap_data_parallel,
 )
@@ -170,3 +171,25 @@ def test_unwrap_model_strips_pg_batch_data_parallel():
     wrapped = PyGBatchDataParallel(inner)
     assert _unwrap_model(wrapped) is inner
     assert _unwrap_model(inner) is inner
+
+
+def test_safe_num_workers_caps_on_small_shm(monkeypatch):
+    # 512 MiB available -> at most 2 workers under the 256 MiB/worker floor.
+    monkeypatch.setattr("maths_ai.gnn_inference.atp_lean_gnn.training._shm_bytes", lambda: 512 * 1024 * 1024)
+    workers, warning = _safe_num_workers(8, pin_memory=True)
+    assert workers == 2
+    assert warning is not None
+
+
+def test_safe_num_workers_zero_when_shm_tiny(monkeypatch):
+    monkeypatch.setattr("maths_ai.gnn_inference.atp_lean_gnn.training._shm_bytes", lambda: 64 * 1024 * 1024)
+    workers, warning = _safe_num_workers(4, pin_memory=True)
+    assert workers == 0
+    assert warning is not None
+
+
+def test_safe_num_workers_keeps_request_when_shm_large(monkeypatch):
+    monkeypatch.setattr("maths_ai.gnn_inference.atp_lean_gnn.training._shm_bytes", lambda: 64 * 1024 * 1024 * 1024)
+    workers, warning = _safe_num_workers(4, pin_memory=True)
+    assert workers == 4
+    assert warning is None
