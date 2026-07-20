@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import Dataset
@@ -670,9 +671,31 @@ def maybe_wrap_data_parallel(model: nn.Module, device: torch.device) -> tuple[nn
     device_ids = list(range(gpu_count))
     primary = torch.device(f"cuda:{device_ids[0]}")
     # PyG DataParallel splits a Batch along the graph dimension, preserving
-    # edge_index connectivity (torch.nn.DataParallel would break it).
-    model = PyGDataParallel(model, device_ids=device_ids)
+    # edge_index connectivity (torch.nn.DataParallel would break it). It
+    # expects a `List[Data]` (one graph per element), not a single `Batch`,
+    # so wrap it to convert the loader's `Batch` into a data list first.
+    model = PyGBatchDataParallel(model, device_ids=device_ids)
     return model, primary, device_ids
+
+
+class PyGBatchDataParallel(nn.Module):
+    """Thin wrapper exposing PyG ``DataParallel`` to a standard ``Batch`` input.
+
+    :class:`torch_geometric.nn.DataParallel` iterates its input expecting a
+    ``List[Data]`` (one graph per element). PyG's ``DataLoader`` instead yields
+    a single ``Batch``; iterating a ``Batch`` yields ``(attr, value)`` tuples,
+    which crashes inside ``DataParallel``. This wrapper converts a ``Batch`` into
+    the expected data list, then lets ``DataParallel`` re-batch per device.
+    """
+
+    def __init__(self, module: nn.Module, device_ids: list[int] | None = None) -> None:
+        super().__init__()
+        self.inner = PyGDataParallel(module, device_ids=device_ids)
+
+    def forward(self, batch) -> torch.Tensor:
+        if hasattr(batch, "to_data_list"):
+            batch = batch.to_data_list()
+        return self.inner(batch)
 
 
 def build_baseline_model(metadata: PreparedMetadata, config: BaselineConfig) -> GraphSAGEStateClassifier | GATv2StateClassifier:
@@ -877,8 +900,12 @@ def _create_run_dir(run_root: Path) -> Path:
 
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
-    """Return the underlying module when wrapped by :class:`DataParallel`."""
-    return model.module if isinstance(model, torch.nn.DataParallel) else model
+    """Return the underlying module, unwrapping DataParallel wrappers."""
+    if isinstance(model, PyGBatchDataParallel):
+        model = model.inner
+    if isinstance(model, torch.nn.DataParallel):
+        model = model.module
+    return model
 
 
 def _save_checkpoint(

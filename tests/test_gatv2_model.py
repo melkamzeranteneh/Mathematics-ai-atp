@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn as nn
 from torch_geometric.data import Data
 
 from maths_ai.gnn_inference.atp_lean_gnn.model import (
@@ -17,7 +18,11 @@ from maths_ai.gnn_inference.atp_lean_gnn.training import (
     build_pointer_model,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.argument_selector import TacticWithArgsClassifier
-from maths_ai.gnn_inference.atp_lean_gnn.training import maybe_wrap_data_parallel
+from maths_ai.gnn_inference.atp_lean_gnn.training import (
+    PyGBatchDataParallel,
+    _unwrap_model,
+    maybe_wrap_data_parallel,
+)
 
 
 def _make_batch(num_nodes: int = 6, num_edges: int = 8, hidden_dim: int = 16, heads: int = 4):
@@ -137,3 +142,31 @@ def test_maybe_wrap_data_parallel_single_gpu_returns_unwrapped():
     wrapped, device, gpu_ids = maybe_wrap_data_parallel(model, torch.device("cuda"))
     # No assertion on wrap state (depends on GPU count); just ensure it runs.
     assert device.type == "cuda"
+
+
+def test_pg_batch_data_parallel_converts_batch_to_list():
+    from torch_geometric.data import Batch, Data
+
+    class Recorder(nn.Module):
+        def forward(self, data):
+            # PyG DP's single-device fallback re-batches the list into a Batch;
+            # on multi-GPU it would pass the list directly. Either way the
+            # wrapper must accept a Batch without iterating its (attr, value)
+            # tuples.
+            num = data.num_graphs if hasattr(data, "num_graphs") else len(data)
+            return torch.zeros(num, 5)
+
+    batch = Batch.from_data_list([
+        Data(x=torch.zeros(3, dtype=torch.long), edge_index=torch.zeros(2, 0, dtype=torch.long)),
+        Data(x=torch.zeros(2, dtype=torch.long), edge_index=torch.zeros(2, 0, dtype=torch.long)),
+    ])
+    wrapper = PyGBatchDataParallel(Recorder())
+    out = wrapper(batch)
+    assert out.shape == (2, 5)
+
+
+def test_unwrap_model_strips_pg_batch_data_parallel():
+    inner = GraphSAGEStateClassifier(num_node_labels=10, num_tactics=5, hidden_dim=16)
+    wrapped = PyGBatchDataParallel(inner)
+    assert _unwrap_model(wrapped) is inner
+    assert _unwrap_model(inner) is inner
