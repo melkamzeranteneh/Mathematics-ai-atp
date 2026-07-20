@@ -705,7 +705,13 @@ def build_pointer_model(metadata: PreparedMetadata, config: PointerConfig) -> Ta
 
 
 def _use_cuda_amp(device: torch.device, config: BaselineConfig | PointerConfig) -> bool:
-    return config.training.use_amp and device.type == "cuda"
+    if not config.training.use_amp or device.type != "cuda":
+        return False
+    # GATv2 attention scores overflow under fp16 autocast and produce NaNs;
+    # keep it in fp32 even when AMP is requested.
+    if getattr(config, "gnn_type", "sage") == "gat":
+        return False
+    return True
 
 
 def _should_log_batch(batch_index: int, total_batches: int, *, log_every_batches: int) -> bool:
@@ -759,6 +765,12 @@ def train_one_epoch(
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             logits = model(batch)
             loss = F.cross_entropy(logits, targets)
+
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"Non-finite loss ({float(loss):.4g}) at batch {batch_index}. "
+                "Training is unstable; reduce hidden_dim/heads or learning rate."
+            )
 
         grad_scaler.scale(loss).backward()
         grad_scaler.unscale_(optimizer)
@@ -910,6 +922,8 @@ def train_baseline(
     set_seed(config.seed)
     device = resolve_device(config.device)
     use_amp = _use_cuda_amp(device, config)
+    if getattr(config, "gnn_type", "sage") == "gat" and config.training.use_amp and device.type == "cuda":
+        console_print("  AMP disabled for GATv2 (fp16 attention overflows to NaN).")
     datasets, loaders = build_dataloaders(metadata, config, required_fields=REQUIRED_DATA_FIELDS)
     if resume_run_dir is None:
         run_dir = _create_run_dir(config.run_root)
