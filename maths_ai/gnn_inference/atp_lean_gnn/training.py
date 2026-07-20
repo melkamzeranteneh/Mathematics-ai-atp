@@ -686,16 +686,47 @@ class PyGBatchDataParallel(nn.Module):
     a single ``Batch``; iterating a ``Batch`` yields ``(attr, value)`` tuples,
     which crashes inside ``DataParallel``. This wrapper converts a ``Batch`` into
     the expected data list, then lets ``DataParallel`` re-batch per device.
+
+    If multi-GPU communication fails at runtime (e.g. NCCL "unhandled system
+    error" in restricted containers), it transparently falls back to single-GPU
+    execution so training is never hard-blocked by the environment.
     """
 
     def __init__(self, module: nn.Module, device_ids: list[int] | None = None) -> None:
         super().__init__()
-        self.inner = PyGDataParallel(module, device_ids=device_ids)
+        self.module = module
+        self.device_ids = device_ids or [0]
+        self.inner: nn.Module | None = None
+        self._fallback = False
+
+    def _ensure_inner(self) -> nn.Module:
+        if self.inner is None and not self._fallback:
+            try:
+                self.inner = PyGDataParallel(self.module, device_ids=self.device_ids)
+            except Exception:
+                self._fallback = True
+                self.inner = self.module
+        return self.inner
 
     def forward(self, batch) -> torch.Tensor:
-        if hasattr(batch, "to_data_list"):
-            batch = batch.to_data_list()
-        return self.inner(batch)
+        data_list = batch.to_data_list() if hasattr(batch, "to_data_list") else batch
+        inner = self._ensure_inner()
+        try:
+            return inner(data_list)
+        except RuntimeError as exc:
+            if "NCCL" in str(exc) and not self._fallback:
+                self._fallback = True
+                self.inner = self.module
+                primary = f"cuda:{self.device_ids[0]}"
+                console_print(
+                    "  [warn] multi-GPU communication (NCCL) failed; "
+                    "falling back to single GPU. Set NCCL_SOCKET_IFNAME / "
+                    "NCCL_P2P_DISABLE to enable both GPUs."
+                )
+                from torch_geometric.data import Batch
+
+                return self.module(Batch.from_data_list(data_list).to(primary))
+            raise
 
 
 def build_baseline_model(metadata: PreparedMetadata, config: BaselineConfig) -> GraphSAGEStateClassifier | GATv2StateClassifier:
@@ -902,7 +933,7 @@ def _create_run_dir(run_root: Path) -> Path:
 def _unwrap_model(model: nn.Module) -> nn.Module:
     """Return the underlying module, unwrapping DataParallel wrappers."""
     if isinstance(model, PyGBatchDataParallel):
-        model = model.inner
+        model = model.module
     if isinstance(model, torch.nn.DataParallel):
         model = model.module
     return model
