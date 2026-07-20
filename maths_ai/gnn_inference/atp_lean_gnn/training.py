@@ -30,6 +30,7 @@ from .model import (
 )
 from .pyg import NODE_TYPE_TO_ID
 from .reporting import console_print
+from torch_geometric.nn import DataParallel as PyGDataParallel
 
 
 VALID_GNN_TYPES = ("sage", "gat")
@@ -644,6 +645,39 @@ def resolve_device(device_name: str) -> torch.device:
     return torch.device(device_name)
 
 
+def primary_device(device: torch.device) -> torch.device:
+    """Return the device that input batches should be placed on.
+
+    When training spans multiple GPUs via :class:`torch.nn.DataParallel`, the
+    batch must live on the module's primary device (``cuda:0``) and
+    ``DataParallel`` scatters replicas across the remaining devices.
+    """
+    return device
+
+
+def maybe_wrap_data_parallel(model: nn.Module, device: torch.device) -> tuple[nn.Module, torch.device, list[int]]:
+    """Wrap ``model`` in :class:`torch.nn.DataParallel` when multiple GPUs exist.
+
+    Returns the (possibly wrapped) model, the primary device batches must be
+    moved to, and the list of CUDA device ids in use.  Single-GPU and CPU paths
+    are returned unchanged so the rest of the training loop is unaffected.
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return model, device, [device.index or 0] if device.type == "cuda" else []
+    gpu_count = torch.cuda.device_count()
+    if gpu_count <= 1:
+        return model, device, [device.index or 0]
+    device_ids = list(range(gpu_count))
+    primary = torch.device(f"cuda:{device_ids[0]}")
+    # Use PyG's DataParallel (NOT torch.nn.DataParallel): it replicates the
+    # module across devices and splits a PyG Batch along the graph dimension
+    # using the `batch` vector, which keeps edge_index/node connectivity intact.
+    # torch.nn.DataParallel would chunk node features across GPUs and break
+    # message passing.
+    model = PyGDataParallel(model, device_ids=device_ids)
+    return model, primary, device_ids
+
+
 def build_baseline_model(metadata: PreparedMetadata, config: BaselineConfig) -> GraphSAGEStateClassifier | GATv2StateClassifier:
     common = dict(
         num_node_labels=len(metadata.node_vocab),
@@ -833,6 +867,11 @@ def _create_run_dir(run_root: Path) -> Path:
     return candidate
 
 
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    """Return the underlying module when wrapped by :class:`DataParallel`."""
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -842,11 +881,13 @@ def _save_checkpoint(
     epoch: int,
     val_metrics: dict[str, float | int],
 ) -> Path:
+    # Always persist the bare module state dict so checkpoints are independent
+    # of whether the model was trained with DataParallel.
     torch.save(
         {
             "epoch": epoch,
             "config": config.to_dict(),
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": _unwrap_model(model).state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "val_metrics": val_metrics,
         },
@@ -898,7 +939,9 @@ def train_baseline(
     best_checkpoint_path = run_dir / "best.pt"
     last_checkpoint_path = run_dir / "last.pt"
 
-    model = build_baseline_model(metadata, config).to(device)
+    model = build_baseline_model(metadata, config)
+    model, device, gpu_ids = maybe_wrap_data_parallel(model, device)
+    model = model.to(device)
     optimizer = AdamW(
         model.parameters(),
         lr=config.training.learning_rate,
@@ -912,7 +955,7 @@ def train_baseline(
                 f"Resume run directory '{run_dir}' is missing 'last.pt', so training cannot resume."
             )
         last_checkpoint = _load_checkpoint(last_checkpoint_path, device=device)
-        model.load_state_dict(last_checkpoint["model_state_dict"])
+        _unwrap_model(model).load_state_dict(last_checkpoint["model_state_dict"])
         optimizer.load_state_dict(last_checkpoint["optimizer_state_dict"])
         start_epoch = int(last_checkpoint["epoch"]) + 1
         if best_checkpoint_path.exists():
@@ -924,7 +967,7 @@ def train_baseline(
 
     console_print(f"\n  Training baseline run in: {run_dir}")
     console_print(f"  Prepared cache           : {config.prepared_root}")
-    console_print(f"  Device                   : {device}")
+    console_print(f"  Device                   : {device}" + (f" (DataParallel over GPUs {gpu_ids})" if len(gpu_ids) > 1 else ""))
     console_print(f"  AMP enabled              : {use_amp}")
     console_print(
         f"  Split sizes              : train={len(datasets['train'])}, "
@@ -1012,7 +1055,7 @@ def train_baseline(
         )
 
     best_checkpoint = _load_checkpoint(best_checkpoint_path, device=device)
-    model.load_state_dict(best_checkpoint["model_state_dict"])
+    _unwrap_model(model).load_state_dict(best_checkpoint["model_state_dict"])
 
     eval_val = {
         "split": "val",
@@ -1107,7 +1150,9 @@ def train_pointer(
     best_checkpoint_path = run_dir / "best.pt"
     last_checkpoint_path = run_dir / "last.pt"
 
-    model = build_pointer_model(metadata, config).to(device)
+    model = build_pointer_model(metadata, config)
+    model, device, gpu_ids = maybe_wrap_data_parallel(model, device)
+    model = model.to(device)
     optimizer = AdamW(
         model.parameters(),
         lr=config.training.learning_rate,
@@ -1121,7 +1166,7 @@ def train_pointer(
                 f"Resume run directory '{run_dir}' is missing 'last.pt', so training cannot resume."
             )
         last_checkpoint = _load_checkpoint(last_checkpoint_path, device=device)
-        model.load_state_dict(last_checkpoint["model_state_dict"])
+        _unwrap_model(model).load_state_dict(last_checkpoint["model_state_dict"])
         optimizer.load_state_dict(last_checkpoint["optimizer_state_dict"])
         start_epoch = int(last_checkpoint["epoch"]) + 1
         if best_checkpoint_path.exists():
@@ -1133,7 +1178,7 @@ def train_pointer(
 
     console_print(f"\n  Training pointer run in  : {run_dir}")
     console_print(f"  Prepared cache           : {config.prepared_root}")
-    console_print(f"  Device                   : {device}")
+    console_print(f"  Device                   : {device}" + (f" (DataParallel over GPUs {gpu_ids})" if len(gpu_ids) > 1 else ""))
     console_print(f"  AMP enabled              : {use_amp}")
     console_print(
         f"  Split sizes              : train={len(datasets['train'])}, "
@@ -1225,7 +1270,7 @@ def train_pointer(
         )
 
     best_checkpoint = _load_checkpoint(best_checkpoint_path, device=device)
-    model.load_state_dict(best_checkpoint["model_state_dict"])
+    _unwrap_model(model).load_state_dict(best_checkpoint["model_state_dict"])
 
     eval_val = {
         "split": "val",
@@ -1304,7 +1349,7 @@ def evaluate_baseline_run(run_dir: str | Path, *, split: str) -> dict[str, objec
     model = build_baseline_model(metadata, config).to(device)
     checkpoint_path = run_directory / "best.pt"
     checkpoint = _load_checkpoint(checkpoint_path, device=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    _unwrap_model(model).load_state_dict(checkpoint["model_state_dict"])
 
     canonical_split = canonicalize_split_name(split)
     if canonical_split not in {"val", "test"}:

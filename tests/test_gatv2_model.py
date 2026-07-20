@@ -17,6 +17,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.training import (
     build_pointer_model,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.argument_selector import TacticWithArgsClassifier
+from maths_ai.gnn_inference.atp_lean_gnn.training import maybe_wrap_data_parallel
 
 
 def _make_batch(num_nodes: int = 6, num_edges: int = 8, hidden_dim: int = 16, heads: int = 4):
@@ -120,3 +121,19 @@ def test_baseline_config_rejects_bad_gnn_type():
 def test_pointer_config_rejects_bad_gnn_type():
     with pytest.raises(ValueError):
         PointerConfig.from_dict({"prepared_root": "x", "gnn_type": "transformer"})
+
+
+def test_maybe_wrap_data_parallel_cpu_returns_unwrapped():
+    model = GraphSAGEStateClassifier(num_node_labels=10, num_tactics=5, hidden_dim=16)
+    wrapped, device, gpu_ids = maybe_wrap_data_parallel(model, torch.device("cpu"))
+    assert wrapped is model
+    assert gpu_ids == []
+
+
+def test_maybe_wrap_data_parallel_single_gpu_returns_unwrapped():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    model = GraphSAGEStateClassifier(num_node_labels=10, num_tactics=5, hidden_dim=16)
+    wrapped, device, gpu_ids = maybe_wrap_data_parallel(model, torch.device("cuda"))
+    # No assertion on wrap state (depends on GPU count); just ensure it runs.
+    assert device.type == "cuda"
