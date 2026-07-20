@@ -82,7 +82,7 @@ class BaselineConfig:
     edge_mode: str = "bidirectional"
     use_node_type: bool = True
     gnn_type: str = "sage"
-    model: GraphSAGEClassifierConfig = field(default_factory=GraphSAGEClassifierConfig)
+    model: GraphSAGEClassifierConfig | GATv2ClassifierConfig = field(default_factory=GraphSAGEClassifierConfig)
     training: TrainingLoopConfig = field(default_factory=TrainingLoopConfig)
 
     @classmethod
@@ -103,11 +103,16 @@ class BaselineConfig:
             edge_mode=str(payload.get("edge_mode", "bidirectional")),
             use_node_type=bool(payload.get("use_node_type", True)),
             gnn_type=gnn_type,
-            model=GraphSAGEClassifierConfig(
+            model=(GATv2ClassifierConfig(
+                hidden_dim=int(model_payload.get("hidden_dim", 256)),
+                num_layers=int(model_payload.get("num_layers", 4)),
+                dropout=float(model_payload.get("dropout", 0.2)),
+                heads=int(model_payload.get("heads", 8)),
+            ) if gnn_type == "gat" else GraphSAGEClassifierConfig(
                 hidden_dim=int(model_payload.get("hidden_dim", 128)),
                 num_layers=int(model_payload.get("num_layers", 4)),
                 dropout=float(model_payload.get("dropout", 0.2)),
-            ),
+            )),
             training=TrainingLoopConfig(
                 batch_size=int(training_payload.get("batch_size", 32)),
                 epochs=int(training_payload.get("epochs", 20)),
@@ -224,6 +229,7 @@ class PointerConfig:
                 dropout=float(model_payload.get("dropout", 0.2)),
                 max_args=int(model_payload.get("max_args", 3)),
                 arg_loss_weight=float(model_payload.get("arg_loss_weight", 0.5)),
+                heads=int(model_payload.get("heads", 8)),
             ),
             training=TrainingLoopConfig(
                 batch_size=int(training_payload.get("batch_size", 32)),
@@ -803,7 +809,7 @@ def build_baseline_model(metadata: PreparedMetadata, config: BaselineConfig) -> 
         use_node_type=config.use_node_type,
     )
     if config.gnn_type == "gat":
-        return GATv2StateClassifier(**common)
+        return GATv2StateClassifier(heads=config.model.heads, **common)
     return GraphSAGEStateClassifier(**common)
 
 
@@ -818,6 +824,7 @@ def build_pointer_model(metadata: PreparedMetadata, config: PointerConfig) -> Ta
         use_node_type=config.use_node_type,
         max_args=config.max_args,
         gnn_type=config.gnn_type,
+        heads=config.model.heads,
     )
 
 

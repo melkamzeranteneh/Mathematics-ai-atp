@@ -119,6 +119,7 @@ class TacticWithArgsConfig:
     dropout: float = 0.2
     max_args: int = 3
     arg_loss_weight: float = 0.5
+    heads: int = 8
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -127,6 +128,7 @@ class TacticWithArgsConfig:
             "dropout": self.dropout,
             "max_args": self.max_args,
             "arg_loss_weight": self.arg_loss_weight,
+            "heads": self.heads,
         }
 
 
@@ -151,6 +153,7 @@ class TacticWithArgsClassifier(nn.Module):
         use_node_type: bool = True,
         max_args: int = 3,
         gnn_type: str = "sage",
+        heads: int = 8,
     ) -> None:
         super().__init__()
 
@@ -165,7 +168,7 @@ class TacticWithArgsClassifier(nn.Module):
             use_node_type=use_node_type,
         )
         if gnn_type == "gat":
-            self.backbone = GATv2StateClassifier(**backbone_kwargs)
+            self.backbone = GATv2StateClassifier(heads=heads, **backbone_kwargs)
         else:
             self.backbone = GraphSAGEStateClassifier(**backbone_kwargs)
 

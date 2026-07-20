@@ -112,6 +112,39 @@ def test_pointer_build_routes_gnn_type():
     assert isinstance(gat_model.backbone, GATv2StateClassifier)
 
 
+def test_baseline_config_reads_heads_for_gat():
+    """Config heads value should be read and passed to GATv2 model."""
+    meta = type("M", (), {"node_vocab": [f"n{i}" for i in range(10)],
+                          "tactic_vocab": [f"t{i}" for i in range(5)]})()
+
+    cfg = BaselineConfig.from_dict({
+        "prepared_root": "x",
+        "gnn_type": "gat",
+        "model": {"heads": 4, "hidden_dim": 128}
+    })
+    model = build_baseline_model(meta, cfg)
+
+    assert isinstance(model, GATv2StateClassifier)
+    # head_proj in_features = heads * hidden_dim
+    assert model.head_proj.in_features == 4 * 128
+
+
+def test_pointer_config_reads_heads_for_gat():
+    """PointerConfig should also read heads and pass to GATv2 backbone."""
+    meta = type("M", (), {"node_vocab": [f"n{i}" for i in range(10)],
+                          "tactic_vocab": [f"t{i}" for i in range(5)]})()
+
+    cfg = PointerConfig.from_dict({
+        "prepared_root": "x",
+        "gnn_type": "gat",
+        "model": {"heads": 4, "hidden_dim": 128}
+    })
+    model = build_pointer_model(meta, cfg)
+
+    assert isinstance(model.backbone, GATv2StateClassifier)
+    assert model.backbone.head_proj.in_features == 4 * 128
+
+
 def test_tactic_with_args_backbone_switch():
     sage = TacticWithArgsClassifier(num_node_labels=10, num_tactics=5, gnn_type="sage")
     gat = TacticWithArgsClassifier(num_node_labels=10, num_tactics=5, gnn_type="gat")
