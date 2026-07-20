@@ -165,8 +165,7 @@ class GATv2StateClassifier(nn.Module):
             nn.Embedding(num_node_types, hidden_dim) if use_node_type else None
         )
 
-        # Binder feature embeddings
-        self.is_bound_embedding = nn.Embedding(2, hidden_dim)  # 0/1
+        self.is_bound_embedding = nn.Embedding(2, hidden_dim)
         self.binder_depth_embedding = nn.Embedding(max_binder_depth, hidden_dim)
         self.binder_kind_embedding = nn.Embedding(num_binder_kinds, hidden_dim)
 
@@ -174,9 +173,6 @@ class GATv2StateClassifier(nn.Module):
             GATv2Conv(hidden_dim, hidden_dim, heads=heads, dropout=dropout, concat=True)
             for _ in range(num_layers)
         )
-        # Each GATv2Conv with concat=True emits (heads * hidden_dim) features;
-        # collapse that back to hidden_dim so every layer stays shape-compatible
-        # with the GraphSAGE variant and the classifier head.
         self.head_proj = nn.Linear(hidden_dim * heads, hidden_dim)
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(hidden_dim, num_tactics)
@@ -186,7 +182,6 @@ class GATv2StateClassifier(nn.Module):
         if self.node_type_embedding is not None:
             x = x + self.node_type_embedding(data.node_type)
 
-        # Add binder features if present
         if hasattr(data, "is_bound"):
             x = x + self.is_bound_embedding(data.is_bound)
         if hasattr(data, "binder_depth"):

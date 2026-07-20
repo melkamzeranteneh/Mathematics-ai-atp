@@ -669,11 +669,8 @@ def maybe_wrap_data_parallel(model: nn.Module, device: torch.device) -> tuple[nn
         return model, device, [device.index or 0]
     device_ids = list(range(gpu_count))
     primary = torch.device(f"cuda:{device_ids[0]}")
-    # Use PyG's DataParallel (NOT torch.nn.DataParallel): it replicates the
-    # module across devices and splits a PyG Batch along the graph dimension
-    # using the `batch` vector, which keeps edge_index/node connectivity intact.
-    # torch.nn.DataParallel would chunk node features across GPUs and break
-    # message passing.
+    # PyG DataParallel splits a Batch along the graph dimension, preserving
+    # edge_index connectivity (torch.nn.DataParallel would break it).
     model = PyGDataParallel(model, device_ids=device_ids)
     return model, primary, device_ids
 
@@ -881,8 +878,6 @@ def _save_checkpoint(
     epoch: int,
     val_metrics: dict[str, float | int],
 ) -> Path:
-    # Always persist the bare module state dict so checkpoints are independent
-    # of whether the model was trained with DataParallel.
     torch.save(
         {
             "epoch": epoch,
