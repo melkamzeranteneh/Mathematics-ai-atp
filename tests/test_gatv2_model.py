@@ -166,6 +166,30 @@ def test_pg_batch_data_parallel_converts_batch_to_list():
     assert out.shape == (2, 5)
 
 
+def test_pg_batch_data_parallel_fallback_rebatches_list():
+    from torch_geometric.data import Batch, Data
+
+    seen = {}
+
+    class Recorder(nn.Module):
+        def forward(self, data):
+            seen["is_batch"] = hasattr(data, "x")
+            num = data.num_graphs if hasattr(data, "num_graphs") else len(data)
+            return torch.zeros(num, 5)
+
+    batch = Batch.from_data_list([
+        Data(x=torch.zeros(3, dtype=torch.long), edge_index=torch.zeros(2, 0, dtype=torch.long)),
+        Data(x=torch.zeros(2, dtype=torch.long), edge_index=torch.zeros(2, 0, dtype=torch.long)),
+    ])
+    wrapper = PyGBatchDataParallel(Recorder())
+    wrapper._fallback = True
+    wrapper.inner = wrapper.module
+    # Second call would otherwise pass a list straight to the module.
+    out = wrapper(batch)
+    assert seen["is_batch"] is True
+    assert out.shape == (2, 5)
+
+
 def test_unwrap_model_strips_pg_batch_data_parallel():
     inner = GraphSAGEStateClassifier(num_node_labels=10, num_tactics=5, hidden_dim=16)
     wrapped = PyGBatchDataParallel(inner)

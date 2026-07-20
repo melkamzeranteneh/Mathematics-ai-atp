@@ -129,8 +129,8 @@ class BaselineConfig:
             raise ValueError("Training config field 'edge_mode' must be either 'forward' or 'bidirectional'.")
 
         device = self.device.lower().strip()
-        if device not in {"auto", "cpu", "cuda"}:
-            raise ValueError("Training config field 'device' must be one of: auto, cpu, cuda.")
+        if not _is_valid_device(device):
+            raise ValueError("Training config field 'device' must be one of: auto, cpu, cuda, or cuda:<index>.")
 
         gnn_type = self.gnn_type.lower().strip()
         if gnn_type not in VALID_GNN_TYPES:
@@ -246,8 +246,8 @@ class PointerConfig:
             raise ValueError("Training config field 'edge_mode' must be either 'forward' or 'bidirectional'.")
 
         device = self.device.lower().strip()
-        if device not in {"auto", "cpu", "cuda"}:
-            raise ValueError("Training config field 'device' must be one of: auto, cpu, cuda.")
+        if not _is_valid_device(device):
+            raise ValueError("Training config field 'device' must be one of: auto, cpu, cuda, or cuda:<index>.")
 
         gnn_type = self.gnn_type.lower().strip()
         if gnn_type not in VALID_GNN_TYPES:
@@ -680,6 +680,14 @@ def set_seed(seed: int) -> None:
         torch.backends.cudnn.benchmark = False
 
 
+def _is_valid_device(device_name: str) -> bool:
+    """Accept ``auto``, ``cpu``, ``cuda``, and ``cuda:<index>``."""
+    device_name = device_name.lower().strip()
+    if device_name in {"auto", "cpu", "cuda"}:
+        return True
+    return device_name.startswith("cuda:") and device_name[5:].isdigit()
+
+
 def resolve_device(device_name: str) -> torch.device:
     if device_name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -760,6 +768,12 @@ class PyGBatchDataParallel(nn.Module):
     def forward(self, batch) -> torch.Tensor:
         data_list = batch.to_data_list() if hasattr(batch, "to_data_list") else batch
         inner = self._ensure_inner()
+        if self._fallback:
+            # Permanently on single GPU: the bare module expects a Batch, not a
+            # data list, so re-batch before calling it.
+            from torch_geometric.data import Batch
+
+            return inner(Batch.from_data_list(data_list).to(f"cuda:{self.device_ids[0]}"))
         try:
             return inner(data_list)
         except RuntimeError as exc:
