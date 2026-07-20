@@ -207,6 +207,26 @@ def run_prepare(config: dict[str, Any]) -> dict[str, Any]:
     return {"summary": summary, "output_root": str(output_root)}
 
 
+def _resolve_stage_model(baseline_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Merge inline and nested ``model``/``training`` hyperparams for a stage.
+
+    ``DEFAULT_CONFIG`` stores stage hyperparams inline (e.g. ``baseline.hidden_dim``),
+    while ``--config`` preset files follow ``BaselineConfig.to_dict()`` and nest them
+    under ``baseline.model`` / ``baseline.training``. This resolves both shapes,
+    preferring the nested form when present.
+    """
+    inline_model_keys = ("hidden_dim", "num_layers", "dropout")
+    inline_training_keys = (
+        "batch_size", "epochs", "learning_rate", "weight_decay",
+        "grad_clip", "num_workers", "use_amp",
+    )
+    model = {k: baseline_cfg[k] for k in inline_model_keys if k in baseline_cfg}
+    model.update(baseline_cfg.get("model", {}) or {})
+    training = {k: baseline_cfg[k] for k in inline_training_keys if k in baseline_cfg}
+    training.update(baseline_cfg.get("training", {}) or {})
+    return model, training
+
+
 def run_baseline(config: dict[str, Any], resume_run_dir: str | None = None) -> dict[str, Any]:
     """Stage 2: Train baseline GNN classifier."""
     from maths_ai.gnn_inference.atp_lean_gnn.training import (
@@ -226,41 +246,18 @@ def run_baseline(config: dict[str, Any], resume_run_dir: str | None = None) -> d
     console_print("=" * 60)
     console_print(f"  Prepared  : {prepared_root}")
     console_print(f"  Run root  : {run_root}")
-    console_print(f"  hidden    : {baseline_cfg['model']['hidden_dim']}")
-    console_print(f"  layers    : {baseline_cfg['model']['num_layers']}")
-    console_print(f"  dropout   : {baseline_cfg['model']['dropout']}")
+    _m, _t = _resolve_stage_model(baseline_cfg)
+    console_print(f"  hidden    : {_m.get('hidden_dim')}")
+    console_print(f"  layers    : {_m.get('num_layers')}")
+    console_print(f"  dropout   : {_m.get('dropout')}")
     console_print(f"  batch     : {baseline_cfg['batch_size']}")
     console_print(f"  epochs    : {baseline_cfg['epochs']}")
     console_print(f"  lr        : {baseline_cfg['learning_rate']}")
     console_print(f"  workers   : {baseline_cfg['num_workers']}")
     console_print("")
 
-    cfg = BaselineConfig(
-        prepared_root=prepared_root,
-        run_root=run_root,
-        seed=config["seed"],
-        device=config["device"],
-        edge_mode="bidirectional",
-        use_node_type=True,
-        model={
-            "hidden_dim": baseline_cfg["hidden_dim"],
-            "num_layers": baseline_cfg["num_layers"],
-            "dropout": baseline_cfg["dropout"],
-        },
-        training={
-            "batch_size": baseline_cfg["batch_size"],
-            "epochs": baseline_cfg["epochs"],
-            "learning_rate": baseline_cfg["learning_rate"],
-            "weight_decay": baseline_cfg["weight_decay"],
-            "grad_clip": baseline_cfg["grad_clip"],
-            "log_every_batches": 100,
-            "num_workers": baseline_cfg["num_workers"],
-            "pin_memory": True,
-            "persistent_workers": baseline_cfg["num_workers"] > 0,
-            "prefetch_factor": 2,
-            "use_amp": baseline_cfg["use_amp"],
-        },
-    )
+    model_overrides, training_overrides = _resolve_stage_model(baseline_cfg)
+    gnn_type = baseline_cfg.get("gnn_type", config["gnn_type"])
 
     # Rebuild config from dict to ensure proper normalization
     cfg = BaselineConfig.from_dict({
@@ -268,26 +265,16 @@ def run_baseline(config: dict[str, Any], resume_run_dir: str | None = None) -> d
         "run_root": str(run_root),
         "seed": config["seed"],
         "device": config["device"],
-        "edge_mode": "bidirectional",
-        "use_node_type": True,
-        "gnn_type": config["gnn_type"],
-        "model": {
-            "hidden_dim": baseline_cfg["hidden_dim"],
-            "num_layers": baseline_cfg["num_layers"],
-            "dropout": baseline_cfg["dropout"],
-        },
+        "edge_mode": baseline_cfg.get("edge_mode", "bidirectional"),
+        "use_node_type": baseline_cfg.get("use_node_type", True),
+        "gnn_type": gnn_type,
+        "model": dict(model_overrides),
         "training": {
-            "batch_size": baseline_cfg["batch_size"],
-            "epochs": baseline_cfg["epochs"],
-            "learning_rate": baseline_cfg["learning_rate"],
-            "weight_decay": baseline_cfg["weight_decay"],
-            "grad_clip": baseline_cfg["grad_clip"],
             "log_every_batches": 100,
-            "num_workers": baseline_cfg["num_workers"],
             "pin_memory": True,
-            "persistent_workers": baseline_cfg["num_workers"] > 0,
+            "persistent_workers": training_overrides.get("num_workers", 0) > 0,
             "prefetch_factor": 2,
-            "use_amp": baseline_cfg["use_amp"],
+            **training_overrides,
         },
     })
 
@@ -325,42 +312,36 @@ def run_pointer(config: dict[str, Any], resume_run_dir: str | None = None) -> di
     console_print("=" * 60)
     console_print(f"  Prepared  : {prepared_root}")
     console_print(f"  Run root  : {run_root}")
-    console_print(f"  hidden    : {pointer_cfg['hidden_dim']}")
-    console_print(f"  layers    : {pointer_cfg['num_layers']}")
-    console_print(f"  dropout   : {pointer_cfg['dropout']}")
-    console_print(f"  batch     : {pointer_cfg['batch_size']}")
-    console_print(f"  epochs    : {pointer_cfg['epochs']}")
-    console_print(f"  max_args  : {pointer_cfg['max_args']}")
-    console_print(f"  arg_wt    : {pointer_cfg['arg_loss_weight']}")
+    _pm, _pt = _resolve_stage_model(pointer_cfg)
+    console_print(f"  hidden    : {_pm.get('hidden_dim')}")
+    console_print(f"  layers    : {_pm.get('num_layers')}")
+    console_print(f"  dropout   : {_pm.get('dropout')}")
+    console_print(f"  batch     : {_pt.get('batch_size')}")
+    console_print(f"  epochs    : {_pt.get('epochs')}")
+    console_print(f"  max_args  : {pointer_cfg.get('max_args', 3)}")
+    console_print(f"  arg_wt    : {pointer_cfg.get('arg_loss_weight', 0.5)}")
     console_print("")
+
+    model_overrides, training_overrides = _resolve_stage_model(pointer_cfg)
+    gnn_type = pointer_cfg.get("gnn_type", config["gnn_type"])
 
     cfg = PointerConfig.from_dict({
         "prepared_root": str(prepared_root),
         "run_root": str(run_root),
         "seed": config["seed"],
         "device": config["device"],
-        "edge_mode": "bidirectional",
-        "use_node_type": True,
-        "gnn_type": config["gnn_type"],
-        "max_args": pointer_cfg["max_args"],
-        "arg_loss_weight": pointer_cfg["arg_loss_weight"],
-        "model": {
-            "hidden_dim": pointer_cfg["hidden_dim"],
-            "num_layers": pointer_cfg["num_layers"],
-            "dropout": pointer_cfg["dropout"],
-        },
+        "edge_mode": pointer_cfg.get("edge_mode", "bidirectional"),
+        "use_node_type": pointer_cfg.get("use_node_type", True),
+        "gnn_type": gnn_type,
+        "max_args": pointer_cfg.get("max_args", 3),
+        "arg_loss_weight": pointer_cfg.get("arg_loss_weight", 0.5),
+        "model": dict(model_overrides),
         "training": {
-            "batch_size": pointer_cfg["batch_size"],
-            "epochs": pointer_cfg["epochs"],
-            "learning_rate": pointer_cfg["learning_rate"],
-            "weight_decay": pointer_cfg["weight_decay"],
-            "grad_clip": pointer_cfg["grad_clip"],
             "log_every_batches": 50,
-            "num_workers": pointer_cfg["num_workers"],
             "pin_memory": True,
-            "persistent_workers": pointer_cfg["num_workers"] > 0,
+            "persistent_workers": training_overrides.get("num_workers", 0) > 0,
             "prefetch_factor": 2,
-            "use_amp": pointer_cfg["use_amp"],
+            **training_overrides,
         },
     })
 
@@ -708,6 +689,24 @@ def main(argv: list[str] | None = None) -> int:
                 config[key] = {**config[key], **value}
             else:
                 config[key] = value
+
+        # A preset file (e.g. baseline_gat_state.json) is a standalone
+        # BaselineConfig/PointerConfig with top-level ``model``/``training``
+        # rather than wrapped in a ``baseline``/``pointer`` section. Fold those
+        # fields into the matching stage so run_baseline/run_pointer see them.
+        if "model" in user_config or "training" in user_config:
+            stage_key = "pointer" if "max_args" in user_config else "baseline"
+            target = config.setdefault(stage_key, {})
+            for fld in ("model", "training", "gnn_type", "prepared_root",
+                        "run_root", "device", "edge_mode", "use_node_type", "seed"):
+                if fld in user_config:
+                    if fld in ("model", "training"):
+                        target[fld] = {**target.get(fld, {}), **user_config[fld]}
+                    else:
+                        target[fld] = user_config[fld]
+            # Also surface gnn_type at top level for the banner/CLI path.
+            if "gnn_type" in user_config:
+                config["gnn_type"] = user_config["gnn_type"]
 
     # Apply CLI overrides
     if args.stages:
