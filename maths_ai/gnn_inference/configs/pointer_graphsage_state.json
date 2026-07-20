@@ -6,6 +6,7 @@
   "device": "auto",
   "edge_mode": "bidirectional",
   "use_node_type": true,
+  "gnn_type": "sage",
   "max_args": 3,
   "arg_loss_weight": 0.5,
   "model": {

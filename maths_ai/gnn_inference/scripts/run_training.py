@@ -112,6 +112,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
     "seed": 42,
     "device": "auto",
+    "gnn_type": "sage",
 }
 
 
@@ -269,6 +270,7 @@ def run_baseline(config: dict[str, Any], resume_run_dir: str | None = None) -> d
         "device": config["device"],
         "edge_mode": "bidirectional",
         "use_node_type": True,
+        "gnn_type": config["gnn_type"],
         "model": {
             "hidden_dim": baseline_cfg["hidden_dim"],
             "num_layers": baseline_cfg["num_layers"],
@@ -339,6 +341,7 @@ def run_pointer(config: dict[str, Any], resume_run_dir: str | None = None) -> di
         "device": config["device"],
         "edge_mode": "bidirectional",
         "use_node_type": True,
+        "gnn_type": config["gnn_type"],
         "max_args": pointer_cfg["max_args"],
         "arg_loss_weight": pointer_cfg["arg_loss_weight"],
         "model": {
@@ -663,6 +666,7 @@ Examples:
     parser.add_argument("--experiment-name", type=str, default=None, help="Name for this experiment run")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--device", type=str, default=None, help="Device: auto, cpu, cuda")
+    parser.add_argument("--gnn-type", type=str, default=None, choices=["sage", "gat"], help="GNN backbone: sage (GraphSAGE) or gat (GATv2)")
     parser.add_argument("--prepared-root", type=str, default=None, help="Path to prepared dataset root")
     parser.add_argument("--run-root", type=str, default=None, help="Path to runs output directory")
 
@@ -714,6 +718,8 @@ def main(argv: list[str] | None = None) -> int:
         config["seed"] = args.seed
     if args.device:
         config["device"] = args.device
+    if args.gnn_type:
+        config["gnn_type"] = args.gnn_type
     if args.prepared_root:
         config["prepared_root"] = args.prepared_root
     if args.run_root:
@@ -737,6 +743,7 @@ def main(argv: list[str] | None = None) -> int:
     console_print(f"  Stages     : {', '.join(config['stages'])}")
     console_print(f"  Seed       : {config['seed']}")
     console_print(f"  Device     : {config['device']}")
+    console_print(f"  GNN type   : {config['gnn_type']}")
     console_print(f"  Prepared   : {config['prepared_root']}")
     console_print(f"  Runs       : {config['run_root']}")
     console_print("")

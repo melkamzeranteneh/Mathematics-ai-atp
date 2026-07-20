@@ -22,10 +22,17 @@ from .argument_training import (
 from .argument_selector import TacticWithArgsClassifier, TacticWithArgsConfig
 from .dataset import CANONICAL_SPLITS, canonicalize_split_name
 from .labels import UNKNOWN_TACTIC, get_tactic_arity
-from .model import GraphSAGEClassifierConfig, GraphSAGEStateClassifier
+from .model import (
+    GATv2ClassifierConfig,
+    GATv2StateClassifier,
+    GraphSAGEClassifierConfig,
+    GraphSAGEStateClassifier,
+)
 from .pyg import NODE_TYPE_TO_ID
 from .reporting import console_print
 
+
+VALID_GNN_TYPES = ("sage", "gat")
 
 DEFAULT_BASELINE_CONFIG_PATH = Path("configs") / "baseline_graphsage_state.json"
 DEFAULT_POINTER_CONFIG_PATH = Path("configs") / "pointer_graphsage_state.json"
@@ -71,6 +78,7 @@ class BaselineConfig:
     device: str = "auto"
     edge_mode: str = "bidirectional"
     use_node_type: bool = True
+    gnn_type: str = "sage"
     model: GraphSAGEClassifierConfig = field(default_factory=GraphSAGEClassifierConfig)
     training: TrainingLoopConfig = field(default_factory=TrainingLoopConfig)
 
@@ -81,6 +89,9 @@ class BaselineConfig:
 
         model_payload = payload.get("model", {})
         training_payload = payload.get("training", {})
+        gnn_type = str(payload.get("gnn_type", "sage")).lower().strip()
+        if gnn_type not in VALID_GNN_TYPES:
+            raise ValueError(f"Training config field 'gnn_type' must be one of: {', '.join(VALID_GNN_TYPES)}.")
         return cls(
             prepared_root=Path(payload["prepared_root"]),
             run_root=Path(payload.get("run_root", "runs/baseline_gnn")),
@@ -88,6 +99,7 @@ class BaselineConfig:
             device=str(payload.get("device", "auto")),
             edge_mode=str(payload.get("edge_mode", "bidirectional")),
             use_node_type=bool(payload.get("use_node_type", True)),
+            gnn_type=gnn_type,
             model=GraphSAGEClassifierConfig(
                 hidden_dim=int(model_payload.get("hidden_dim", 128)),
                 num_layers=int(model_payload.get("num_layers", 4)),
@@ -117,6 +129,10 @@ class BaselineConfig:
         if device not in {"auto", "cpu", "cuda"}:
             raise ValueError("Training config field 'device' must be one of: auto, cpu, cuda.")
 
+        gnn_type = self.gnn_type.lower().strip()
+        if gnn_type not in VALID_GNN_TYPES:
+            raise ValueError(f"Training config field 'gnn_type' must be one of: {', '.join(VALID_GNN_TYPES)}.")
+
         if self.model.hidden_dim < 1:
             raise ValueError("Training config field 'model.hidden_dim' must be positive.")
         if self.model.num_layers < 1:
@@ -145,6 +161,7 @@ class BaselineConfig:
             device=device,
             edge_mode=edge_mode,
             use_node_type=self.use_node_type,
+            gnn_type=gnn_type,
             model=self.model,
             training=self.training,
         )
@@ -157,6 +174,7 @@ class BaselineConfig:
             "device": self.device,
             "edge_mode": self.edge_mode,
             "use_node_type": self.use_node_type,
+            "gnn_type": self.gnn_type,
             "model": self.model.to_dict(),
             "training": self.training.to_dict(),
         }
@@ -171,6 +189,7 @@ class PointerConfig:
     device: str = "auto"
     edge_mode: str = "bidirectional"
     use_node_type: bool = True
+    gnn_type: str = "sage"
     max_args: int = 3
     arg_loss_weight: float = 0.5
     model: TacticWithArgsConfig = field(default_factory=TacticWithArgsConfig)
@@ -183,6 +202,9 @@ class PointerConfig:
 
         model_payload = payload.get("model", {})
         training_payload = payload.get("training", {})
+        gnn_type = str(payload.get("gnn_type", "sage")).lower().strip()
+        if gnn_type not in VALID_GNN_TYPES:
+            raise ValueError(f"Training config field 'gnn_type' must be one of: {', '.join(VALID_GNN_TYPES)}.")
         return cls(
             prepared_root=Path(payload["prepared_root"]),
             run_root=Path(payload.get("run_root", "runs/pointer_gnn")),
@@ -190,6 +212,7 @@ class PointerConfig:
             device=str(payload.get("device", "auto")),
             edge_mode=str(payload.get("edge_mode", "bidirectional")),
             use_node_type=bool(payload.get("use_node_type", True)),
+            gnn_type=gnn_type,
             max_args=int(payload.get("max_args", 3)),
             arg_loss_weight=float(payload.get("arg_loss_weight", 0.5)),
             model=TacticWithArgsConfig(
@@ -223,6 +246,10 @@ class PointerConfig:
         if device not in {"auto", "cpu", "cuda"}:
             raise ValueError("Training config field 'device' must be one of: auto, cpu, cuda.")
 
+        gnn_type = self.gnn_type.lower().strip()
+        if gnn_type not in VALID_GNN_TYPES:
+            raise ValueError(f"Training config field 'gnn_type' must be one of: {', '.join(VALID_GNN_TYPES)}.")
+
         if self.model.hidden_dim < 1:
             raise ValueError("Training config field 'model.hidden_dim' must be positive.")
         if self.model.num_layers < 1:
@@ -249,6 +276,7 @@ class PointerConfig:
             device=device,
             edge_mode=edge_mode,
             use_node_type=self.use_node_type,
+            gnn_type=gnn_type,
             max_args=self.max_args,
             arg_loss_weight=self.arg_loss_weight,
             model=self.model,
@@ -263,6 +291,7 @@ class PointerConfig:
             "device": self.device,
             "edge_mode": self.edge_mode,
             "use_node_type": self.use_node_type,
+            "gnn_type": self.gnn_type,
             "max_args": self.max_args,
             "arg_loss_weight": self.arg_loss_weight,
             "model": self.model.to_dict(),
@@ -615,8 +644,8 @@ def resolve_device(device_name: str) -> torch.device:
     return torch.device(device_name)
 
 
-def build_baseline_model(metadata: PreparedMetadata, config: BaselineConfig) -> GraphSAGEStateClassifier:
-    return GraphSAGEStateClassifier(
+def build_baseline_model(metadata: PreparedMetadata, config: BaselineConfig) -> GraphSAGEStateClassifier | GATv2StateClassifier:
+    common = dict(
         num_node_labels=len(metadata.node_vocab),
         num_tactics=len(metadata.tactic_vocab),
         num_node_types=len(NODE_TYPE_TO_ID),
@@ -625,6 +654,9 @@ def build_baseline_model(metadata: PreparedMetadata, config: BaselineConfig) -> 
         dropout=config.model.dropout,
         use_node_type=config.use_node_type,
     )
+    if config.gnn_type == "gat":
+        return GATv2StateClassifier(**common)
+    return GraphSAGEStateClassifier(**common)
 
 
 def build_pointer_model(metadata: PreparedMetadata, config: PointerConfig) -> TacticWithArgsClassifier:
@@ -637,6 +669,7 @@ def build_pointer_model(metadata: PreparedMetadata, config: PointerConfig) -> Ta
         dropout=config.model.dropout,
         use_node_type=config.use_node_type,
         max_args=config.max_args,
+        gnn_type=config.gnn_type,
     )
 
 

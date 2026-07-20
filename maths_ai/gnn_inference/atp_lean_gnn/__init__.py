@@ -30,7 +30,12 @@ from .labels import (
     parse_tactic_arguments,
 )
 from .lemma_index import LemmaIndex, LemmaIndexConfig
-from .model import GraphSAGEClassifierConfig, GraphSAGEStateClassifier
+from .model import (
+    GATv2ClassifierConfig,
+    GATv2StateClassifier,
+    GraphSAGEClassifierConfig,
+    GraphSAGEStateClassifier,
+)
 from .preparation import PreparedExample, prepare_example
 from .premise_pool import CandidatePool, build_unified_pools
 from .premise_scoring import PremiseScorer, PremiseScorerConfig, compute_premise_ranking_loss
@@ -67,6 +72,8 @@ __all__ = [
     "DatasetRow",
     "EMPTY_TACTIC",
     "GraphNode",
+    "GATv2ClassifierConfig",
+    "GATv2StateClassifier",
     "GraphSAGEClassifierConfig",
     "GraphSAGEStateClassifier",
     "GraphStats",

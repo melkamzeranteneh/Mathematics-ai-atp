@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .labels import get_tactic_arity
-from .model import GraphSAGEStateClassifier
+from .model import GATv2StateClassifier, GraphSAGEStateClassifier
 from .pyg import NODE_TYPE_TO_ID
 
 
@@ -150,11 +150,12 @@ class TacticWithArgsClassifier(nn.Module):
         dropout: float = 0.2,
         use_node_type: bool = True,
         max_args: int = 3,
+        gnn_type: str = "sage",
     ) -> None:
         super().__init__()
 
         # Backbone — shared encoder + tactic head
-        self.backbone = GraphSAGEStateClassifier(
+        backbone_kwargs = dict(
             num_node_labels=num_node_labels,
             num_tactics=num_tactics,
             num_node_types=num_node_types,
@@ -163,6 +164,10 @@ class TacticWithArgsClassifier(nn.Module):
             dropout=dropout,
             use_node_type=use_node_type,
         )
+        if gnn_type == "gat":
+            self.backbone = GATv2StateClassifier(**backbone_kwargs)
+        else:
+            self.backbone = GraphSAGEStateClassifier(**backbone_kwargs)
 
         # Tactic embedding (one learned vector per tactic family)
         self.tactic_embedding = nn.Embedding(num_tactics, hidden_dim)
