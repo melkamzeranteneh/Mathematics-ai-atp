@@ -16,6 +16,8 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +29,34 @@ DEFAULT_PROVER_COMMAND = (
     "--goal_statement {goal}"
 )
 GOAL_FIELDS = ("formal_statement", "statement", "goal", "theorem")
+
+# Canonical miniF2F JSONL (488 problems, valid+test splits combined), hosted on
+# Hugging Face. Used to auto-download the dataset when it isn't present locally,
+# so nobody has to manually source/copy the file to run the benchmark.
+DEFAULT_DATASET_PATH = Path("data/minif2f.jsonl")
+DEFAULT_DATASET_URL = (
+    "https://huggingface.co/datasets/hk/MiniF2F-Cleaned/resolve/main/minif2f_cleaned.jsonl"
+)
+
+
+def ensure_dataset(path: Path, url: str) -> Path:
+    """Download the dataset to ``path`` if it isn't already present."""
+    if path.exists():
+        return path
+    print(f"Dataset not found at {path}; downloading from {url} ...")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            data = response.read()
+    except urllib.error.URLError as error:
+        raise SystemExit(
+            f"Could not download the dataset automatically ({error}). "
+            f"Please download it manually and save it to {path}, "
+            f"or pass an existing dataset file as the first argument."
+        ) from error
+    path.write_bytes(data)
+    print(f"Saved dataset to {path} ({len(data) / 1024:.1f} KiB).")
+    return path
 
 
 def load_examples(dataset_path: Path) -> list[dict[str, Any]]:
@@ -166,7 +196,27 @@ def write_reports(output_dir: Path, results: Iterable[dict[str, Any]], command: 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a miniF2F benchmark against the project prover.")
-    parser.add_argument("dataset", type=Path, help="miniF2F JSON, JSONL, or JSON dataset file")
+    parser.add_argument(
+        "dataset",
+        type=Path,
+        nargs="?",
+        default=DEFAULT_DATASET_PATH,
+        help=(
+            "miniF2F JSON, JSONL, or JSON dataset file. Defaults to "
+            f"{DEFAULT_DATASET_PATH}; if that file doesn't exist, it is "
+            "downloaded automatically."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-url",
+        default=DEFAULT_DATASET_URL,
+        help="URL to download the dataset from if it's missing locally.",
+    )
+    parser.add_argument(
+        "--no-download",
+        action="store_true",
+        help="Never auto-download the dataset; error out instead if it's missing.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("benchmark_results"))
     parser.add_argument("--prover-command", default=DEFAULT_PROVER_COMMAND, help="Shell command; use {goal} for the Lean goal.")
     parser.add_argument("--success-marker", default="Proof found!", help="Output text that marks a solved theorem.")
@@ -180,6 +230,10 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.timeout <= 0 or args.limit is not None and args.limit < 1:
         raise SystemExit("--timeout must be positive and --limit must be at least 1")
+    if args.no_download and not args.dataset.exists():
+        raise SystemExit(f"Dataset file {args.dataset} does not exist and --no-download was set.")
+    if not args.no_download:
+        ensure_dataset(args.dataset, args.dataset_url)
     examples = load_examples(args.dataset)
     if args.split is not None:
         examples = [example for example in examples if str(example.get("split", "")).lower() == args.split.lower()]
