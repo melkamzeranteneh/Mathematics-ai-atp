@@ -235,6 +235,7 @@ def run_baseline(config: dict[str, Any], resume_run_dir: str | None = None) -> d
         train_baseline,
         _create_run_dir,
         _write_json,
+        _safe_num_workers,
     )
 
     baseline_cfg = config["baseline"]
@@ -253,7 +254,8 @@ def run_baseline(config: dict[str, Any], resume_run_dir: str | None = None) -> d
     console_print(f"  batch     : {baseline_cfg['batch_size']}")
     console_print(f"  epochs    : {baseline_cfg['epochs']}")
     console_print(f"  lr        : {baseline_cfg['learning_rate']}")
-    console_print(f"  workers   : {baseline_cfg['num_workers']}")
+    _eff_workers, _ = _safe_num_workers(baseline_cfg["num_workers"], pin_memory=True)
+    console_print(f"  workers   : {_eff_workers} (requested {baseline_cfg['num_workers']})")
     console_print("")
 
     model_overrides, training_overrides = _resolve_stage_model(baseline_cfg)

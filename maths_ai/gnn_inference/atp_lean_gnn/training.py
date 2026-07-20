@@ -704,9 +704,16 @@ def maybe_wrap_data_parallel(model: nn.Module, device: torch.device) -> tuple[nn
     Returns the (possibly wrapped) model, the primary device batches must be
     moved to, and the list of CUDA device ids in use.  Single-GPU and CPU paths
     are returned unchanged so the rest of the training loop is unaffected.
+
+    An explicit device index (e.g. ``cuda:0``) disables DataParallel even when
+    several GPUs are present, which is the reliable choice in containers where
+    NCCL or ``/dev/shm`` are restricted.
     """
     if device.type != "cuda" or not torch.cuda.is_available():
         return model, device, [device.index or 0] if device.type == "cuda" else []
+    if device.index is not None:
+        # Explicit single-GPU request: skip DataParallel entirely.
+        return model, device, [device.index]
     gpu_count = torch.cuda.device_count()
     if gpu_count <= 1:
         return model, device, [device.index or 0]
