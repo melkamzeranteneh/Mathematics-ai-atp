@@ -12,8 +12,8 @@ from .dataset import canonicalize_split_name
 from .labels import UNKNOWN_TACTIC
 from .reporting import console_print
 from .training import (
+    _amp_dtype,
     _load_checkpoint,
-    _use_cuda_amp,
     build_baseline_model,
     load_baseline_config,
     load_prepared_metadata,
@@ -246,7 +246,8 @@ def analyze_saved_run(
     checkpoint = _load_checkpoint(checkpoint_path, device=device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    use_amp = _use_cuda_amp(device, config)
+    amp_dtype = _amp_dtype(device, config)
+    use_amp = amp_dtype is not None
     id_to_tactic = _invert_vocab(metadata.tactic_vocab)
     records: list[dict[str, object]] = []
     loss_sum = 0.0
@@ -262,7 +263,11 @@ def analyze_saved_run(
             true_tactic_names = _normalize_batch_strings(batch.tactic_name, batch_size)
 
             batch = batch.to(device, non_blocking=(device.type == "cuda" and config.training.pin_memory))
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            with torch.amp.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=use_amp,
+            ):
                 logits = model(batch)
                 probabilities = logits.softmax(dim=1)
                 known_mask = batch.y.view(-1) != metadata.unknown_tactic_id

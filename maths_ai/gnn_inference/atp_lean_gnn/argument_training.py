@@ -89,6 +89,7 @@ def train_one_epoch_with_args(
     total_epochs: int,
     log_every_batches: int,
     use_amp: bool,
+    amp_dtype: torch.dtype | None,
     pin_memory: bool,
 ) -> dict[str, float | int]:
     """Train one epoch with combined tactic + argument loss."""
@@ -113,7 +114,11 @@ def train_one_epoch_with_args(
         tactic_arities = [get_tactic_arity(n) for n in tactic_names]
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=use_amp,
+        ):
             tactic_logits, arg_logits_list = model(
                 batch,
                 teacher_tactic_ids=targets,
@@ -183,6 +188,7 @@ def evaluate_model_with_args(
     split_name: str | None = None,
     log_every_batches: int | None = None,
     use_amp: bool = False,
+    amp_dtype: torch.dtype | None = None,
     pin_memory: bool = False,
 ) -> dict[str, float | int]:
     """Evaluate model with combined metrics."""
@@ -206,7 +212,11 @@ def evaluate_model_with_args(
         arg_targets = _extract_arg_targets(batch, model.max_args, device)
         tactic_arities = [get_tactic_arity(n) for n in tactic_names]
 
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=use_amp,
+        ):
             tactic_logits, arg_logits_list = model(
                 batch,
                 tactic_names=tactic_names,

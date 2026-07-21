@@ -296,6 +296,17 @@ def process_split(
         data.tactic_raw = row.tactic
         data.tactic_name = tactic_name
 
+        # Materialize the readout node once. Older prepared datasets omit this
+        # field and remain supported by PreparedGraphDataset's fallback.
+        state_node_ids = [node.id for node in dag.nodes if node.label == "State"]
+        source_node_ids = {source for source, _ in dag.edges}
+        root_state_ids = [node_id for node_id in state_node_ids if node_id not in source_node_ids]
+        if len(root_state_ids) != 1:
+            raise ValueError(
+                f"Expected exactly one root State node, found {len(root_state_ids)}."
+            )
+        data.state_node_index = torch.tensor(root_state_ids, dtype=torch.long)
+
         # --- Argument-selection ground truth (additive) ---------------
         premise_mask = build_premise_mask(dag)
         data.premise_mask = torch.tensor(premise_mask, dtype=torch.bool)

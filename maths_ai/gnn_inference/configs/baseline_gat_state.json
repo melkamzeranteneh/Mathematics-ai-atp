@@ -23,6 +23,9 @@
     "pin_memory": true,
     "persistent_workers": true,
     "prefetch_factor": 2,
-    "use_amp": false
+    "use_amp": true,
+    "cache_in_memory": true,
+    "early_stopping_patience": 5,
+    "early_stopping_min_delta": 0.0001
   }
 }

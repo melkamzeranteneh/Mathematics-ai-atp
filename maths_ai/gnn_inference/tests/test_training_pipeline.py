@@ -189,6 +189,21 @@ class TrainingPipelineTests(unittest.TestCase):
         )
         self.assertNotIn(int(sample.state_node_index.item()), source_nodes)
 
+    def test_threaded_batch_loading_preserves_order_and_can_cache(self) -> None:
+        metadata = load_prepared_metadata(self.prepared_root)
+        dataset = PreparedGraphDataset(
+            metadata,
+            split="train",
+            edge_mode="forward",
+            io_threads=2,
+            cache_in_memory=True,
+        )
+
+        samples = dataset.__getitems__([1, 0])
+
+        self.assertEqual([int(sample.row_index) for sample in samples], [1, 0])
+        self.assertIs(dataset[1], samples[0])
+
     def test_bidirectional_transform_preserves_nodes_and_adds_reverse_edges(self) -> None:
         metadata = load_prepared_metadata(self.prepared_root)
         forward_sample = PreparedGraphDataset(metadata, split="train", edge_mode="forward")[0]

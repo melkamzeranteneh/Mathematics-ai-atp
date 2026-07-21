@@ -28,10 +28,10 @@ class GraphSAGEClassifierConfig:
 class GATv2ClassifierConfig:
     """Configuration for :class:`GATv2StateClassifier`.
 
-    ``heads`` multi-head attention outputs are concatenated and then projected
-    back to ``hidden_dim`` via a linear layer, so the classifier input width is
-    identical to the GraphSAGE variant.  No edge attributes are required; the
-    underlying ``GATv2Conv`` simply attends over ``edge_index``.
+    ``hidden_dim`` is the total width across all attention heads.  Each head
+    therefore emits ``hidden_dim // heads`` features and concatenation restores
+    the configured width.  No edge attributes are required; the underlying
+    ``GATv2Conv`` simply attends over ``edge_index``.
     """
 
     hidden_dim: int = 256
@@ -158,8 +158,14 @@ class GATv2StateClassifier(nn.Module):
             raise ValueError("GATv2StateClassifier requires at least one message-passing layer.")
         if heads < 1:
             raise ValueError("GATv2StateClassifier requires at least one attention head.")
+        if hidden_dim % heads != 0:
+            raise ValueError(
+                "GATv2StateClassifier requires hidden_dim to be divisible by heads "
+                f"(got hidden_dim={hidden_dim}, heads={heads})."
+            )
 
         self.heads = heads
+        self.head_dim = hidden_dim // heads
         self.label_embedding = nn.Embedding(num_node_labels, hidden_dim)
         self.node_type_embedding = (
             nn.Embedding(num_node_types, hidden_dim) if use_node_type else None
@@ -170,10 +176,15 @@ class GATv2StateClassifier(nn.Module):
         self.binder_kind_embedding = nn.Embedding(num_binder_kinds, hidden_dim)
 
         self.convs = nn.ModuleList(
-            GATv2Conv(hidden_dim, hidden_dim, heads=heads, dropout=dropout, concat=True)
+            GATv2Conv(
+                hidden_dim,
+                self.head_dim,
+                heads=heads,
+                dropout=dropout,
+                concat=True,
+            )
             for _ in range(num_layers)
         )
-        self.head_proj = nn.Linear(hidden_dim * heads, hidden_dim)
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(hidden_dim, num_tactics)
 
@@ -192,7 +203,6 @@ class GATv2StateClassifier(nn.Module):
         for conv in self.convs:
             x = conv(x, data.edge_index)
             x = F.relu(x)
-            x = self.head_proj(x)
             x = self.dropout(x)
         return x
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import random
@@ -56,6 +57,9 @@ class TrainingLoopConfig:
     persistent_workers: bool = True
     prefetch_factor: int = 2
     use_amp: bool = True
+    cache_in_memory: bool = False
+    early_stopping_patience: int = 0
+    early_stopping_min_delta: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -70,6 +74,9 @@ class TrainingLoopConfig:
             "persistent_workers": self.persistent_workers,
             "prefetch_factor": self.prefetch_factor,
             "use_amp": self.use_amp,
+            "cache_in_memory": self.cache_in_memory,
+            "early_stopping_patience": self.early_stopping_patience,
+            "early_stopping_min_delta": self.early_stopping_min_delta,
         }
 
 
@@ -125,6 +132,9 @@ class BaselineConfig:
                 persistent_workers=bool(training_payload.get("persistent_workers", True)),
                 prefetch_factor=int(training_payload.get("prefetch_factor", 2)),
                 use_amp=bool(training_payload.get("use_amp", True)),
+                cache_in_memory=bool(training_payload.get("cache_in_memory", False)),
+                early_stopping_patience=int(training_payload.get("early_stopping_patience", 0)),
+                early_stopping_min_delta=float(training_payload.get("early_stopping_min_delta", 0.0)),
             ),
         ).normalized()
 
@@ -161,6 +171,10 @@ class BaselineConfig:
             raise ValueError("Training config field 'training.num_workers' cannot be negative.")
         if self.training.prefetch_factor < 1:
             raise ValueError("Training config field 'training.prefetch_factor' must be positive.")
+        if self.training.early_stopping_patience < 0:
+            raise ValueError("Training config field 'training.early_stopping_patience' cannot be negative.")
+        if self.training.early_stopping_min_delta < 0:
+            raise ValueError("Training config field 'training.early_stopping_min_delta' cannot be negative.")
 
         return BaselineConfig(
             prepared_root=self.prepared_root.resolve(),
@@ -243,6 +257,9 @@ class PointerConfig:
                 persistent_workers=bool(training_payload.get("persistent_workers", True)),
                 prefetch_factor=int(training_payload.get("prefetch_factor", 2)),
                 use_amp=bool(training_payload.get("use_amp", True)),
+                cache_in_memory=bool(training_payload.get("cache_in_memory", False)),
+                early_stopping_patience=int(training_payload.get("early_stopping_patience", 0)),
+                early_stopping_min_delta=float(training_payload.get("early_stopping_min_delta", 0.0)),
             ),
         ).normalized()
 
@@ -275,6 +292,10 @@ class PointerConfig:
             raise ValueError("Training config field 'training.learning_rate' must be positive.")
         if self.training.weight_decay < 0:
             raise ValueError("Training config field 'training.weight_decay' cannot be negative.")
+        if self.training.early_stopping_patience < 0:
+            raise ValueError("Training config field 'training.early_stopping_patience' cannot be negative.")
+        if self.training.early_stopping_min_delta < 0:
+            raise ValueError("Training config field 'training.early_stopping_min_delta' cannot be negative.")
         if self.training.grad_clip <= 0:
             raise ValueError("Training config field 'training.grad_clip' must be positive.")
 
@@ -456,8 +477,11 @@ def transform_edge_index(edge_index: torch.Tensor, *, edge_mode: str) -> torch.T
 
     forward = edge_index.to(dtype=torch.long)
     reverse = forward[[1, 0], :]
-    combined = torch.cat([forward, reverse], dim=1)
-    return torch.unique(combined, dim=1).contiguous()
+    # Prepared graphs are DAGs whose edges were already deduplicated. They
+    # cannot contain reciprocal pairs or self-loops, so concatenation is both
+    # sufficient and much cheaper than sorting every graph with torch.unique
+    # on every epoch.
+    return torch.cat([forward, reverse], dim=1).contiguous()
 
 
 def validate_prepared_data(data, *, path: Path, split: str, required_fields: tuple[str, ...]) -> None:
@@ -512,11 +536,16 @@ class PreparedGraphDataset(Dataset):
         split: str,
         edge_mode: str = "bidirectional",
         required_fields: tuple[str, ...] = REQUIRED_DATA_FIELDS,
+        io_threads: int = 0,
+        cache_in_memory: bool = False,
     ) -> None:
         self.metadata = metadata
         self.split = canonicalize_split_name(split)
         self.edge_mode = edge_mode
         self.required_fields = required_fields
+        self.io_threads = max(0, int(io_threads))
+        self.cache_in_memory = bool(cache_in_memory)
+        self._thread_pool: ThreadPoolExecutor | None = None
         self.pyg_dir = metadata.split_pyg_dir(self.split)
         self.files = sorted(self.pyg_dir.glob("*.pt"))
         if not self.files:
@@ -530,25 +559,48 @@ class PreparedGraphDataset(Dataset):
                 f"Prepared split '{self.split}' manifest reports {expected_count} examples, "
                 f"but '{self.pyg_dir}' contains {len(self.files)} '.pt' files."
             )
+        self._cache = [None] * len(self.files) if self.cache_in_memory else None
 
     def __len__(self) -> int:
         return len(self.files)
 
     def __getitem__(self, index: int):
+        if self._cache is not None and self._cache[index] is not None:
+            return self._cache[index]
+
         path = self.files[index]
         data = torch.load(path, map_location="cpu", weights_only=False)
         validate_prepared_data(data, path=path, split=self.split, required_fields=self.required_fields)
 
         data.x = data.x.to(dtype=torch.long)
         data.node_type = data.node_type.to(dtype=torch.long)
-        data.state_node_index = infer_state_node_index(
-            data,
-            state_label_id=self.metadata.state_label_id,
-            path=path,
-        )
+        if not hasattr(data, "state_node_index"):
+            data.state_node_index = infer_state_node_index(
+                data,
+                state_label_id=self.metadata.state_label_id,
+                path=path,
+            )
         data.edge_index = transform_edge_index(data.edge_index, edge_mode=self.edge_mode)
         data.y = data.y.view(-1).to(dtype=torch.long)
+        if self._cache is not None:
+            self._cache[index] = data
         return data
+
+    def __getitems__(self, indices: list[int]):
+        """Load one batch concurrently when process workers cannot be used.
+
+        PyTorch's map-style fetcher calls ``__getitems__`` with the complete
+        batch of indices.  A small thread pool overlaps high-latency reads from
+        network filesystems without allocating multiprocessing shared memory.
+        """
+        if self.io_threads <= 1 or len(indices) <= 1:
+            return [self[index] for index in indices]
+        if self._thread_pool is None:
+            self._thread_pool = ThreadPoolExecutor(
+                max_workers=self.io_threads,
+                thread_name_prefix=f"gnn-{self.split}-io",
+            )
+        return list(self._thread_pool.map(self.__getitem__, indices))
 
 
 def _shm_bytes() -> int:
@@ -598,6 +650,12 @@ def build_dataloaders(
     if shm_warning:
         console_print(f"  [warn] {shm_warning}")
     use_workers = num_workers > 0
+    io_threads = requested_workers if requested_workers > 0 and not use_workers else 0
+    if io_threads:
+        console_print(
+            f"  [info] using {io_threads} in-process I/O threads as the "
+            "shared-memory-safe DataLoader fallback."
+        )
     loader_kwargs: dict[str, object] = {
         "batch_size": config.training.batch_size,
         "num_workers": num_workers,
@@ -613,6 +671,8 @@ def build_dataloaders(
             split=split,
             edge_mode=config.edge_mode,
             required_fields=required_fields,
+            io_threads=io_threads,
+            cache_in_memory=config.training.cache_in_memory,
         )
         for split in CANONICAL_SPLITS
     }
@@ -764,6 +824,10 @@ class PyGBatchDataParallel(nn.Module):
 
     def _ensure_inner(self) -> nn.Module:
         if self.inner is None and not self._fallback:
+            if not torch.cuda.is_available():
+                self._fallback = True
+                self.inner = self.module
+                return self.inner
             try:
                 self.inner = PyGDataParallel(self.module, device_ids=self.device_ids)
             except Exception:
@@ -779,7 +843,12 @@ class PyGBatchDataParallel(nn.Module):
             # data list, so re-batch before calling it.
             from torch_geometric.data import Batch
 
-            return inner(Batch.from_data_list(data_list).to(f"cuda:{self.device_ids[0]}"))
+            target = (
+                torch.device(f"cuda:{self.device_ids[0]}")
+                if torch.cuda.is_available()
+                else torch.device("cpu")
+            )
+            return inner(Batch.from_data_list(data_list).to(target))
         try:
             return inner(data_list)
         except RuntimeError as exc:
@@ -828,14 +897,24 @@ def build_pointer_model(metadata: PreparedMetadata, config: PointerConfig) -> Ta
     )
 
 
-def _use_cuda_amp(device: torch.device, config: BaselineConfig | PointerConfig) -> bool:
+def _amp_dtype(
+    device: torch.device,
+    config: BaselineConfig | PointerConfig,
+) -> torch.dtype | None:
     if not config.training.use_amp or device.type != "cuda":
-        return False
-    # GATv2 attention scores overflow under fp16 autocast and produce NaNs;
-    # keep it in fp32 even when AMP is requested.
+        return None
+    # FP16 attention scores can overflow. Ampere GPUs support BF16, whose
+    # exponent range matches FP32 and avoids that failure while retaining
+    # Tensor Core acceleration.
     if getattr(config, "gnn_type", "sage") == "gat":
-        return False
-    return True
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return None
+    return torch.float16
+
+
+def _use_cuda_amp(device: torch.device, config: BaselineConfig | PointerConfig) -> bool:
+    return _amp_dtype(device, config) is not None
 
 
 def _should_log_batch(batch_index: int, total_batches: int, *, log_every_batches: int) -> bool:
@@ -853,6 +932,24 @@ def _format_elapsed(seconds: float) -> str:
     return f"{int(minutes)}m {remaining_seconds:.0f}s"
 
 
+def _move_baseline_batch(
+    model: nn.Module,
+    batch,
+    *,
+    device: torch.device,
+    pin_memory: bool,
+):
+    # PyG DataParallel expects a CPU List[Data] and performs its own balanced
+    # scatter. Moving the Batch to cuda:0 first adds a GPU round-trip and makes
+    # cuda:0 a transfer bottleneck.
+    if isinstance(model, PyGBatchDataParallel) and not model._fallback:
+        return batch
+    return batch.to(
+        device,
+        non_blocking=(device.type == "cuda" and pin_memory),
+    )
+
+
 def train_one_epoch(
     model: GraphSAGEStateClassifier,
     loader: DataLoader,
@@ -866,6 +963,7 @@ def train_one_epoch(
     total_epochs: int,
     log_every_batches: int,
     use_amp: bool,
+    amp_dtype: torch.dtype | None,
     pin_memory: bool,
 ) -> dict[str, float | int]:
     model.train()
@@ -873,6 +971,8 @@ def train_one_epoch(
     total_examples = 0
     total_batches = len(loader)
     start_time = time.perf_counter()
+    previous_step_end = start_time
+    data_wait_seconds = 0.0
 
     console_print(
         f"  Starting epoch {epoch:02d}/{total_epochs:02d} "
@@ -880,13 +980,23 @@ def train_one_epoch(
     )
 
     for batch_index, batch in enumerate(loader, start=1):
-        batch = batch.to(device, non_blocking=(device.type == "cuda" and pin_memory))
-        targets = batch.y.view(-1)
+        data_wait_seconds += time.perf_counter() - previous_step_end
+        batch = _move_baseline_batch(
+            model,
+            batch,
+            device=device,
+            pin_memory=pin_memory,
+        )
+        targets = batch.y.view(-1).to(device, non_blocking=(device.type == "cuda"))
         if bool((targets == unknown_tactic_id).any()):
             raise ValueError("The train split contains '<UNK_TACTIC>' targets, which should never happen.")
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=amp_dtype,
+            enabled=use_amp,
+        ):
             logits = model(batch)
             loss = F.cross_entropy(logits, targets)
 
@@ -914,10 +1024,13 @@ def train_one_epoch(
                 f"avg_loss={total_loss / max(total_examples, 1):.4f} | "
                 f"elapsed={elapsed}"
             )
+        previous_step_end = time.perf_counter()
 
     return {
         "loss": total_loss / max(total_examples, 1),
         "example_count": total_examples,
+        "data_wait_seconds": data_wait_seconds,
+        "elapsed_seconds": time.perf_counter() - start_time,
     }
 
 
@@ -930,6 +1043,7 @@ def evaluate_model(
     split_name: str | None = None,
     log_every_batches: int | None = None,
     use_amp: bool = False,
+    amp_dtype: torch.dtype | None = None,
     pin_memory: bool = False,
 ) -> dict[str, float | int]:
     model.eval()
@@ -940,16 +1054,28 @@ def evaluate_model(
     top5_correct = 0
     total_batches = len(loader)
     start_time = time.perf_counter()
+    previous_step_end = start_time
+    data_wait_seconds = 0.0
 
     if split_name is not None:
         console_print(f"  Evaluating {split_name} split ({total_batches} batches)...")
 
     with torch.no_grad():
         for batch_index, batch in enumerate(loader, start=1):
-            batch = batch.to(device, non_blocking=(device.type == "cuda" and pin_memory))
-            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+            data_wait_seconds += time.perf_counter() - previous_step_end
+            batch = _move_baseline_batch(
+                model,
+                batch,
+                device=device,
+                pin_memory=pin_memory,
+            )
+            with torch.amp.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=use_amp,
+            ):
                 logits = model(batch)
-            targets = batch.y.view(-1)
+            targets = batch.y.view(-1).to(device, non_blocking=(device.type == "cuda"))
             batch_metrics = compute_eval_metrics_from_logits(
                 logits,
                 targets,
@@ -973,6 +1099,7 @@ def evaluate_model(
                     f"excluded={unknown_label_excluded_count} | "
                     f"elapsed={elapsed}"
                 )
+            previous_step_end = time.perf_counter()
 
     top1 = top1_correct / known_label_count if known_label_count else 0.0
     top5 = top5_correct / known_label_count if known_label_count else 0.0
@@ -985,6 +1112,8 @@ def evaluate_model(
         "known_label_count": known_label_count,
         "unknown_label_excluded_count": unknown_label_excluded_count,
         "evaluated_count": known_label_count + unknown_label_excluded_count,
+        "data_wait_seconds": data_wait_seconds,
+        "elapsed_seconds": time.perf_counter() - start_time,
     }
 
 
@@ -1049,9 +1178,10 @@ def train_baseline(
     metadata = load_prepared_metadata(config.prepared_root)
     set_seed(config.seed)
     device = resolve_device(config.device)
-    use_amp = _use_cuda_amp(device, config)
-    if getattr(config, "gnn_type", "sage") == "gat" and config.training.use_amp and device.type == "cuda":
-        console_print("  AMP disabled for GATv2 (fp16 attention overflows to NaN).")
+    amp_dtype = _amp_dtype(device, config)
+    use_amp = amp_dtype is not None
+    if config.gnn_type == "gat" and config.training.use_amp and amp_dtype is None and device.type == "cuda":
+        console_print("  AMP disabled for GATv2 because BF16 is unavailable; FP16 attention is unsafe.")
     datasets, loaders = build_dataloaders(metadata, config, required_fields=REQUIRED_DATA_FIELDS)
     if resume_run_dir is None:
         run_dir = _create_run_dir(config.run_root)
@@ -1084,7 +1214,10 @@ def train_baseline(
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
-    grad_scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+    grad_scaler = torch.amp.GradScaler(
+        device.type,
+        enabled=(amp_dtype == torch.float16),
+    )
 
     if resume_run_dir is not None:
         if not last_checkpoint_path.exists():
@@ -1102,20 +1235,25 @@ def train_baseline(
                 dict(best_checkpoint.get("val_metrics", {})).get("top1_accuracy", -1.0)
             )
 
+    epochs_without_improvement = 0
+    last_completed_epoch = start_epoch - 1
+
     console_print(f"\n  Training baseline run in: {run_dir}")
     console_print(f"  Prepared cache           : {config.prepared_root}")
     console_print(f"  Device                   : {device}" + (f" (DataParallel over GPUs {gpu_ids})" if len(gpu_ids) > 1 else ""))
-    console_print(f"  AMP enabled              : {use_amp}")
+    precision = str(amp_dtype).removeprefix("torch.") if amp_dtype is not None else "float32"
+    console_print(f"  Compute precision        : {precision}")
     console_print(
         f"  Split sizes              : train={len(datasets['train'])}, "
         f"val={len(datasets['val'])}, test={len(datasets['test'])}"
     )
     console_print(
         f"  DataLoader settings      : batch_size={config.training.batch_size}, "
-        f"workers={config.training.num_workers}, "
+        f"process_workers={loaders['train'].num_workers}, "
+        f"io_threads={datasets['train'].io_threads}, "
         f"pin_memory={config.training.pin_memory}, "
-        f"persistent_workers={config.training.persistent_workers and config.training.num_workers > 0}, "
-        f"prefetch_factor={config.training.prefetch_factor if config.training.num_workers > 0 else 'n/a'}"
+        f"persistent_workers={getattr(loaders['train'], 'persistent_workers', False)}, "
+        f"cache_in_memory={config.training.cache_in_memory}"
     )
     if resume_run_dir is not None:
         console_print(
@@ -1124,6 +1262,7 @@ def train_baseline(
         )
 
     for epoch in range(start_epoch, config.training.epochs + 1):
+        last_completed_epoch = epoch
         train_metrics = train_one_epoch(
             model,
             loaders["train"],
@@ -1136,6 +1275,7 @@ def train_baseline(
             total_epochs=config.training.epochs,
             log_every_batches=config.training.log_every_batches,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
             pin_memory=config.training.pin_memory,
         )
         val_metrics = evaluate_model(
@@ -1146,6 +1286,7 @@ def train_baseline(
             split_name="val",
             log_every_batches=config.training.log_every_batches,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
             pin_memory=config.training.pin_memory,
         )
 
@@ -1153,11 +1294,15 @@ def train_baseline(
             "epoch": epoch,
             "train_loss": float(train_metrics["loss"]),
             "train_example_count": int(train_metrics["example_count"]),
+            "train_data_wait_seconds": float(train_metrics["data_wait_seconds"]),
+            "train_elapsed_seconds": float(train_metrics["elapsed_seconds"]),
             "val_loss": float(val_metrics["loss"]),
             "val_top1": float(val_metrics["top1_accuracy"]),
             "val_top5": float(val_metrics["top5_accuracy"]),
             "known_label_eval_count": int(val_metrics["known_label_count"]),
             "unknown_label_excluded_count": int(val_metrics["unknown_label_excluded_count"]),
+            "val_data_wait_seconds": float(val_metrics["data_wait_seconds"]),
+            "val_elapsed_seconds": float(val_metrics["elapsed_seconds"]),
         }
         _append_jsonl(metrics_path, epoch_record)
 
@@ -1169,9 +1314,14 @@ def train_baseline(
             epoch=epoch,
             val_metrics=val_metrics,
         )
-        if float(val_metrics["top1_accuracy"]) > best_val_top1:
+        improved = (
+            float(val_metrics["top1_accuracy"])
+            > best_val_top1 + config.training.early_stopping_min_delta
+        )
+        if improved:
             best_val_top1 = float(val_metrics["top1_accuracy"])
             best_epoch = epoch
+            epochs_without_improvement = 0
             _save_checkpoint(
                 best_checkpoint_path,
                 model=model,
@@ -1180,6 +1330,8 @@ def train_baseline(
                 epoch=epoch,
                 val_metrics=val_metrics,
             )
+        else:
+            epochs_without_improvement += 1
 
         console_print(
             f"  Epoch {epoch:02d}/{config.training.epochs:02d} | "
@@ -1187,9 +1339,20 @@ def train_baseline(
             f"val_loss={epoch_record['val_loss']:.4f} | "
             f"val_top1={epoch_record['val_top1']:.4f} | "
             f"val_top5={epoch_record['val_top5']:.4f} | "
+            f"data_wait={_format_elapsed(epoch_record['train_data_wait_seconds'])} | "
             f"known={epoch_record['known_label_eval_count']} | "
             f"excluded={epoch_record['unknown_label_excluded_count']}"
         )
+
+        if (
+            config.training.early_stopping_patience > 0
+            and epochs_without_improvement >= config.training.early_stopping_patience
+        ):
+            console_print(
+                "  Early stopping: validation top-1 did not improve for "
+                f"{epochs_without_improvement} epochs (best epoch {best_epoch})."
+            )
+            break
 
     best_checkpoint = _load_checkpoint(best_checkpoint_path, device=device)
     _unwrap_model(model).load_state_dict(best_checkpoint["model_state_dict"])
@@ -1206,6 +1369,7 @@ def train_baseline(
             split_name="val",
             log_every_batches=config.training.log_every_batches,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
             pin_memory=config.training.pin_memory,
         ),
     }
@@ -1221,6 +1385,7 @@ def train_baseline(
             split_name="test",
             log_every_batches=config.training.log_every_batches,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
             pin_memory=config.training.pin_memory,
         ),
     }
@@ -1233,8 +1398,10 @@ def train_baseline(
         "prepared_root": str(config.prepared_root),
         "device": str(device),
         "amp_enabled": use_amp,
+        "amp_dtype": precision,
         "dataset_sizes": {split: len(dataset) for split, dataset in datasets.items()},
         "start_epoch": start_epoch,
+        "last_completed_epoch": last_completed_epoch,
         "best_epoch": best_epoch,
         "best_checkpoint": str(best_checkpoint_path),
         "last_checkpoint": str(last_checkpoint_path),
@@ -1261,7 +1428,8 @@ def train_pointer(
     metadata = load_prepared_metadata(config.prepared_root)
     set_seed(config.seed)
     device = resolve_device(config.device)
-    use_amp = _use_cuda_amp(device, config)
+    amp_dtype = _amp_dtype(device, config)
+    use_amp = amp_dtype is not None
     datasets, loaders = build_dataloaders(metadata, config, required_fields=REQUIRED_POINTER_DATA_FIELDS)
     
     if resume_run_dir is None:
@@ -1295,7 +1463,10 @@ def train_pointer(
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
-    grad_scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+    grad_scaler = torch.amp.GradScaler(
+        device.type,
+        enabled=(amp_dtype == torch.float16),
+    )
 
     if resume_run_dir is not None:
         if not last_checkpoint_path.exists():
@@ -1313,20 +1484,25 @@ def train_pointer(
                 dict(best_checkpoint.get("val_metrics", {})).get("combined_loss", float("inf"))
             )
 
+    epochs_without_improvement = 0
+    last_completed_epoch = start_epoch - 1
+
     console_print(f"\n  Training pointer run in  : {run_dir}")
     console_print(f"  Prepared cache           : {config.prepared_root}")
     console_print(f"  Device                   : {device}" + (f" (DataParallel over GPUs {gpu_ids})" if len(gpu_ids) > 1 else ""))
-    console_print(f"  AMP enabled              : {use_amp}")
+    precision = str(amp_dtype).removeprefix("torch.") if amp_dtype is not None else "float32"
+    console_print(f"  Compute precision        : {precision}")
     console_print(
         f"  Split sizes              : train={len(datasets['train'])}, "
         f"val={len(datasets['val'])}, test={len(datasets['test'])}"
     )
     console_print(
         f"  DataLoader settings      : batch_size={config.training.batch_size}, "
-        f"workers={config.training.num_workers}, "
+        f"process_workers={loaders['train'].num_workers}, "
+        f"io_threads={datasets['train'].io_threads}, "
         f"pin_memory={config.training.pin_memory}, "
-        f"persistent_workers={config.training.persistent_workers and config.training.num_workers > 0}, "
-        f"prefetch_factor={config.training.prefetch_factor if config.training.num_workers > 0 else 'n/a'}"
+        f"persistent_workers={getattr(loaders['train'], 'persistent_workers', False)}, "
+        f"cache_in_memory={config.training.cache_in_memory}"
     )
     console_print(f"  Max args per step        : {config.max_args}")
     console_print(f"  Argument loss weight     : {config.arg_loss_weight}")
@@ -1337,6 +1513,7 @@ def train_pointer(
         )
 
     for epoch in range(start_epoch, config.training.epochs + 1):
+        last_completed_epoch = epoch
         train_metrics = train_one_epoch_with_args(
             model,
             loaders["train"],
@@ -1350,6 +1527,7 @@ def train_pointer(
             total_epochs=config.training.epochs,
             log_every_batches=config.training.log_every_batches,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
             pin_memory=config.training.pin_memory,
         )
         val_metrics = evaluate_model_with_args(
@@ -1361,6 +1539,7 @@ def train_pointer(
             split_name="val",
             log_every_batches=config.training.log_every_batches,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
             pin_memory=config.training.pin_memory,
         )
 
@@ -1386,9 +1565,14 @@ def train_pointer(
             epoch=epoch,
             val_metrics=val_metrics,
         )
-        if float(val_metrics["combined_loss"]) < best_val_loss:
+        improved = (
+            float(val_metrics["combined_loss"])
+            < best_val_loss - config.training.early_stopping_min_delta
+        )
+        if improved:
             best_val_loss = float(val_metrics["combined_loss"])
             best_epoch = epoch
+            epochs_without_improvement = 0
             _save_checkpoint(
                 best_checkpoint_path,
                 model=model,
@@ -1397,6 +1581,8 @@ def train_pointer(
                 epoch=epoch,
                 val_metrics=val_metrics,
             )
+        else:
+            epochs_without_improvement += 1
 
         console_print(
             f"  Epoch {epoch:02d}/{config.training.epochs:02d} | "
@@ -1405,6 +1591,16 @@ def train_pointer(
             f"val_tactic_acc={epoch_record['val_tactic_accuracy']:.4f} | "
             f"known={epoch_record['known_label_eval_count']}"
         )
+
+        if (
+            config.training.early_stopping_patience > 0
+            and epochs_without_improvement >= config.training.early_stopping_patience
+        ):
+            console_print(
+                "  Early stopping: validation loss did not improve for "
+                f"{epochs_without_improvement} epochs (best epoch {best_epoch})."
+            )
+            break
 
     best_checkpoint = _load_checkpoint(best_checkpoint_path, device=device)
     _unwrap_model(model).load_state_dict(best_checkpoint["model_state_dict"])
@@ -1422,6 +1618,7 @@ def train_pointer(
             split_name="val",
             log_every_batches=config.training.log_every_batches,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
             pin_memory=config.training.pin_memory,
         ),
     }
@@ -1438,6 +1635,7 @@ def train_pointer(
             split_name="test",
             log_every_batches=config.training.log_every_batches,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
             pin_memory=config.training.pin_memory,
         ),
     }
@@ -1450,8 +1648,10 @@ def train_pointer(
         "prepared_root": str(config.prepared_root),
         "device": str(device),
         "amp_enabled": use_amp,
+        "amp_dtype": precision,
         "dataset_sizes": {split: len(dataset) for split, dataset in datasets.items()},
         "start_epoch": start_epoch,
+        "last_completed_epoch": last_completed_epoch,
         "best_epoch": best_epoch,
         "best_checkpoint": str(best_checkpoint_path),
         "last_checkpoint": str(last_checkpoint_path),
@@ -1484,6 +1684,7 @@ def evaluate_baseline_run(run_dir: str | Path, *, split: str) -> dict[str, objec
     metadata = load_prepared_metadata(config.prepared_root)
     device = resolve_device(config.device)
     model = build_baseline_model(metadata, config).to(device)
+    amp_dtype = _amp_dtype(device, config)
     checkpoint_path = run_directory / "best.pt"
     checkpoint = _load_checkpoint(checkpoint_path, device=device)
     _unwrap_model(model).load_state_dict(checkpoint["model_state_dict"])
@@ -1505,7 +1706,8 @@ def evaluate_baseline_run(run_dir: str | Path, *, split: str) -> dict[str, objec
             unknown_tactic_id=metadata.unknown_tactic_id,
             split_name=canonical_split,
             log_every_batches=config.training.log_every_batches,
-            use_amp=_use_cuda_amp(device, config),
+            use_amp=amp_dtype is not None,
+            amp_dtype=amp_dtype,
             pin_memory=config.training.pin_memory,
         ),
     }

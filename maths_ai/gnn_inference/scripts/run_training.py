@@ -76,6 +76,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "grad_clip": 1.0,
         "num_workers": 12,
         "use_amp": True,
+        "cache_in_memory": False,
+        "early_stopping_patience": 5,
+        "early_stopping_min_delta": 0.0001,
     },
 
     "pointer": {
@@ -91,6 +94,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "grad_clip": 1.0,
         "num_workers": 8,
         "use_amp": True,
+        "cache_in_memory": False,
+        "early_stopping_patience": 5,
+        "early_stopping_min_delta": 0.0001,
     },
 
     "scorer": {
@@ -218,7 +224,8 @@ def _resolve_stage_model(baseline_cfg: dict[str, Any]) -> dict[str, Any]:
     inline_model_keys = ("hidden_dim", "num_layers", "dropout")
     inline_training_keys = (
         "batch_size", "epochs", "learning_rate", "weight_decay",
-        "grad_clip", "num_workers", "use_amp",
+        "grad_clip", "num_workers", "use_amp", "cache_in_memory",
+        "early_stopping_patience", "early_stopping_min_delta",
     )
     model = {k: baseline_cfg[k] for k in inline_model_keys if k in baseline_cfg}
     model.update(baseline_cfg.get("model", {}) or {})

@@ -12,7 +12,8 @@
     "model": {
         "hidden_dim": 256,
         "num_layers": 4,
-        "dropout": 0.2
+        "dropout": 0.2,
+        "heads": 4
     },
     "training": {
         "batch_size": 256,
@@ -25,6 +26,9 @@
         "pin_memory": true,
         "persistent_workers": true,
         "prefetch_factor": 2,
-        "use_amp": false
+        "use_amp": true,
+        "cache_in_memory": true,
+        "early_stopping_patience": 5,
+        "early_stopping_min_delta": 0.0001
     }
 }

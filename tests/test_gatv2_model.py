@@ -20,6 +20,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.training import (
 from maths_ai.gnn_inference.atp_lean_gnn.argument_selector import TacticWithArgsClassifier
 from maths_ai.gnn_inference.atp_lean_gnn.training import (
     PyGBatchDataParallel,
+    _amp_dtype,
     _safe_num_workers,
     _unwrap_model,
     maybe_wrap_data_parallel,
@@ -51,7 +52,7 @@ def test_gatv2_forward_shape():
     assert out.shape == (1, 5)
 
 
-def test_gatv2_head_proj_width():
+def test_gatv2_total_width_is_split_across_heads():
     heads = 4
     hidden_dim = 16
     model = GATv2StateClassifier(
@@ -61,13 +62,24 @@ def test_gatv2_head_proj_width():
         num_layers=2,
         heads=heads,
     )
-    assert model.head_proj.in_features == heads * hidden_dim
-    assert model.head_proj.out_features == hidden_dim
+    assert model.head_dim == hidden_dim // heads
+    assert model.convs[0].out_channels == hidden_dim // heads
+    assert model.convs[0].heads == heads
 
 
 def test_gatv2_requires_at_least_one_layer():
     with pytest.raises(ValueError):
         GATv2StateClassifier(num_node_labels=10, num_tactics=5, num_layers=0)
+
+
+def test_gatv2_requires_hidden_dim_divisible_by_heads():
+    with pytest.raises(ValueError, match="divisible"):
+        GATv2StateClassifier(
+            num_node_labels=10,
+            num_tactics=5,
+            hidden_dim=10,
+            heads=4,
+        )
 
 
 def test_gatv2_does_not_require_edge_attr():
@@ -125,8 +137,7 @@ def test_baseline_config_reads_heads_for_gat():
     model = build_baseline_model(meta, cfg)
 
     assert isinstance(model, GATv2StateClassifier)
-    # head_proj in_features = heads * hidden_dim
-    assert model.head_proj.in_features == 4 * 128
+    assert model.head_dim == 128 // 4
 
 
 def test_pointer_config_reads_heads_for_gat():
@@ -142,7 +153,29 @@ def test_pointer_config_reads_heads_for_gat():
     model = build_pointer_model(meta, cfg)
 
     assert isinstance(model.backbone, GATv2StateClassifier)
-    assert model.backbone.head_proj.in_features == 4 * 128
+    assert model.backbone.head_dim == 128 // 4
+
+
+def test_gat_uses_bfloat16_amp_when_supported(monkeypatch):
+    cfg = BaselineConfig.from_dict({
+        "prepared_root": "x",
+        "gnn_type": "gat",
+        "training": {"use_amp": True},
+    })
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+
+    assert _amp_dtype(torch.device("cuda"), cfg) == torch.bfloat16
+
+
+def test_gat_does_not_fall_back_to_unsafe_float16(monkeypatch):
+    cfg = BaselineConfig.from_dict({
+        "prepared_root": "x",
+        "gnn_type": "gat",
+        "training": {"use_amp": True},
+    })
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+
+    assert _amp_dtype(torch.device("cuda"), cfg) is None
 
 
 def test_tactic_with_args_backbone_switch():
