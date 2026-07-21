@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import asyncio
+import hashlib
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from .dataset import DatasetRow
 from .graph import DAGBuilder, proof_state_to_dag
@@ -32,7 +33,18 @@ class PreparationPhaseError(Exception):
 
 
 class SExprCache:
-    """Disk cache for S-expressions with on-demand generation via proof replay."""
+    """Disk cache for validated theorem-replay S-expression records."""
+
+    SCHEMA_VERSION = 2
+    EXTRACTOR_VERSION = "theorem-replay-v2"
+
+    @staticmethod
+    def row_state_sha256(row: DatasetRow) -> str:
+        return hashlib.sha256(row.state.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def row_tactic_sha256(row: DatasetRow) -> str:
+        return hashlib.sha256(row.tactic.encode("utf-8")).hexdigest()
 
     def __init__(
         self,
@@ -53,16 +65,56 @@ class SExprCache:
         sexpr_file = self._sexpr_dir(split) / f"{row_index:09d}.json"
         if sexpr_file.exists():
             try:
-                with open(sexpr_file) as f:
-                    return json.load(f)
+                with open(sexpr_file, encoding="utf-8") as f:
+                    payload = json.load(f)
+                if payload.get("schema_version") != self.SCHEMA_VERSION:
+                    return None
+                return payload
             except Exception:
                 pass
         return None
 
     def save(self, split: str, row_index: int, data: dict) -> None:
         sexpr_file = self._sexpr_dir(split) / f"{row_index:09d}.json"
-        with open(sexpr_file, "w") as f:
-            json.dump(data, f)
+        temporary = sexpr_file.with_suffix(".json.tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, sexpr_file)
+
+    def load_for_row(
+        self,
+        row: DatasetRow,
+        *,
+        step_index: int | None = None,
+        extractor_version: str | None = None,
+    ) -> Optional[dict]:
+        payload = self.load(row.split, row.row_index)
+        if payload is None:
+            return None
+        expected = {
+            "dataset": row.dataset_name,
+            "split": row.split,
+            "row_index": row.row_index,
+            "theorem": row.theorem,
+            "state_sha256": self.row_state_sha256(row),
+            "tactic_sha256": self.row_tactic_sha256(row),
+        }
+        if any(payload.get(key) != value for key, value in expected.items()):
+            return None
+        if step_index is not None and payload.get("step_index") != step_index:
+            return None
+        if (
+            extractor_version is not None
+            and payload.get("extractor_version") != extractor_version
+        ):
+            return None
+        return payload
+
+
+class SExprUnavailableError(RuntimeError):
+    """Raised when strict S-expression mode has no validated cache record."""
 
 
 def _fix_pp_for_goal_start(pp: str) -> str:
@@ -109,210 +161,12 @@ def _fix_pp_for_goal_start(pp: str) -> str:
     return s
 
 
-def _extract_binder_names_from_pp(pp_type: str) -> list[str]:
-    """Extract ordered binder names from a pretty-printed Lean 4 forall type.
-
-    Handles implicit ``{x : T}``, explicit ``(x : T)``, and instance
-    ``[C]`` binders.  Grouped binders like ``{a b : T}`` must already be
-    split (use ``_fix_pp_for_goal_start`` first).
-    """
-    s = pp_type.strip()
-    if s.startswith("∀"):
-        s = s[1:].lstrip()
-    elif s.startswith("forall"):
-        s = s[5:].lstrip()
-
-    names: list[str] = []
-    idx = 0
-    while idx < len(s):
-        c = s[idx]
-        if c in ("{", "("):
-            close = "}" if c == "{" else ")"
-            depth = 1
-            start = idx + 1
-            idx += 1
-            while idx < len(s) and depth > 0:
-                if s[idx] == c:
-                    depth += 1
-                elif s[idx] == close:
-                    depth -= 1
-                idx += 1
-            if depth == 0:
-                inner = s[start : idx - 1].strip()
-                if inner.startswith("["):
-                    names.append("inst")
-                elif " : " in inner:
-                    before_colon = inner.split(" : ", 1)[0].strip()
-                    for n in before_colon.split():
-                        n = n.strip()
-                        if n:
-                            names.append(n)
-                elif ":" in inner:
-                    before_colon = inner.split(":", 1)[0].strip()
-                    for n in before_colon.split():
-                        n = n.strip()
-                        if n:
-                            names.append(n)
-        elif c == "[":
-            depth = 1
-            idx += 1
-            while idx < len(s) and depth > 0:
-                if s[idx] == "[":
-                    depth += 1
-                elif s[idx] == "]":
-                    depth -= 1
-                idx += 1
-            names.append("inst")
-        elif c in (",", "\u2192", "\u27f6"):
-            idx += 1
-        elif c in ("\n", " "):
-            idx += 1
-        else:
-            break
-
-    return names
-
-
-async def _replay_one_theorem(server, full_name: str, tactics: list[str]) -> list[dict]:
-    """Replay a single theorem on an existing server (no server create/shutdown)."""
-    from .graph import goal_state_to_proof_state
-
-    results: list[dict] = []
-    try:
-        inspect_result = await server.env_inspect_async(full_name)
-        pp_type = inspect_result["type"]["pp"]
-        fixed_pp = _fix_pp_for_goal_start(pp_type)
-        binder_names = _extract_binder_names_from_pp(fixed_pp)
-
-        gs = await server.goal_start_async(fixed_pp)
-
-        for bname in binder_names:
-            try:
-                gs = await server.goal_tactic_async(gs, f"intro {bname}")
-            except Exception:
-                try:
-                    gs = await server.goal_tactic_async(gs, "intro")
-                except Exception:
-                    break
-
-        text, hyp_sexps, goal_sexp = goal_state_to_proof_state(gs)
-        results.append({
-            "goal_sexp": goal_sexp,
-            "hyp_sexps": [{"name": name, "sexp": sexp} for name, sexp in hyp_sexps],
-            "text_state": text,
-        })
-
-        for tactic in tactics:
-            try:
-                gs = await server.goal_tactic_async(gs, tactic)
-            except Exception:
-                break
-
-            text, hyp_sexps, goal_sexp = goal_state_to_proof_state(gs)
-            if not goal_sexp and not hyp_sexps:
-                break
-            results.append({
-                "goal_sexp": goal_sexp,
-                "hyp_sexps": [{"name": name, "sexp": sexp} for name, sexp in hyp_sexps],
-                "text_state": text,
-            })
-    except Exception:
-        pass
-
-    return results
-
-
-async def _replay_batch(
-    project_path: str,
-    theorems: dict[str, list[str]],
-    imports: list[str] | None = None,
-) -> dict[str, list[dict]]:
-    """Replay multiple theorems on a SINGLE server.
-
-    Args:
-        project_path: Path to the Lean project.
-        theorems: Dict mapping theorem name → list of tactics.
-        imports: Lean imports (default: ``["Init", "Mathlib"]``).
-
-    Returns:
-        Dict mapping theorem name → list of S-expression dicts.
-    """
-    from pantograph.server import Server
-    from .graph import patch_pantograph_for_sexp
-
-    patch_pantograph_for_sexp()
-
-    if imports is None:
-        imports = ["Init", "Mathlib"]
-
-    server = await Server.create(
-        project_path=project_path,
-        imports=imports,
-        options={"printExprAST": True},
-    )
-
-    all_results: dict[str, list[dict]] = {}
-    try:
-        for full_name, tactics in theorems.items():
-            results = await _replay_one_theorem(server, full_name, tactics)
-            if results:
-                all_results[full_name] = results
-    finally:
-        try:
-            await server.shutdown_async()
-        except Exception:
-            pass
-
-    return all_results
-
-
-def replay_batch_sexpr(
-    project_path: str,
-    theorems: dict[str, list[str]],
-    imports: list[str] | None = None,
-) -> dict[str, list[dict]]:
-    """Synchronous wrapper: replay multiple theorems on a single server.
-
-    Args:
-        project_path: Path to the Lean project.
-        theorems: Dict mapping theorem name → list of tactics.
-
-    Returns:
-        Dict mapping theorem name → list of S-expression dicts.
-    """
-    async def _run():
-        return await _replay_batch(project_path, theorems, imports)
-
-    return asyncio.run(_run())
-
-
-def replay_theorem_sexpr(
-    project_path: str,
-    full_name: str,
-    state_tactic_pairs: list[tuple[str, str]],
-    imports: list[str] | None = None,
-) -> list[dict]:
-    """Synchronous wrapper for single theorem replay.
-
-    Args:
-        project_path: Path to the Lean project.
-        full_name: Fully qualified theorem name.
-        state_tactic_pairs: List of ``(state_str, tactic_str)`` pairs.
-
-    Returns:
-        List of S-expression dicts, one per proof step.
-    """
-    tactics = [tactic for _, tactic in state_tactic_pairs]
-    result = replay_batch_sexpr(project_path, {full_name: tactics}, imports)
-    return result.get(full_name, [])
-
-
 def prepare_example(
     row: DatasetRow,
     *,
     sexpr_cache: Optional[SExprCache] = None,
     sexpr_data: Optional[dict] = None,
-    use_sexpr: bool = True,
+    use_sexpr: bool = False,
 ) -> PreparedExample:
     """Prepare a single example with phase-specific error reporting.
 
@@ -333,12 +187,18 @@ def prepare_example(
             (item["name"], item["sexp"]) for item in sexpr_data.get("hyp_sexps", [])
         ]
     elif use_sexpr and sexpr_cache is not None and sexpr_cache.enabled:
-        cached = sexpr_cache.load(row.split, row.row_index)
+        cached = sexpr_cache.load_for_row(row)
         if cached is not None:
             goal_sexp = cached.get("goal_sexp")
             hyp_sexps = [
                 (item["name"], item["sexp"]) for item in cached.get("hyp_sexps", [])
             ]
+
+    if use_sexpr and (goal_sexp is None or hyp_sexps is None):
+        raise SExprUnavailableError(
+            f"No validated S-expression cache record for "
+            f"{row.split} row {row.row_index} ({row.theorem})."
+        )
 
     try:
         if goal_sexp is not None or hyp_sexps is not None:

@@ -36,12 +36,13 @@ from .model import (
     GraphSAGEClassifierConfig,
     GraphSAGEStateClassifier,
 )
-from .preparation import PreparedExample, prepare_example
+from .preparation import PreparedExample, SExprCache, SExprUnavailableError, prepare_example
 from .premise_pool import CandidatePool, build_unified_pools
 from .premise_scoring import PremiseScorer, PremiseScorerConfig, compute_premise_ranking_loss
 from .premise_training import evaluate_model_with_premises, train_one_epoch_with_premises
 from .preprocess import DEFAULT_OUTPUT_ROOT, PreprocessConfig, run_preprocessing
 from .pyg import NODE_TYPE_TO_ID, build_premise_mask, build_vocab, build_vocab_from_labels, dag_to_pyg
+from .sexpr_extraction import SExprExtractionConfig, extract_sexpressions
 from .state import Hypothesis, ProofState, parse_state
 from .training import (
     DEFAULT_BASELINE_CONFIG_PATH,
@@ -90,6 +91,9 @@ __all__ = [
     "PremiseScorer",
     "PremiseScorerConfig",
     "PreprocessConfig",
+    "SExprCache",
+    "SExprExtractionConfig",
+    "SExprUnavailableError",
     "ProofState",
     "SplitReport",
     "TACTIC_ARITY",
@@ -114,6 +118,7 @@ __all__ = [
     "dag_to_dict",
     "dag_to_pyg",
     "encode_tactic_name",
+    "extract_sexpressions",
     "get_node_labels",
     "evaluate_baseline_run",
     "evaluate_model",
@@ -146,4 +151,3 @@ __all__ = [
     "visualize_dag",
     "write_dag_json",
 ]
-

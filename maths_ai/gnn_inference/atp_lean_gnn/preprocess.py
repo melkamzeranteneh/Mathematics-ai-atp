@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -32,7 +31,6 @@ from .dataset import DATASET_NAME, DatasetRow, canonicalize_split_name, iter_dat
 from .preparation import (
     prepare_example,
     SExprCache,
-    replay_batch_sexpr,
 )
 from .labels import build_tactic_vocab, encode_tactic_name
 from .lemma_corpus import load_lemma_name_index
@@ -52,6 +50,7 @@ class PreprocessConfig:
     lemma_corpus_path: Path | None = None
     force: bool = False
     use_sexpr: bool = False
+    sexpr_cache_root: Path | None = None
     project_path: str = "maths_ai/lean_mathlib"
 
 
@@ -89,14 +88,6 @@ def _load_rows(
     ))
 
 
-def _group_by_theorem(rows: list[DatasetRow]) -> dict[str, list[DatasetRow]]:
-    """Group rows by theorem name, preserving order within each group."""
-    groups: dict[str, list[DatasetRow]] = defaultdict(list)
-    for row in rows:
-        groups[row.theorem].append(row)
-    return dict(groups)
-
-
 def _build_sexpr_map(
     rows: list[DatasetRow],
     project_path: str,
@@ -104,55 +95,32 @@ def _build_sexpr_map(
     sexpr_cache: Optional[SExprCache] = None,
     split_label: str = "",
 ) -> dict[int, dict]:
-    """Build a mapping from row_index → sexpr_data for all rows.
-
-    Loads cached S-expressions first, then batch-replays all missing theorems
-    on a SINGLE Pantograph server.
-    """
+    """Load validated Phase 2 records without silently generating or falling back."""
     if not use_sexpr:
         return {}
 
     sexpr_map: dict[int, dict] = {}
 
-    if sexpr_cache is not None:
-        for row in rows:
-            cached = sexpr_cache.load(split_label, row.row_index)
+    if sexpr_cache is None:
+        raise ValueError("S-expression mode requires a Phase 2 cache root.")
+    theorem_rows: dict[str, list[DatasetRow]] = {}
+    for row in rows:
+        theorem_rows.setdefault(row.theorem, []).append(row)
+    for grouped_rows in theorem_rows.values():
+        for step_index, row in enumerate(
+            sorted(grouped_rows, key=lambda item: item.row_index)
+        ):
+            cached = sexpr_cache.load_for_row(
+                row,
+                step_index=step_index,
+                extractor_version=SExprCache.EXTRACTOR_VERSION,
+            )
             if cached is not None:
                 sexpr_map[row.row_index] = cached
 
-    theorems = _group_by_theorem(rows)
-
-    missing_theorems: dict[str, list[DatasetRow]] = {}
-    for full_name, theorem_rows in theorems.items():
-        first_idx = theorem_rows[0].row_index
-        if first_idx not in sexpr_map and full_name:
-            missing_theorems[full_name] = theorem_rows
-
-    if missing_theorems:
-        tactics_map: dict[str, list[str]] = {
-            name: [row.tactic for row in trows]
-            for name, trows in missing_theorems.items()
-        }
-
-        console_print(f"    Batch replay: {len(missing_theorems)} theorems on one server...")
-        try:
-            batch_results = replay_batch_sexpr(project_path, tactics_map)
-        except Exception as e:
-            console_print(f"    [WARN] Batch replay failed: {e}")
-            batch_results = {}
-
-        replayed_count = 0
-        for full_name, sexpr_list in batch_results.items():
-            theorem_rows = missing_theorems[full_name]
-            for i, row in enumerate(theorem_rows):
-                if i < len(sexpr_list):
-                    sexpr_map[row.row_index] = sexpr_list[i]
-                    if sexpr_cache is not None:
-                        sexpr_cache.save(split_label, row.row_index, sexpr_list[i])
-            if sexpr_list:
-                replayed_count += 1
-
-        console_print(f"    Replay done: {replayed_count}/{len(missing_theorems)} theorems, {len(sexpr_map)} total states with S-exprs")
+    console_print(
+        f"    Validated S-expression cache: {len(sexpr_map)}/{len(rows)} rows"
+    )
 
     return sexpr_map
 
@@ -353,8 +321,22 @@ def run_preprocessing(config: PreprocessConfig) -> dict[str, object]:
 
     sexpr_cache = None
     if config.use_sexpr:
-        console_print(f"  S-expression mode: proof replay per theorem via Pantograph")
-        sexpr_cache = SExprCache(config.output_root, config.project_path, enabled=True)
+        if config.sexpr_cache_root is None:
+            raise ValueError(
+                "S-expression preprocessing requires --sexpr-cache-root from "
+                "the completed theorem-replay extraction stage."
+            )
+        if config.sexpr_cache_root.resolve() == output_root.resolve():
+            raise ValueError(
+                "--sexpr-cache-root must differ from --output-root because "
+                "preprocessing replaces the output directory."
+            )
+        console_print("  S-expression mode: consuming validated theorem-replay cache")
+        sexpr_cache = SExprCache(
+            config.sexpr_cache_root,
+            config.project_path,
+            enabled=True,
+        )
 
     console_print(
         f"\n  Scanning train split from {config.dataset_name} to build train-only vocabularies..."
@@ -434,6 +416,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-sexpr", action="store_true", default=False, help="Use S-expressions from Pantograph (default: False, text parser only for training)")
     parser.add_argument("--no-sexpr", action="store_false", dest="use_sexpr", help="Disable S-expressions, use text parser only")
     parser.add_argument("--project-path", type=str, default="maths_ai/lean_mathlib", help="Path to Lean project for Pantograph")
+    parser.add_argument("--sexpr-cache-root", type=str, default=None, help="Validated cache root produced by generate_sexprs")
     return parser
 
 
@@ -450,6 +433,7 @@ def main(argv: list[str] | None = None) -> int:
             lemma_corpus_path=None if args.lemma_corpus is None else Path(args.lemma_corpus),
             force=args.force,
             use_sexpr=args.use_sexpr,
+            sexpr_cache_root=None if args.sexpr_cache_root is None else Path(args.sexpr_cache_root),
             project_path=args.project_path,
         )
         run_preprocessing(config)
