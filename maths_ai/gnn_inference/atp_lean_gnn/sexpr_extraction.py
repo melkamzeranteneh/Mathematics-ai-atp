@@ -413,10 +413,13 @@ async def extract_sexpressions(
     *,
     server_factory=None,
 ) -> dict[str, object]:
-    from pantograph.server import Server
+    if server_factory is None:
+        patch_pantograph_for_sexp()
+        from pantograph.server import Server
 
-    patch_pantograph_for_sexp()
-    factory = server_factory or Server.create
+        factory = Server.create
+    else:
+        factory = server_factory
     server = await factory(
         project_path=config.project_path,
         imports=list(config.imports),
