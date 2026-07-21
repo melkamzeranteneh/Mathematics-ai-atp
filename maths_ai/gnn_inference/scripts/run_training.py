@@ -270,24 +270,33 @@ def run_baseline(config: dict[str, Any], resume_run_dir: str | None = None) -> d
     model_overrides, training_overrides = _resolve_stage_model(baseline_cfg)
     gnn_type = baseline_cfg.get("gnn_type", config["gnn_type"])
 
-    # Rebuild config from dict to ensure proper normalization
-    cfg = BaselineConfig.from_dict({
-        "prepared_root": str(prepared_root),
-        "run_root": str(run_root),
-        "seed": config["seed"],
-        "device": config["device"],
-        "edge_mode": baseline_cfg.get("edge_mode", "bidirectional"),
-        "use_node_type": baseline_cfg.get("use_node_type", True),
-        "gnn_type": gnn_type,
-        "model": dict(model_overrides),
-        "training": {
-            "log_every_batches": 100,
-            "pin_memory": True,
-            "persistent_workers": training_overrides.get("num_workers", 0) > 0,
-            "prefetch_factor": 2,
-            **training_overrides,
-        },
-    })
+    if resume_run_dir is not None:
+        # The run-local config is authoritative for architecture compatibility;
+        # only the prepared cache location and total epoch target may change.
+        cfg = load_baseline_config(
+            Path(resume_run_dir) / "config.json",
+            prepared_root_override=prepared_root,
+            epochs_override=int(training_overrides["epochs"]),
+        )
+    else:
+        # Rebuild config from dict to ensure proper normalization.
+        cfg = BaselineConfig.from_dict({
+            "prepared_root": str(prepared_root),
+            "run_root": str(run_root),
+            "seed": config["seed"],
+            "device": config["device"],
+            "edge_mode": baseline_cfg.get("edge_mode", "bidirectional"),
+            "use_node_type": baseline_cfg.get("use_node_type", True),
+            "gnn_type": gnn_type,
+            "model": dict(model_overrides),
+            "training": {
+                "log_every_batches": 100,
+                "pin_memory": True,
+                "persistent_workers": training_overrides.get("num_workers", 0) > 0,
+                "prefetch_factor": 2,
+                **training_overrides,
+            },
+        })
 
     summary = train_baseline(cfg, resume_run_dir=resume_run_dir)
     best_checkpoint = summary.get("best_checkpoint", "")
@@ -654,6 +663,18 @@ Examples:
     parser.add_argument("--config", type=str, default=None, help="Path to JSON config file (overrides defaults)")
     parser.add_argument("--stages", type=str, default=None, help="Comma-separated stages to run: prepare,baseline,pointer,scorer")
     parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint (requires pipeline_state.json)")
+    parser.add_argument(
+        "--resume-run-dir",
+        type=str,
+        default=None,
+        help="Extend a specific completed baseline run from its last.pt checkpoint",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Target total epochs when using --resume-run-dir",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print config and exit without running")
     parser.add_argument("--experiment-name", type=str, default=None, help="Name for this experiment run")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
@@ -740,6 +761,43 @@ def main(argv: list[str] | None = None) -> int:
         if "." in key and value is not None:
             _set_nested(config, key, value)
 
+    if args.resume_run_dir:
+        if args.resume:
+            console_print("  ERROR: Use either --resume or --resume-run-dir, not both.")
+            return 1
+        if args.epochs is None:
+            console_print("  ERROR: --resume-run-dir requires --epochs with a new total epoch target.")
+            return 1
+        if args.epochs < 1:
+            console_print("  ERROR: --epochs must be positive.")
+            return 1
+        resume_run_dir = Path(args.resume_run_dir).resolve()
+        resume_config_path = resume_run_dir / "config.json"
+        if not resume_config_path.exists():
+            console_print(f"  ERROR: Resume run is missing config: {resume_config_path}")
+            return 1
+        with resume_config_path.open(encoding="utf-8") as handle:
+            resume_config = json.load(handle)
+
+        config["prepared_root"] = args.prepared_root or resume_config["prepared_root"]
+        config["run_root"] = str(resume_run_dir.parent.parent)
+        config["seed"] = int(resume_config.get("seed", config["seed"]))
+        config["device"] = args.device or str(resume_config.get("device", config["device"]))
+        config["gnn_type"] = str(resume_config.get("gnn_type", config["gnn_type"]))
+        config["stages"] = ["baseline"]
+        config["baseline"] = {
+            **config["baseline"],
+            "gnn_type": config["gnn_type"],
+            "edge_mode": resume_config.get("edge_mode", "bidirectional"),
+            "use_node_type": bool(resume_config.get("use_node_type", True)),
+            "model": dict(resume_config.get("model", {})),
+            "training": {
+                **dict(resume_config.get("training", {})),
+                "epochs": args.epochs,
+            },
+            "epochs": args.epochs,
+        }
+
     # Print config and exit if dry run
     if args.dry_run:
         console_print(json.dumps(config, indent=2, ensure_ascii=False))
@@ -785,8 +843,8 @@ def main(argv: list[str] | None = None) -> int:
             if stage == "prepare":
                 results[stage] = run_prepare(config)
             elif stage == "baseline":
-                resume_dir = None
-                if args.resume and state.stage_outputs.get("baseline", {}).get("run_dir"):
+                resume_dir = args.resume_run_dir
+                if resume_dir is None and args.resume and state.stage_outputs.get("baseline", {}).get("run_dir"):
                     resume_dir = state.stage_outputs["baseline"]["run_dir"]
                 results[stage] = run_baseline(config, resume_run_dir=resume_dir)
             elif stage == "pointer":

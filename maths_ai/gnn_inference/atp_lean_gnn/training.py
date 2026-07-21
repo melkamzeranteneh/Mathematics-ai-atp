@@ -1322,8 +1322,21 @@ def train_baseline(
             best_val_top1 = float(
                 dict(best_checkpoint.get("val_metrics", {})).get("top1_accuracy", -1.0)
             )
+        if config.training.epochs < start_epoch:
+            raise ValueError(
+                f"Resume target is {config.training.epochs} total epochs, but checkpoint "
+                f"'{last_checkpoint_path}' already completed epoch {start_epoch - 1}. "
+                f"Choose --epochs {start_epoch} or greater to extend the run."
+            )
+        # Persist the extended total so later resumes and analyses see the
+        # effective configuration rather than the original epoch limit.
+        _write_json(config_path, config.to_dict())
 
-    epochs_without_improvement = 0
+    epochs_without_improvement = (
+        max(0, start_epoch - 1 - best_epoch)
+        if resume_run_dir is not None and best_epoch > 0
+        else 0
+    )
     last_completed_epoch = start_epoch - 1
 
     console_print(f"\n  Training baseline run in: {run_dir}")

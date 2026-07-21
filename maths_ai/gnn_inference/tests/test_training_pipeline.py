@@ -25,6 +25,7 @@ from maths_ai.gnn_inference.atp_lean_gnn import (
 from maths_ai.gnn_inference.atp_lean_gnn.cache import SplitReport, prepare_output_root, write_manifest, write_pyg_artifact, write_vocab
 from maths_ai.gnn_inference.atp_lean_gnn.graph import proof_state_to_dag
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import build_vocab_from_labels, dag_to_pyg
+from maths_ai.gnn_inference.scripts.run_training import build_parser as build_pipeline_parser
 from maths_ai.gnn_inference.atp_lean_gnn.training import build_baseline_model
 from maths_ai.gnn_inference.scripts.pack_prepared_dataset import pack_prepared_dataset
 
@@ -343,6 +344,19 @@ class TrainingPipelineTests(unittest.TestCase):
         self.assertTrue(bool(resumed_summary["resumed_from_checkpoint"]))
         self.assertEqual(int(resumed_summary["start_epoch"]), 2)
         self.assertEqual(len(metrics_lines), 2)
+        persisted_config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(int(persisted_config["training"]["epochs"]), 2)
+
+        with self.assertRaises(ValueError, msg="same epoch target must not silently no-op"):
+            train_baseline(resumed_config, resume_run_dir=run_dir)
+
+    def test_pipeline_parser_accepts_explicit_finished_run_extension(self) -> None:
+        args = build_pipeline_parser().parse_args(
+            ["--resume-run-dir", "runs/example/run_1", "--epochs", "30"]
+        )
+
+        self.assertEqual(args.resume_run_dir, "runs/example/run_1")
+        self.assertEqual(args.epochs, 30)
 
 
 if __name__ == "__main__":
