@@ -115,6 +115,7 @@ class BaselineConfig:
                 num_layers=int(model_payload.get("num_layers", 4)),
                 dropout=float(model_payload.get("dropout", 0.2)),
                 heads=int(model_payload.get("heads", 8)),
+                readout=str(model_payload.get("readout", "state")),
             ) if gnn_type == "gat" else GraphSAGEClassifierConfig(
                 hidden_dim=int(model_payload.get("hidden_dim", 128)),
                 num_layers=int(model_payload.get("num_layers", 4)),
@@ -155,6 +156,21 @@ class BaselineConfig:
             raise ValueError("Training config field 'model.hidden_dim' must be positive.")
         if self.model.num_layers < 1:
             raise ValueError("Training config field 'model.num_layers' must be positive.")
+        normalized_model = self.model
+        if gnn_type == "gat":
+            readout = self.model.readout.lower().strip()
+            if readout not in {"state", "state_mean_attention"}:
+                raise ValueError(
+                    "Training config field 'model.readout' must be either "
+                    "'state' or 'state_mean_attention'."
+                )
+            normalized_model = GATv2ClassifierConfig(
+                hidden_dim=self.model.hidden_dim,
+                num_layers=self.model.num_layers,
+                dropout=self.model.dropout,
+                heads=self.model.heads,
+                readout=readout,
+            )
         if self.training.batch_size < 1:
             raise ValueError("Training config field 'training.batch_size' must be positive.")
         if self.training.epochs < 1:
@@ -184,7 +200,7 @@ class BaselineConfig:
             edge_mode=edge_mode,
             use_node_type=self.use_node_type,
             gnn_type=gnn_type,
-            model=self.model,
+            model=normalized_model,
             training=self.training,
         )
 
@@ -946,7 +962,11 @@ def build_baseline_model(metadata: PreparedMetadata, config: BaselineConfig) -> 
         use_node_type=config.use_node_type,
     )
     if config.gnn_type == "gat":
-        return GATv2StateClassifier(heads=config.model.heads, **common)
+        return GATv2StateClassifier(
+            heads=config.model.heads,
+            readout=config.model.readout,
+            **common,
+        )
     return GraphSAGEStateClassifier(**common)
 
 
@@ -1311,6 +1331,7 @@ def train_baseline(
     console_print(f"  Device                   : {device}" + (f" (DataParallel over GPUs {gpu_ids})" if len(gpu_ids) > 1 else ""))
     precision = str(amp_dtype).removeprefix("torch.") if amp_dtype is not None else "float32"
     console_print(f"  Compute precision        : {precision}")
+    console_print(f"  Readout                  : {getattr(config.model, 'readout', 'state')}")
     console_print(
         f"  Split sizes              : train={len(datasets['train'])}, "
         f"val={len(datasets['val'])}, test={len(datasets['test'])}"

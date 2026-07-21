@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn as nn
-from torch_geometric.data import Data
+from torch_geometric.data import Batch, Data
 
 from maths_ai.gnn_inference.atp_lean_gnn.model import (
     GATv2StateClassifier,
@@ -96,6 +96,64 @@ def test_gatv2_and_sage_shapes_match():
     assert sage(data).shape == gat(data).shape
 
 
+def test_state_mean_attention_readout_fuses_three_hidden_vectors():
+    first = _make_batch(num_nodes=5, num_edges=6)
+    second = _make_batch(num_nodes=3, num_edges=4)
+    batch = Batch.from_data_list([first, second])
+    model = GATv2StateClassifier(
+        num_node_labels=10,
+        num_tactics=5,
+        hidden_dim=16,
+        num_layers=2,
+        heads=4,
+        readout="state_mean_attention",
+    )
+    model.eval()
+
+    node_embeddings = model.encode_nodes(batch)
+    state_embeddings = node_embeddings.index_select(0, batch.state_node_index.view(-1))
+    graph_embeddings, attention_weights = model.global_readout(
+        node_embeddings,
+        state_embeddings,
+        batch.batch,
+    )
+    logits = model(batch)
+
+    assert model.global_readout.fusion.in_features == 16 * 3
+    assert model.global_readout.fusion.out_features == 16
+    assert graph_embeddings.shape == (2, 16)
+    assert logits.shape == (2, 5)
+    for graph_index in range(2):
+        graph_weights = attention_weights[batch.batch == graph_index]
+        assert torch.allclose(graph_weights.sum(), torch.tensor(1.0), atol=1e-6)
+
+
+def test_state_mean_attention_readout_receives_gradients():
+    model = GATv2StateClassifier(
+        num_node_labels=10,
+        num_tactics=5,
+        hidden_dim=16,
+        num_layers=2,
+        heads=4,
+        readout="state_mean_attention",
+    )
+    model(_make_batch()).sum().backward()
+
+    assert model.global_readout.attention_score.weight.grad is not None
+    assert model.global_readout.fusion.weight.grad is not None
+
+
+def test_gatv2_rejects_unknown_readout():
+    with pytest.raises(ValueError, match="readout"):
+        GATv2StateClassifier(
+            num_node_labels=10,
+            num_tactics=5,
+            hidden_dim=16,
+            heads=4,
+            readout="mystery",
+        )
+
+
 def test_baseline_build_routes_gnn_type():
     meta = type("M", (), {"node_vocab": [f"n{i}" for i in range(10)],
                           "tactic_vocab": [f"t{i}" for i in range(5)]})()
@@ -138,6 +196,26 @@ def test_baseline_config_reads_heads_for_gat():
 
     assert isinstance(model, GATv2StateClassifier)
     assert model.head_dim == 128 // 4
+
+
+def test_baseline_config_routes_state_mean_attention_readout():
+    meta = type("M", (), {"node_vocab": [f"n{i}" for i in range(10)],
+                          "tactic_vocab": [f"t{i}" for i in range(5)]})()
+    cfg = BaselineConfig.from_dict({
+        "prepared_root": "x",
+        "gnn_type": "gat",
+        "model": {
+            "heads": 4,
+            "hidden_dim": 16,
+            "readout": "state_mean_attention",
+        },
+    })
+
+    model = build_baseline_model(meta, cfg)
+
+    assert cfg.model.readout == "state_mean_attention"
+    assert model.readout_mode == "state_mean_attention"
+    assert model.global_readout is not None
 
 
 def test_pointer_config_reads_heads_for_gat():

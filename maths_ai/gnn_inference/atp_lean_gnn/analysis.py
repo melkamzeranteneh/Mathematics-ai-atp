@@ -947,6 +947,7 @@ def compare_saved_runs(run_dirs: list[str | Path]) -> dict[str, object]:
                 "edge_mode": config.edge_mode,
                 "hidden_dim": config.model.hidden_dim,
                 "num_layers": config.model.num_layers,
+                "readout": getattr(config.model, "readout", "state"),
                 "use_node_type": config.use_node_type,
                 "amp_enabled": bool(summary.get("amp_enabled", False)),
             }
@@ -960,15 +961,15 @@ def render_run_comparison_markdown(comparison: dict[str, object]) -> str:
     lines = [
         "# Run Comparison",
         "",
-        "| Run | Best Epoch | Val Top-1 | Val Top-5 | Test Top-1 | Test Top-5 | Top-1 Gap | Edge Mode | Hidden | Layers | Node Type | AMP |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | --- |",
+        "| Run | Best Epoch | Val Top-1 | Val Top-5 | Test Top-1 | Test Top-5 | Top-1 Gap | Edge Mode | Readout | Hidden | Layers | Node Type | AMP |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | --- | --- |",
     ]
     for item in comparison["runs"]:
         lines.append(
             f"| {item['run_name']} | {item['best_epoch']} | "
             f"{item['val_top1']:.4f} | {item['val_top5']:.4f} | "
             f"{item['test_top1']:.4f} | {item['test_top5']:.4f} | "
-            f"{item['top1_gap']:.4f} | {item['edge_mode']} | "
+            f"{item['top1_gap']:.4f} | {item['edge_mode']} | {item['readout']} | "
             f"{item['hidden_dim']} | {item['num_layers']} | "
             f"{item['use_node_type']} | {item['amp_enabled']} |"
         )

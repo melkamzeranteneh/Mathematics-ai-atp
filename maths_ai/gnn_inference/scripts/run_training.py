@@ -258,6 +258,8 @@ def run_baseline(config: dict[str, Any], resume_run_dir: str | None = None) -> d
     console_print(f"  hidden    : {_m.get('hidden_dim')}")
     console_print(f"  layers    : {_m.get('num_layers')}")
     console_print(f"  dropout   : {_m.get('dropout')}")
+    if config.get("gnn_type") == "gat":
+        console_print(f"  readout   : {_m.get('readout', 'state')}")
     console_print(f"  batch     : {baseline_cfg['batch_size']}")
     console_print(f"  epochs    : {baseline_cfg['epochs']}")
     console_print(f"  lr        : {baseline_cfg['learning_rate']}")
