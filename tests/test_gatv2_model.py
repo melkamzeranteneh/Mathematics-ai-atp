@@ -128,6 +128,49 @@ def test_state_mean_attention_readout_fuses_three_hidden_vectors():
         assert torch.allclose(graph_weights.sum(), torch.tensor(1.0), atol=1e-6)
 
 
+def test_forward_details_expose_pooling_weights_without_changing_logits():
+    first = _make_batch(num_nodes=5, num_edges=6)
+    second = _make_batch(num_nodes=3, num_edges=4)
+    batch = Batch.from_data_list([first, second])
+    model = GATv2StateClassifier(
+        num_node_labels=10,
+        num_tactics=5,
+        hidden_dim=16,
+        num_layers=2,
+        heads=4,
+        readout="state_mean_attention",
+    )
+    model.eval()
+
+    logits = model(batch)
+    detailed_logits, details = model.forward_with_readout_details(batch)
+
+    assert torch.equal(logits, detailed_logits)
+    assert details["attention_weights"].shape == batch.x.shape
+    for graph_index in range(2):
+        graph_weights = details["attention_weights"][batch.batch == graph_index]
+        assert torch.allclose(graph_weights.sum(), torch.tensor(1.0), atol=1e-6)
+
+
+def test_state_readout_details_remain_empty_and_preserve_logits():
+    model = GATv2StateClassifier(
+        num_node_labels=10,
+        num_tactics=5,
+        hidden_dim=16,
+        num_layers=2,
+        heads=4,
+        readout="state",
+    )
+    model.eval()
+    data = _make_batch()
+
+    logits = model(data)
+    detailed_logits, details = model.forward_with_readout_details(data)
+
+    assert torch.equal(logits, detailed_logits)
+    assert details == {}
+
+
 def test_state_mean_attention_readout_receives_gradients():
     model = GATv2StateClassifier(
         num_node_labels=10,

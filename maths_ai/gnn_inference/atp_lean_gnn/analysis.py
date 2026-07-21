@@ -4,6 +4,7 @@ import json
 import argparse
 import csv
 import hashlib
+import math
 import statistics
 import time
 from collections import Counter, defaultdict
@@ -14,6 +15,7 @@ from torch_geometric.loader import DataLoader
 
 from .dataset import canonicalize_split_name
 from .labels import UNKNOWN_TACTIC
+from .pyg import NODE_TYPE_TO_ID
 from .reporting import console_print
 from .training import (
     _amp_dtype,
@@ -576,6 +578,123 @@ def _build_error_samples(records: list[dict[str, object]]) -> list[dict[str, obj
     return errors[:25]
 
 
+def _distribution_summary(values: list[float]) -> dict[str, float | int | None]:
+    if not values:
+        return {"count": 0, "mean": None, "median": None, "p90": None}
+    ordered = sorted(values)
+    p90_index = max(0, math.ceil(0.9 * len(ordered)) - 1)
+    return {
+        "count": len(values),
+        "mean": statistics.fmean(values),
+        "median": statistics.median(values),
+        "p90": ordered[p90_index],
+    }
+
+
+def _format_optional_metric(value: object, digits: int = 4) -> str:
+    return "n/a" if value is None else f"{float(value):.{digits}f}"
+
+
+def _attention_concentration_summary(
+    records: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "normalized_entropy": _distribution_summary(
+            [float(record["attention_normalized_entropy"]) for record in records]
+        ),
+        "max_weight": _distribution_summary(
+            [float(record["attention_max_weight"]) for record in records]
+        ),
+        "effective_node_count": _distribution_summary(
+            [float(record["attention_effective_node_count"]) for record in records]
+        ),
+        "node_count": _distribution_summary(
+            [float(record["attention_node_count"]) for record in records]
+        ),
+    }
+
+
+def _rank_attention_targets(
+    mass: Counter[str],
+    occurrences: Counter[str],
+    *,
+    total_mass: float,
+    total_occurrences: int,
+) -> list[dict[str, object]]:
+    rows = []
+    for name, count in occurrences.items():
+        attention_mass = float(mass[name])
+        attention_share = attention_mass / total_mass if total_mass else 0.0
+        occurrence_share = count / total_occurrences if total_occurrences else 0.0
+        rows.append(
+            {
+                "name": name,
+                "occurrences": count,
+                "attention_mass": attention_mass,
+                "attention_share": attention_share,
+                "occurrence_share": occurrence_share,
+                "enrichment": attention_share / occurrence_share if occurrence_share else 0.0,
+                "mean_weight": attention_mass / count,
+            }
+        )
+    rows.sort(key=lambda item: (-float(item["attention_mass"]), str(item["name"])))
+    return rows
+
+
+def _build_attention_audit(
+    records: list[dict[str, object]],
+    *,
+    label_mass: Counter[str],
+    label_occurrences: Counter[str],
+    type_mass: Counter[str],
+    type_occurrences: Counter[str],
+) -> dict[str, object]:
+    attention_records = [
+        record for record in records if "attention_normalized_entropy" in record
+    ]
+    if not attention_records:
+        return {
+            "available": False,
+            "reason": "model readout does not expose graph-level attention weights",
+            "graph_count": 0,
+        }
+
+    total_mass = sum(label_mass.values())
+    total_occurrences = sum(label_occurrences.values())
+    label_rows = _rank_attention_targets(
+        label_mass,
+        label_occurrences,
+        total_mass=total_mass,
+        total_occurrences=total_occurrences,
+    )
+    type_rows = _rank_attention_targets(
+        type_mass,
+        type_occurrences,
+        total_mass=sum(type_mass.values()),
+        total_occurrences=sum(type_occurrences.values()),
+    )
+    correct = [record for record in attention_records if bool(record["correct_top1"])]
+    incorrect = [
+        record
+        for record in attention_records
+        if not bool(record["is_unknown_target"]) and not bool(record["correct_top1"])
+    ]
+    enriched_labels = sorted(
+        (row for row in label_rows if int(row["occurrences"]) >= 20),
+        key=lambda item: (-float(item["enrichment"]), -int(item["occurrences"])),
+    )
+    return {
+        "available": True,
+        "graph_count": len(attention_records),
+        "concentration": _attention_concentration_summary(attention_records),
+        "correct_top1": _attention_concentration_summary(correct),
+        "incorrect_top1": _attention_concentration_summary(incorrect),
+        "node_labels_by_attention_mass": label_rows[:25],
+        "node_labels_by_enrichment_min_20": enriched_labels[:25],
+        "node_types_by_attention_mass": type_rows,
+    }
+
+
 def _render_analysis_markdown(analysis: dict[str, object]) -> str:
     overall = analysis["overall"]
     lines = [
@@ -617,6 +736,52 @@ def _render_analysis_markdown(analysis: dict[str, object]) -> str:
             f"{item['top5_accuracy']:.4f} | {item['top10_accuracy']:.4f} | "
             f"{item['mean_reciprocal_rank']:.4f} | {item['macro_top1_recall']:.4f} |"
         )
+
+    attention_audit = analysis["attention_audit"]
+    lines.extend(["", "## Attention Pooling Audit", ""])
+    if not bool(attention_audit["available"]):
+        lines.append(f"- unavailable: {attention_audit['reason']}")
+    else:
+        concentration = attention_audit["concentration"]
+        correct = attention_audit["correct_top1"]
+        incorrect = attention_audit["incorrect_top1"]
+        lines.extend([
+            f"- audited graphs: `{attention_audit['graph_count']}`",
+            f"- mean normalized entropy: `{concentration['normalized_entropy']['mean']:.4f}` (1.0 is uniform)",
+            f"- mean maximum node weight: `{concentration['max_weight']['mean']:.4f}`",
+            f"- mean effective attended nodes: `{concentration['effective_node_count']['mean']:.2f}`",
+            f"- mean graph nodes: `{concentration['node_count']['mean']:.2f}`",
+            f"- correct/incorrect mean normalized entropy: "
+            f"`{_format_optional_metric(correct['normalized_entropy']['mean'])}` / "
+            f"`{_format_optional_metric(incorrect['normalized_entropy']['mean'])}`",
+            f"- correct/incorrect mean maximum weight: "
+            f"`{_format_optional_metric(correct['max_weight']['mean'])}` / "
+            f"`{_format_optional_metric(incorrect['max_weight']['mean'])}`",
+            "",
+            "### Node Types by Attention Mass",
+            "",
+            "| Type | Occurrences | Attention Share | Node Share | Enrichment | Mean Weight |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ])
+        for item in attention_audit["node_types_by_attention_mass"]:
+            lines.append(
+                f"| {item['name']} | {item['occurrences']} | {item['attention_share']:.4f} | "
+                f"{item['occurrence_share']:.4f} | {item['enrichment']:.2f} | "
+                f"{item['mean_weight']:.4f} |"
+            )
+        lines.extend([
+            "",
+            "### Node Labels by Attention Mass",
+            "",
+            "| Label | Occurrences | Attention Share | Node Share | Enrichment | Mean Weight |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ])
+        for item in attention_audit["node_labels_by_attention_mass"][:15]:
+            lines.append(
+                f"| {item['name']} | {item['occurrences']} | {item['attention_share']:.4f} | "
+                f"{item['occurrence_share']:.4f} | {item['enrichment']:.2f} | "
+                f"{item['mean_weight']:.4f} |"
+            )
 
     lines.extend([
         "",
@@ -739,6 +904,8 @@ def analyze_saved_run(
     amp_dtype = _amp_dtype(device, config)
     use_amp = amp_dtype is not None
     id_to_tactic = _invert_vocab(metadata.tactic_vocab)
+    id_to_node_label = _invert_vocab(metadata.node_vocab)
+    id_to_node_type = _invert_vocab(NODE_TYPE_TO_ID)
     training_counts = {
         str(name): int(count)
         for name, count in dict(training_profile["tactic_counts"]).items()
@@ -746,6 +913,10 @@ def analyze_saved_run(
     log_class_priors = _build_log_class_priors(metadata, training_counts, device)
     prior_stats = {tau: _empty_prior_stats() for tau in resolved_tau_grid}
     records: list[dict[str, object]] = []
+    attention_label_mass: Counter[str] = Counter()
+    attention_label_occurrences: Counter[str] = Counter()
+    attention_type_mass: Counter[str] = Counter()
+    attention_type_occurrences: Counter[str] = Counter()
     loss_sum = 0.0
     known_label_count = 0
 
@@ -764,7 +935,11 @@ def analyze_saved_run(
                 dtype=amp_dtype,
                 enabled=use_amp,
             ):
-                logits = model(batch)
+                if hasattr(model, "forward_with_readout_details"):
+                    logits, readout_details = model.forward_with_readout_details(batch)
+                else:
+                    logits = model(batch)
+                    readout_details = {}
             metric_logits = logits.float()
             probabilities = metric_logits.softmax(dim=1)
             known_mask = batch.y.view(-1) != metadata.unknown_tactic_id
@@ -795,6 +970,55 @@ def analyze_saved_run(
             true_ranks = (metric_logits > target_logits).sum(dim=1).add(1).detach().cpu()
             true_probabilities = probabilities.gather(1, batch.y.view(-1, 1)).squeeze(1).detach().float().cpu()
 
+            batch_attention_metrics: list[dict[str, object]] = []
+            attention_weights = readout_details.get("attention_weights")
+            if attention_weights is not None:
+                weights_cpu = attention_weights.detach().float().cpu()
+                batch_index_cpu = batch.batch.detach().cpu()
+                node_labels_cpu = batch.x.detach().cpu()
+                node_types_cpu = batch.node_type.detach().cpu()
+                for graph_index in range(batch_size):
+                    node_mask = batch_index_cpu == graph_index
+                    graph_weights = weights_cpu[node_mask]
+                    graph_label_ids = node_labels_cpu[node_mask]
+                    graph_type_ids = node_types_cpu[node_mask]
+                    node_count = int(graph_weights.numel())
+                    entropy = float(
+                        -(graph_weights * graph_weights.clamp_min(1e-12).log()).sum().item()
+                    )
+                    normalized_entropy = entropy / math.log(node_count) if node_count > 1 else 0.0
+                    top_node_offset = int(graph_weights.argmax().item())
+                    top_label = id_to_node_label.get(
+                        int(graph_label_ids[top_node_offset].item()),
+                        "<UNK_NODE>",
+                    )
+                    top_type = id_to_node_type.get(
+                        int(graph_type_ids[top_node_offset].item()),
+                        "Unknown",
+                    )
+                    for label_id, type_id, weight in zip(
+                        graph_label_ids.tolist(),
+                        graph_type_ids.tolist(),
+                        graph_weights.tolist(),
+                    ):
+                        label_name = id_to_node_label.get(int(label_id), "<UNK_NODE>")
+                        type_name = id_to_node_type.get(int(type_id), "Unknown")
+                        attention_label_mass[label_name] += float(weight)
+                        attention_label_occurrences[label_name] += 1
+                        attention_type_mass[type_name] += float(weight)
+                        attention_type_occurrences[type_name] += 1
+                    batch_attention_metrics.append(
+                        {
+                            "attention_node_count": node_count,
+                            "attention_entropy": entropy,
+                            "attention_normalized_entropy": normalized_entropy,
+                            "attention_effective_node_count": math.exp(entropy),
+                            "attention_max_weight": float(graph_weights[top_node_offset].item()),
+                            "attention_top_node_label": top_label,
+                            "attention_top_node_type": top_type,
+                        }
+                    )
+
             for index in range(batch_size):
                 true_id = int(targets[index].item())
                 predicted_ids = [int(item) for item in topk_ids[index].tolist()]
@@ -821,6 +1045,8 @@ def analyze_saved_run(
                     "correct_top1": (not is_unknown_target) and (predicted_ids[0] == true_id),
                     "correct_top5": (not is_unknown_target) and (int(true_ranks[index].item()) <= 5),
                 }
+                if batch_attention_metrics:
+                    record.update(batch_attention_metrics[index])
                 records.append(record)
 
     known_records = [record for record in records if not bool(record["is_unknown_target"])]
@@ -862,6 +1088,14 @@ def analyze_saved_run(
         )
         prior_selection_source = "val"
 
+    attention_audit = _build_attention_audit(
+        records,
+        label_mass=attention_label_mass,
+        label_occurrences=attention_label_occurrences,
+        type_mass=attention_type_mass,
+        type_occurrences=attention_type_occurrences,
+    )
+
     analysis = {
         "run_dir": str(run_directory),
         "split": canonical_split,
@@ -892,6 +1126,7 @@ def analyze_saved_run(
             "selected_metrics": selected_prior_result,
             "sweep": prior_sweep,
         },
+        "attention_audit": attention_audit,
         "training_ambiguity": training_profile["ambiguity"],
         "per_tactic_summary": per_tactic_summary,
         "hardest_tactics": hardest_tactics,
@@ -900,6 +1135,20 @@ def analyze_saved_run(
     }
 
     predictions_path = _write_jsonl(run_directory / f"predictions_{canonical_split}.jsonl", records)
+    attention_records = [
+        {
+            key: value
+            for key, value in record.items()
+            if key in {"row_index", "theorem", "true_tactic", "predicted_top1", "correct_top1"}
+            or key.startswith("attention_")
+        }
+        for record in records
+        if "attention_normalized_entropy" in record
+    ]
+    attention_path = _write_jsonl(
+        run_directory / f"attention_{canonical_split}.jsonl",
+        attention_records,
+    )
     per_tactic_path = _write_csv(
         run_directory / f"per_tactic_{canonical_split}.csv",
         per_tactic_summary,
@@ -915,6 +1164,7 @@ def analyze_saved_run(
     )
     analysis["artifacts"] = {
         "predictions_jsonl": str(predictions_path),
+        "attention_jsonl": str(attention_path),
         "per_tactic_csv": str(per_tactic_path),
         "confusion_pairs_csv": str(confusion_path),
         "training_profile_json": str(training_profile_path),
@@ -1082,6 +1332,7 @@ def analyze_main(argv: list[str] | None = None) -> int:
             console_print(f"  Wrote analysis summary   : {analysis['artifacts']['analysis_json']}")
             console_print(f"  Wrote analysis markdown  : {analysis['artifacts']['analysis_markdown']}")
             console_print(f"  Wrote prediction records : {analysis['artifacts']['predictions_jsonl']}")
+            console_print(f"  Wrote attention records  : {analysis['artifacts']['attention_jsonl']}")
             console_print(f"  Wrote per-tactic table   : {analysis['artifacts']['per_tactic_csv']}")
             console_print(f"  Wrote confusion table    : {analysis['artifacts']['confusion_pairs_csv']}")
             console_print(

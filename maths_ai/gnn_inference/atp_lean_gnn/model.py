@@ -292,10 +292,14 @@ class GATv2StateClassifier(nn.Module):
             x = self.dropout(x)
         return x
 
-    def readout(self, node_embeddings: torch.Tensor, data) -> torch.Tensor:
+    def readout_with_details(
+        self,
+        node_embeddings: torch.Tensor,
+        data,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         state_embeddings = _state_node_embeddings(node_embeddings, data)
         if self.global_readout is None:
-            return state_embeddings
+            return state_embeddings, {}
         batch_index = getattr(data, "batch", None)
         if batch_index is None:
             batch_index = torch.zeros(
@@ -303,14 +307,31 @@ class GATv2StateClassifier(nn.Module):
                 device=node_embeddings.device,
                 dtype=torch.long,
             )
-        graph_embeddings, _ = self.global_readout(
+        graph_embeddings, attention_weights = self.global_readout(
             node_embeddings,
             state_embeddings,
             batch_index,
         )
+        return graph_embeddings, {"attention_weights": attention_weights}
+
+    def readout(self, node_embeddings: torch.Tensor, data) -> torch.Tensor:
+        graph_embeddings, _ = self.readout_with_details(node_embeddings, data)
         return graph_embeddings
 
-    def forward(self, data) -> torch.Tensor:
+    def forward_with_readout_details(
+        self,
+        data,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return logits plus optional global-readout diagnostics.
+
+        The normal ``forward`` path delegates here, so analysis can inspect the
+        learned pooling weights without registering hooks or changing numerical
+        behavior during training.
+        """
         node_embeddings = self.encode_nodes(data)
-        graph_embeddings = self.readout(node_embeddings, data)
-        return self.classifier(self.dropout(graph_embeddings))
+        graph_embeddings, details = self.readout_with_details(node_embeddings, data)
+        return self.classifier(self.dropout(graph_embeddings)), details
+
+    def forward(self, data) -> torch.Tensor:
+        logits, _ = self.forward_with_readout_details(data)
+        return logits

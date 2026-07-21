@@ -11,6 +11,7 @@ import torch
 from maths_ai.gnn_inference.atp_lean_gnn import (
     BaselineConfig,
     DatasetRow,
+    GATv2ClassifierConfig,
     GraphSAGEClassifierConfig,
     TrainingLoopConfig,
     analyze_saved_run,
@@ -180,6 +181,26 @@ class RunAnalysisTests(unittest.TestCase):
             ),
         ).normalized()
 
+    def _tiny_pooled_gat_config(self) -> BaselineConfig:
+        config = self._tiny_config()
+        return BaselineConfig(
+            prepared_root=config.prepared_root,
+            run_root=config.run_root,
+            seed=config.seed,
+            device=config.device,
+            edge_mode=config.edge_mode,
+            use_node_type=config.use_node_type,
+            gnn_type="gat",
+            model=GATv2ClassifierConfig(
+                hidden_dim=16,
+                num_layers=2,
+                dropout=0.1,
+                heads=4,
+                readout="state_mean_attention",
+            ),
+            training=config.training,
+        ).normalized()
+
     def test_analyze_saved_run_writes_reports_and_predictions(self) -> None:
         summary = train_baseline(self._tiny_config())
         run_dir = Path(str(summary["run_dir"]))
@@ -192,6 +213,7 @@ class RunAnalysisTests(unittest.TestCase):
         self.assertTrue((run_dir / "analysis_training_profile.json").exists())
         self.assertTrue((run_dir / "per_tactic_val.csv").exists())
         self.assertTrue((run_dir / "confusion_pairs_val.csv").exists())
+        self.assertTrue((run_dir / "attention_val.jsonl").exists())
         self.assertEqual(analysis["split"], "val")
         self.assertEqual(int(analysis["overall"]["evaluated_count"]), 2)
         self.assertIn("mean_reciprocal_rank", analysis["ranking"])
@@ -201,6 +223,7 @@ class RunAnalysisTests(unittest.TestCase):
         self.assertEqual(len(analysis["prior_adjustment"]["sweep"]), 11)
         self.assertIn("empirical_deterministic_top1_ceiling", analysis["training_ambiguity"])
         self.assertEqual(analysis["per_tactic_summary"][0]["frequency_bucket"], "tail")
+        self.assertFalse(analysis["attention_audit"]["available"])
 
         prediction_lines = (run_dir / "predictions_val.jsonl").read_text(encoding="utf-8").strip().splitlines()
         self.assertEqual(len(prediction_lines), 2)
@@ -210,6 +233,27 @@ class RunAnalysisTests(unittest.TestCase):
         self.assertIn("true_rank", first_prediction)
         self.assertIn("true_probability", first_prediction)
         self.assertIn("predicted_topk_confidences", first_prediction)
+
+    def test_pooled_gat_analysis_audits_attention_weights(self) -> None:
+        summary = train_baseline(self._tiny_pooled_gat_config())
+        run_dir = Path(str(summary["run_dir"]))
+
+        analysis = analyze_saved_run(run_dir, split="val", top_k=3, min_support=1)
+
+        audit = analysis["attention_audit"]
+        self.assertTrue(audit["available"])
+        self.assertEqual(audit["graph_count"], 2)
+        self.assertEqual(audit["concentration"]["normalized_entropy"]["count"], 2)
+        self.assertGreater(len(audit["node_types_by_attention_mass"]), 0)
+        attention_lines = (run_dir / "attention_val.jsonl").read_text(
+            encoding="utf-8"
+        ).strip().splitlines()
+        self.assertEqual(len(attention_lines), 2)
+        first_attention = json.loads(attention_lines[0])
+        self.assertIn("attention_max_weight", first_attention)
+        self.assertIn("attention_top_node_label", first_attention)
+        self.assertGreaterEqual(first_attention["attention_normalized_entropy"], 0.0)
+        self.assertLessEqual(first_attention["attention_normalized_entropy"], 1.000001)
 
     def test_rank_and_calibration_metrics_use_exact_target_rank(self) -> None:
         records = [
