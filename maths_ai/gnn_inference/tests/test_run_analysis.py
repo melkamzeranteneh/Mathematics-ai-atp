@@ -21,6 +21,10 @@ from maths_ai.gnn_inference.atp_lean_gnn import (
     train_baseline,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.cache import SplitReport, prepare_output_root, write_manifest, write_pyg_artifact, write_vocab
+from maths_ai.gnn_inference.atp_lean_gnn.analysis import (
+    _build_calibration_summary,
+    _build_rank_summary,
+)
 from maths_ai.gnn_inference.atp_lean_gnn.graph import proof_state_to_dag
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import build_vocab_from_labels, dag_to_pyg
 
@@ -178,14 +182,49 @@ class RunAnalysisTests(unittest.TestCase):
         self.assertTrue((run_dir / "analysis_val.json").exists())
         self.assertTrue((run_dir / "analysis_val.md").exists())
         self.assertTrue((run_dir / "predictions_val.jsonl").exists())
+        self.assertTrue((run_dir / "analysis_training_profile.json").exists())
+        self.assertTrue((run_dir / "per_tactic_val.csv").exists())
+        self.assertTrue((run_dir / "confusion_pairs_val.csv").exists())
         self.assertEqual(analysis["split"], "val")
         self.assertEqual(int(analysis["overall"]["evaluated_count"]), 2)
+        self.assertIn("mean_reciprocal_rank", analysis["ranking"])
+        self.assertIn("expected_calibration_error", analysis["calibration"])
+        self.assertIn("topk_accuracy", analysis["frequency_baseline"])
+        self.assertIn("empirical_deterministic_top1_ceiling", analysis["training_ambiguity"])
+        self.assertEqual(analysis["per_tactic_summary"][0]["frequency_bucket"], "tail")
 
         prediction_lines = (run_dir / "predictions_val.jsonl").read_text(encoding="utf-8").strip().splitlines()
         self.assertEqual(len(prediction_lines), 2)
         first_prediction = json.loads(prediction_lines[0])
         self.assertIn("predicted_topk", first_prediction)
         self.assertIn("correct_top1", first_prediction)
+        self.assertIn("true_rank", first_prediction)
+        self.assertIn("true_probability", first_prediction)
+        self.assertIn("predicted_topk_confidences", first_prediction)
+
+    def test_rank_and_calibration_metrics_use_exact_target_rank(self) -> None:
+        records = [
+            {
+                "is_unknown_target": False,
+                "true_rank": 1,
+                "correct_top1": True,
+                "predicted_top1_confidence": 0.8,
+            },
+            {
+                "is_unknown_target": False,
+                "true_rank": 6,
+                "correct_top1": False,
+                "predicted_top1_confidence": 0.4,
+            },
+        ]
+
+        ranking = _build_rank_summary(records)
+        calibration = _build_calibration_summary(records, num_bins=5)
+
+        self.assertEqual(ranking["topk_accuracy"]["5"], 0.5)
+        self.assertEqual(ranking["topk_accuracy"]["10"], 1.0)
+        self.assertAlmostEqual(ranking["mean_reciprocal_rank"], (1.0 + 1.0 / 6.0) / 2.0)
+        self.assertAlmostEqual(calibration["mean_top1_confidence"], 0.6)
 
     def test_compare_saved_runs_renders_markdown_table(self) -> None:
         first_summary = train_baseline(self._tiny_config())
