@@ -445,6 +445,115 @@ def _build_frequency_baselines(
     }
 
 
+def _parse_prior_tau_grid(value: str) -> list[float]:
+    try:
+        taus = sorted({float(item.strip()) for item in value.split(",") if item.strip()})
+    except ValueError as exc:
+        raise ValueError("Prior-adjustment tau values must be comma-separated numbers.") from exc
+    if not taus:
+        raise ValueError("Prior-adjustment tau grid cannot be empty.")
+    if any(tau < 0.0 for tau in taus):
+        raise ValueError("Prior-adjustment tau values cannot be negative.")
+    return taus
+
+
+def _build_log_class_priors(metadata, training_counts: dict[str, int], device: torch.device) -> torch.Tensor:
+    counts = torch.zeros(len(metadata.tactic_vocab), dtype=torch.float32, device=device)
+    for tactic_name, tactic_id in metadata.tactic_vocab.items():
+        counts[tactic_id] = float(training_counts.get(tactic_name, 0))
+    known_mask = torch.ones_like(counts, dtype=torch.bool)
+    known_mask[metadata.unknown_tactic_id] = False
+    known_total = counts[known_mask].sum()
+    if float(known_total.item()) <= 0.0:
+        raise ValueError("Training tactic counts are empty; prior adjustment cannot be evaluated.")
+    minimum_prior = 1.0 / float(known_total.item())
+    priors = (counts / known_total).clamp_min(minimum_prior)
+    log_priors = priors.log()
+    # <UNK_TACTIC> has no train support and must never receive a rare-class boost.
+    log_priors[metadata.unknown_tactic_id] = 0.0
+    return log_priors
+
+
+def _empty_prior_stats() -> dict[str, object]:
+    return {
+        "known_count": 0,
+        "top1_correct": 0,
+        "top5_correct": 0,
+        "top10_correct": 0,
+        "reciprocal_rank_sum": 0.0,
+        "per_class_support": Counter(),
+        "per_class_top1_correct": Counter(),
+    }
+
+
+def _update_prior_stats(
+    stats: dict[str, object],
+    *,
+    adjusted_logits: torch.Tensor,
+    targets: torch.Tensor,
+    unknown_tactic_id: int,
+) -> None:
+    known_mask = targets != unknown_tactic_id
+    if not bool(known_mask.any()):
+        return
+    known_logits = adjusted_logits[known_mask]
+    known_targets = targets[known_mask]
+    target_logits = known_logits.gather(1, known_targets.view(-1, 1))
+    ranks = (known_logits > target_logits).sum(dim=1).add(1)
+    predictions = known_logits.argmax(dim=1)
+
+    target_ids = [int(item) for item in known_targets.detach().cpu().tolist()]
+    prediction_ids = [int(item) for item in predictions.detach().cpu().tolist()]
+    stats["known_count"] = int(stats["known_count"]) + len(target_ids)
+    stats["top1_correct"] = int(stats["top1_correct"]) + int((ranks <= 1).sum().item())
+    stats["top5_correct"] = int(stats["top5_correct"]) + int((ranks <= 5).sum().item())
+    stats["top10_correct"] = int(stats["top10_correct"]) + int((ranks <= 10).sum().item())
+    stats["reciprocal_rank_sum"] = float(stats["reciprocal_rank_sum"]) + float(
+        ranks.float().reciprocal().sum().item()
+    )
+    stats["per_class_support"].update(target_ids)
+    stats["per_class_top1_correct"].update(
+        target_id
+        for target_id, prediction_id in zip(target_ids, prediction_ids)
+        if target_id == prediction_id
+    )
+
+
+def _finalize_prior_stats(tau: float, stats: dict[str, object]) -> dict[str, object]:
+    known_count = int(stats["known_count"])
+    per_class_support = stats["per_class_support"]
+    per_class_correct = stats["per_class_top1_correct"]
+    macro_recall = (
+        sum(per_class_correct[tactic_id] / support for tactic_id, support in per_class_support.items())
+        / len(per_class_support)
+        if per_class_support else 0.0
+    )
+    return {
+        "tau": tau,
+        "known_count": known_count,
+        "top1_accuracy": int(stats["top1_correct"]) / known_count if known_count else 0.0,
+        "top5_accuracy": int(stats["top5_correct"]) / known_count if known_count else 0.0,
+        "top10_accuracy": int(stats["top10_correct"]) / known_count if known_count else 0.0,
+        "mean_reciprocal_rank": float(stats["reciprocal_rank_sum"]) / known_count if known_count else 0.0,
+        "macro_top1_recall": macro_recall,
+    }
+
+
+def _select_prior_tau(sweep: list[dict[str, object]]) -> dict[str, object]:
+    if not sweep:
+        raise ValueError("Prior-adjustment sweep cannot be empty.")
+    # Optimize the declared objective (top-1), use MRR as a stable tie-breaker,
+    # and prefer the smaller correction when metrics are identical.
+    return max(
+        sweep,
+        key=lambda item: (
+            float(item["top1_accuracy"]),
+            float(item["mean_reciprocal_rank"]),
+            -float(item["tau"]),
+        ),
+    )
+
+
 def _build_confusion_summary(records: list[dict[str, object]]) -> list[dict[str, object]]:
     confusions: Counter[tuple[str, str]] = Counter()
     for record in records:
@@ -492,6 +601,25 @@ def _render_analysis_markdown(analysis: dict[str, object]) -> str:
         f"- most-common top-1 baseline: `{analysis['frequency_baseline']['topk_accuracy']['1']:.4f}`",
         f"- five-most-common coverage: `{analysis['frequency_baseline']['topk_accuracy']['5']:.4f}`",
         "",
+        "## Class-Prior Logit Adjustment",
+        "",
+        f"- selected tau: `{analysis['prior_adjustment']['selected_tau']}`",
+        f"- selection source: `{analysis['prior_adjustment']['selection_source']}`",
+        "",
+        "| Tau | Top-1 | Top-5 | Top-10 | MRR | Macro Recall |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+
+    for item in analysis["prior_adjustment"]["sweep"]:
+        selected_marker = " (selected)" if float(item["tau"]) == float(analysis["prior_adjustment"]["selected_tau"]) else ""
+        lines.append(
+            f"| {item['tau']:.2f}{selected_marker} | {item['top1_accuracy']:.4f} | "
+            f"{item['top5_accuracy']:.4f} | {item['top10_accuracy']:.4f} | "
+            f"{item['mean_reciprocal_rank']:.4f} | {item['macro_top1_recall']:.4f} |"
+        )
+
+    lines.extend([
+        "",
         "## Training Input Ambiguity",
         "",
         f"- unique model inputs: `{analysis['training_ambiguity']['unique_model_input_count']}`",
@@ -504,7 +632,7 @@ def _render_analysis_markdown(analysis: dict[str, object]) -> str:
         "",
         "| Bucket | Tactics | Support | Top-1 | Top-5 | Macro Recall |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
-    ]
+    ])
 
     for item in analysis["frequency_buckets"]:
         lines.append(
@@ -566,6 +694,8 @@ def analyze_saved_run(
     prepared_root: str | Path | None = None,
     medium_frequency_min: int = 100,
     head_frequency_min: int = 1000,
+    prior_tau_grid: list[float] | None = None,
+    selected_prior_tau: float | None = None,
 ) -> dict[str, object]:
     run_directory = Path(run_dir)
     if not run_directory.exists():
@@ -582,6 +712,13 @@ def analyze_saved_run(
         raise ValueError("Analysis parameter 'medium_frequency_min' must be positive.")
     if head_frequency_min <= medium_frequency_min:
         raise ValueError("Analysis parameter 'head_frequency_min' must exceed 'medium_frequency_min'.")
+    resolved_tau_grid = sorted(set(prior_tau_grid or [index / 10.0 for index in range(11)]))
+    if any(tau < 0.0 for tau in resolved_tau_grid):
+        raise ValueError("Prior-adjustment tau values cannot be negative.")
+    if selected_prior_tau is not None:
+        if selected_prior_tau < 0.0:
+            raise ValueError("Selected prior-adjustment tau cannot be negative.")
+        resolved_tau_grid = sorted(set([*resolved_tau_grid, selected_prior_tau]))
 
     config, metadata, loader = _build_analysis_loader(
         run_directory,
@@ -602,6 +739,12 @@ def analyze_saved_run(
     amp_dtype = _amp_dtype(device, config)
     use_amp = amp_dtype is not None
     id_to_tactic = _invert_vocab(metadata.tactic_vocab)
+    training_counts = {
+        str(name): int(count)
+        for name, count in dict(training_profile["tactic_counts"]).items()
+    }
+    log_class_priors = _build_log_class_priors(metadata, training_counts, device)
+    prior_stats = {tau: _empty_prior_stats() for tau in resolved_tau_grid}
     records: list[dict[str, object]] = []
     loss_sum = 0.0
     known_label_count = 0
@@ -631,6 +774,17 @@ def analyze_saved_run(
                 batch_loss = torch.nn.functional.cross_entropy(known_logits, known_targets)
                 loss_sum += float(batch_loss.item()) * int(known_targets.numel())
                 known_label_count += int(known_targets.numel())
+
+            for tau in resolved_tau_grid:
+                adjusted_logits = metric_logits - tau * log_class_priors.unsqueeze(0)
+                if tau > 0.0:
+                    adjusted_logits[:, metadata.unknown_tactic_id] = torch.finfo(adjusted_logits.dtype).min
+                _update_prior_stats(
+                    prior_stats[tau],
+                    adjusted_logits=adjusted_logits,
+                    targets=batch.y.view(-1),
+                    unknown_tactic_id=metadata.unknown_tactic_id,
+                )
 
             targets = batch.y.view(-1).detach().cpu()
             top_k_size = min(top_k, logits.size(1))
@@ -673,10 +827,6 @@ def analyze_saved_run(
     known_count = len(known_records)
     top1_correct = sum(1 for record in known_records if bool(record["correct_top1"]))
     top5_correct = sum(1 for record in known_records if bool(record["correct_top5"]))
-    training_counts = {
-        str(name): int(count)
-        for name, count in dict(training_profile["tactic_counts"]).items()
-    }
     per_tactic_summary, hardest_tactics = _build_per_tactic_summary(
         records,
         min_support=min_support,
@@ -698,6 +848,19 @@ def analyze_saved_run(
         sum(float(item["top1_accuracy"]) for item in per_tactic_summary) / len(per_tactic_summary)
         if per_tactic_summary else 0.0
     )
+    prior_sweep = [
+        _finalize_prior_stats(tau, prior_stats[tau])
+        for tau in resolved_tau_grid
+    ]
+    if selected_prior_tau is None:
+        selected_prior_result = _select_prior_tau(prior_sweep)
+        prior_selection_source = canonical_split
+    else:
+        selected_prior_result = next(
+            item for item in prior_sweep
+            if abs(float(item["tau"]) - selected_prior_tau) < 1e-12
+        )
+        prior_selection_source = "val"
 
     analysis = {
         "run_dir": str(run_directory),
@@ -722,6 +885,13 @@ def analyze_saved_run(
             "head_min": head_frequency_min,
         },
         "frequency_buckets": frequency_buckets,
+        "prior_adjustment": {
+            "formula": "adjusted_logits = logits - tau * log(training_class_prior)",
+            "selection_source": prior_selection_source,
+            "selected_tau": float(selected_prior_result["tau"]),
+            "selected_metrics": selected_prior_result,
+            "sweep": prior_sweep,
+        },
         "training_ambiguity": training_profile["ambiguity"],
         "per_tactic_summary": per_tactic_summary,
         "hardest_tactics": hardest_tactics,
@@ -840,6 +1010,18 @@ def build_analyze_arg_parser() -> argparse.ArgumentParser:
         default=1000,
         help="Minimum training support for the head-frequency bucket",
     )
+    parser.add_argument(
+        "--prior-tau-grid",
+        type=str,
+        default="0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0",
+        help="Comma-separated non-negative class-prior adjustment strengths",
+    )
+    parser.add_argument(
+        "--prior-tau",
+        type=float,
+        default=None,
+        help="Use a fixed tau instead of selecting one on validation",
+    )
     return parser
 
 
@@ -865,6 +1047,23 @@ def analyze_main(argv: list[str] | None = None) -> int:
 
     try:
         splits = ["val", "test"] if args.split == "both" else [args.split]
+        prior_tau_grid = _parse_prior_tau_grid(args.prior_tau_grid)
+        selected_prior_tau = args.prior_tau
+        if splits == ["test"] and selected_prior_tau is None:
+            val_analysis_path = Path(args.run_dir) / "analysis_val.json"
+            if not val_analysis_path.exists():
+                raise ValueError(
+                    "Test-only prior adjustment requires --prior-tau or an existing "
+                    "analysis_val.json produced by this analyzer."
+                )
+            val_analysis = _read_json(val_analysis_path)
+            prior_payload = val_analysis.get("prior_adjustment")
+            if not isinstance(prior_payload, dict) or "selected_tau" not in prior_payload:
+                raise ValueError(
+                    "Existing validation analysis has no selected prior tau; rerun with --split both."
+                )
+            selected_prior_tau = float(prior_payload["selected_tau"])
+
         for split in splits:
             analysis = analyze_saved_run(
                 args.run_dir,
@@ -874,12 +1073,20 @@ def analyze_main(argv: list[str] | None = None) -> int:
                 prepared_root=args.prepared_root,
                 medium_frequency_min=args.medium_frequency_min,
                 head_frequency_min=args.head_frequency_min,
+                prior_tau_grid=prior_tau_grid,
+                selected_prior_tau=selected_prior_tau,
             )
+            if split == "val" and args.prior_tau is None:
+                selected_prior_tau = float(analysis["prior_adjustment"]["selected_tau"])
             console_print(f"  Wrote analysis summary   : {analysis['artifacts']['analysis_json']}")
             console_print(f"  Wrote analysis markdown  : {analysis['artifacts']['analysis_markdown']}")
             console_print(f"  Wrote prediction records : {analysis['artifacts']['predictions_jsonl']}")
             console_print(f"  Wrote per-tactic table   : {analysis['artifacts']['per_tactic_csv']}")
             console_print(f"  Wrote confusion table    : {analysis['artifacts']['confusion_pairs_csv']}")
+            console_print(
+                f"  Prior-adjustment tau     : {analysis['prior_adjustment']['selected_tau']} "
+                f"(selected on {analysis['prior_adjustment']['selection_source']})"
+            )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         console_print(f"  ERROR: {exc}")
         return 1

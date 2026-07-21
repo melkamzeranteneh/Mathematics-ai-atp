@@ -4,6 +4,7 @@ import json
 import shutil
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -23,7 +24,13 @@ from maths_ai.gnn_inference.atp_lean_gnn import (
 from maths_ai.gnn_inference.atp_lean_gnn.cache import SplitReport, prepare_output_root, write_manifest, write_pyg_artifact, write_vocab
 from maths_ai.gnn_inference.atp_lean_gnn.analysis import (
     _build_calibration_summary,
+    _build_log_class_priors,
     _build_rank_summary,
+    _empty_prior_stats,
+    _finalize_prior_stats,
+    _parse_prior_tau_grid,
+    _select_prior_tau,
+    _update_prior_stats,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.graph import proof_state_to_dag
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import build_vocab_from_labels, dag_to_pyg
@@ -190,6 +197,8 @@ class RunAnalysisTests(unittest.TestCase):
         self.assertIn("mean_reciprocal_rank", analysis["ranking"])
         self.assertIn("expected_calibration_error", analysis["calibration"])
         self.assertIn("topk_accuracy", analysis["frequency_baseline"])
+        self.assertIn("selected_tau", analysis["prior_adjustment"])
+        self.assertEqual(len(analysis["prior_adjustment"]["sweep"]), 11)
         self.assertIn("empirical_deterministic_top1_ceiling", analysis["training_ambiguity"])
         self.assertEqual(analysis["per_tactic_summary"][0]["frequency_bucket"], "tail")
 
@@ -225,6 +234,41 @@ class RunAnalysisTests(unittest.TestCase):
         self.assertEqual(ranking["topk_accuracy"]["10"], 1.0)
         self.assertAlmostEqual(ranking["mean_reciprocal_rank"], (1.0 + 1.0 / 6.0) / 2.0)
         self.assertAlmostEqual(calibration["mean_top1_confidence"], 0.6)
+
+    def test_prior_adjustment_can_correct_frequency_biased_logits(self) -> None:
+        metadata = SimpleNamespace(
+            tactic_vocab={"common": 0, "rare": 1, "<UNK_TACTIC>": 2},
+            unknown_tactic_id=2,
+        )
+        logits = torch.tensor(
+            [
+                [3.0, 2.0, -5.0],
+                [3.0, 2.9, -5.0],
+            ]
+        )
+        targets = torch.tensor([0, 1])
+        log_priors = _build_log_class_priors(
+            metadata,
+            {"common": 90, "rare": 10},
+            torch.device("cpu"),
+        )
+
+        sweep = []
+        for tau in (0.0, 0.2):
+            stats = _empty_prior_stats()
+            adjusted_logits = logits - tau * log_priors.unsqueeze(0)
+            _update_prior_stats(
+                stats,
+                adjusted_logits=adjusted_logits,
+                targets=targets,
+                unknown_tactic_id=metadata.unknown_tactic_id,
+            )
+            sweep.append(_finalize_prior_stats(tau, stats))
+
+        self.assertEqual(sweep[0]["top1_accuracy"], 0.5)
+        self.assertEqual(sweep[1]["top1_accuracy"], 1.0)
+        self.assertEqual(_select_prior_tau(sweep)["tau"], 0.2)
+        self.assertEqual(_parse_prior_tau_grid("0.2, 0, 0.2, 1"), [0.0, 0.2, 1.0])
 
     def test_compare_saved_runs_renders_markdown_table(self) -> None:
         first_summary = train_baseline(self._tiny_config())
