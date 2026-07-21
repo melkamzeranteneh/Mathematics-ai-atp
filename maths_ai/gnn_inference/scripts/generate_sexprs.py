@@ -40,6 +40,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-items", type=int, default=None)
     parser.add_argument("--project-path", default="maths_ai/lean_mathlib")
     parser.add_argument(
+        "--server-timeout",
+        type=int,
+        default=600,
+        help="Seconds allowed for Pantograph to import Mathlib and become ready.",
+    )
+    parser.add_argument(
         "--no-resume",
         action="store_true",
         help="Replay every theorem even when all of its versioned rows exist.",
@@ -62,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         sample_per_split=args.max_items,
         resume=not args.no_resume,
         require_solved_theorem=not args.allow_incomplete_theorems,
+        server_startup_timeout=args.server_timeout,
     )
     try:
         summary = asyncio.run(extract_sexpressions(config))

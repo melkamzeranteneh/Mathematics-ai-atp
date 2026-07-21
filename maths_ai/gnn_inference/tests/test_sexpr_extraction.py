@@ -260,6 +260,7 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
 
         async def factory(**kwargs):
             self.assertEqual(kwargs["options"], {"printExprAST": True})
+            self.assertEqual(kwargs["timeout"], 600)
             return server
 
         with patch(

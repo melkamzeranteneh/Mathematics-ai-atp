@@ -26,6 +26,7 @@ class SExprExtractionConfig:
     sample_per_split: int | None = None
     resume: bool = True
     require_solved_theorem: bool = True
+    server_startup_timeout: int = 600
 
 
 class TheoremReplayError(RuntimeError):
@@ -424,6 +425,7 @@ async def extract_sexpressions(
         project_path=config.project_path,
         imports=list(config.imports),
         options={"printExprAST": True},
+        timeout=config.server_startup_timeout,
     )
     cache = SExprCache(config.prepared_root, config.project_path, enabled=True)
     manifests: dict[str, dict[str, object]] = {}
