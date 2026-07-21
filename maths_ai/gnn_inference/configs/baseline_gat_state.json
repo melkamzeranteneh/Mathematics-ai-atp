@@ -2,7 +2,7 @@
   "prepared_root": "maths_ai/gnn_inference/artifacts/prepared/v1",
   "run_root": "maths_ai/gnn_inference/runs/baseline_gat",
   "seed": 42,
-  "device": "auto",
+  "device": "cuda:0",
   "edge_mode": "bidirectional",
   "use_node_type": true,
   "gnn_type": "gat",

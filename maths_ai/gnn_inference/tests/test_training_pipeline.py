@@ -26,6 +26,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.cache import SplitReport, prepare_outpu
 from maths_ai.gnn_inference.atp_lean_gnn.graph import proof_state_to_dag
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import build_vocab_from_labels, dag_to_pyg
 from maths_ai.gnn_inference.atp_lean_gnn.training import build_baseline_model
+from maths_ai.gnn_inference.scripts.pack_prepared_dataset import pack_prepared_dataset
 
 
 class TrainingPipelineTests(unittest.TestCase):
@@ -203,6 +204,26 @@ class TrainingPipelineTests(unittest.TestCase):
 
         self.assertEqual([int(sample.row_index) for sample in samples], [1, 0])
         self.assertIs(dataset[1], samples[0])
+
+    def test_packed_cache_preloads_transformed_graphs(self) -> None:
+        manifest_path = pack_prepared_dataset(
+            self.prepared_root,
+            edge_mode="bidirectional",
+            chunk_size=1,
+            io_threads=2,
+        )
+        metadata = load_prepared_metadata(self.prepared_root)
+        dataset = PreparedGraphDataset(
+            metadata,
+            split="train",
+            edge_mode="bidirectional",
+            cache_in_memory=True,
+        )
+
+        self.assertTrue(manifest_path.exists())
+        self.assertTrue(dataset.packed_cache_loaded)
+        self.assertEqual(len(dataset), 2)
+        self.assertTrue(all(sample is not None for sample in dataset._cache))
 
     def test_bidirectional_transform_preserves_nodes_and_adds_reverse_edges(self) -> None:
         metadata = load_prepared_metadata(self.prepared_root)

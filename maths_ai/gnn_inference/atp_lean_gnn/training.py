@@ -560,6 +560,52 @@ class PreparedGraphDataset(Dataset):
                 f"but '{self.pyg_dir}' contains {len(self.files)} '.pt' files."
             )
         self._cache = [None] * len(self.files) if self.cache_in_memory else None
+        self.packed_cache_loaded = False
+        if self._cache is not None:
+            self.packed_cache_loaded = self._load_packed_cache()
+
+    def _load_packed_cache(self) -> bool:
+        manifest_path = (
+            self.metadata.root
+            / "packed"
+            / self.edge_mode
+            / "manifest.json"
+        )
+        if not manifest_path.exists():
+            return False
+
+        manifest = _read_json(manifest_path)
+        split_payload = dict(manifest.get("splits", {})).get(self.split)
+        if not isinstance(split_payload, dict):
+            return False
+        if int(split_payload.get("count", -1)) != len(self.files):
+            return False
+
+        chunk_names = split_payload.get("chunks", [])
+        if not isinstance(chunk_names, list) or not chunk_names:
+            return False
+
+        packed_root = manifest_path.parent / self.split
+        offset = 0
+        for chunk_name in chunk_names:
+            chunk_path = packed_root / str(chunk_name)
+            if not chunk_path.exists():
+                return False
+            chunk = torch.load(chunk_path, map_location="cpu", weights_only=False)
+            if not isinstance(chunk, list):
+                raise ValueError(f"Packed graph chunk '{chunk_path}' must contain a list.")
+            end = offset + len(chunk)
+            if end > len(self._cache):
+                raise ValueError(f"Packed graph chunk '{chunk_path}' exceeds the split size.")
+            self._cache[offset:end] = chunk
+            offset = end
+
+        if offset != len(self._cache):
+            raise ValueError(
+                f"Packed cache for split '{self.split}' loaded {offset} examples, "
+                f"expected {len(self._cache)}."
+            )
+        return True
 
     def __len__(self) -> int:
         return len(self.files)
@@ -1253,7 +1299,8 @@ def train_baseline(
         f"io_threads={datasets['train'].io_threads}, "
         f"pin_memory={config.training.pin_memory}, "
         f"persistent_workers={getattr(loaders['train'], 'persistent_workers', False)}, "
-        f"cache_in_memory={config.training.cache_in_memory}"
+        f"cache_in_memory={config.training.cache_in_memory}, "
+        f"packed_cache={datasets['train'].packed_cache_loaded}"
     )
     if resume_run_dir is not None:
         console_print(
@@ -1502,7 +1549,8 @@ def train_pointer(
         f"io_threads={datasets['train'].io_threads}, "
         f"pin_memory={config.training.pin_memory}, "
         f"persistent_workers={getattr(loaders['train'], 'persistent_workers', False)}, "
-        f"cache_in_memory={config.training.cache_in_memory}"
+        f"cache_in_memory={config.training.cache_in_memory}, "
+        f"packed_cache={datasets['train'].packed_cache_loaded}"
     )
     console_print(f"  Max args per step        : {config.max_args}")
     console_print(f"  Argument loss weight     : {config.arg_loss_weight}")
