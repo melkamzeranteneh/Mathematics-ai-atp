@@ -547,30 +547,46 @@ class PreparedGraphDataset(Dataset):
         self.cache_in_memory = bool(cache_in_memory)
         self._thread_pool: ThreadPoolExecutor | None = None
         self.pyg_dir = metadata.split_pyg_dir(self.split)
-        self.files = sorted(self.pyg_dir.glob("*.pt"))
-        if not self.files:
+        expected_count = int(metadata.split_manifest(self.split).get("success_count", 0))
+        self._length = expected_count
+        packed_available = self.cache_in_memory and self._packed_cache_is_complete()
+        self.files = [] if packed_available else sorted(self.pyg_dir.glob("*.pt"))
+        if not packed_available and not self.files:
             raise RuntimeError(
-                f"Prepared split '{self.split}' has no cached PyG examples under '{self.pyg_dir}'."
+                f"Prepared split '{self.split}' has neither individual PyG examples "
+                f"under '{self.pyg_dir}' nor a complete packed cache."
             )
-
-        expected_count = int(metadata.split_manifest(self.split).get("success_count", len(self.files)))
-        if expected_count != len(self.files):
+        if not packed_available and expected_count != len(self.files):
             raise ValueError(
                 f"Prepared split '{self.split}' manifest reports {expected_count} examples, "
                 f"but '{self.pyg_dir}' contains {len(self.files)} '.pt' files."
             )
-        self._cache = [None] * len(self.files) if self.cache_in_memory else None
+        self._cache = [None] * self._length if self.cache_in_memory else None
         self.packed_cache_loaded = False
         if self._cache is not None:
             self.packed_cache_loaded = self._load_packed_cache()
 
+    def _packed_manifest_path(self) -> Path:
+        return self.metadata.root / "packed" / self.edge_mode / "manifest.json"
+
+    def _packed_cache_is_complete(self) -> bool:
+        manifest_path = self._packed_manifest_path()
+        if not manifest_path.exists():
+            return False
+        manifest = _read_json(manifest_path)
+        split_payload = dict(manifest.get("splits", {})).get(self.split)
+        if not isinstance(split_payload, dict):
+            return False
+        if int(split_payload.get("count", -1)) != self._length:
+            return False
+        chunk_names = split_payload.get("chunks", [])
+        if not isinstance(chunk_names, list) or not chunk_names:
+            return False
+        packed_root = manifest_path.parent / self.split
+        return all((packed_root / str(chunk_name)).exists() for chunk_name in chunk_names)
+
     def _load_packed_cache(self) -> bool:
-        manifest_path = (
-            self.metadata.root
-            / "packed"
-            / self.edge_mode
-            / "manifest.json"
-        )
+        manifest_path = self._packed_manifest_path()
         if not manifest_path.exists():
             return False
 
@@ -578,7 +594,7 @@ class PreparedGraphDataset(Dataset):
         split_payload = dict(manifest.get("splits", {})).get(self.split)
         if not isinstance(split_payload, dict):
             return False
-        if int(split_payload.get("count", -1)) != len(self.files):
+        if int(split_payload.get("count", -1)) != len(self):
             return False
 
         chunk_names = split_payload.get("chunks", [])
@@ -608,11 +624,17 @@ class PreparedGraphDataset(Dataset):
         return True
 
     def __len__(self) -> int:
-        return len(self.files)
+        return self._length
 
     def __getitem__(self, index: int):
         if self._cache is not None and self._cache[index] is not None:
             return self._cache[index]
+
+        if not self.files:
+            raise RuntimeError(
+                f"Packed cache entry {index} for split '{self.split}' was not loaded "
+                "and individual PyG files are unavailable."
+            )
 
         path = self.files[index]
         data = torch.load(path, map_location="cpu", weights_only=False)

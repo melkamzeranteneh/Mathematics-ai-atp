@@ -225,6 +225,18 @@ class TrainingPipelineTests(unittest.TestCase):
         self.assertEqual(len(dataset), 2)
         self.assertTrue(all(sample is not None for sample in dataset._cache))
 
+        for split in ("train", "val", "test"):
+            for path in (self.prepared_root / split / "pyg").glob("*.pt"):
+                path.unlink()
+        packed_only = PreparedGraphDataset(
+            metadata,
+            split="train",
+            edge_mode="bidirectional",
+            cache_in_memory=True,
+        )
+        self.assertTrue(packed_only.packed_cache_loaded)
+        self.assertEqual(len(packed_only), 2)
+
     def test_bidirectional_transform_preserves_nodes_and_adds_reverse_edges(self) -> None:
         metadata = load_prepared_metadata(self.prepared_root)
         forward_sample = PreparedGraphDataset(metadata, split="train", edge_mode="forward")[0]
