@@ -2,9 +2,12 @@
 import sys
 sys.path.insert(0, ".")
 
+import pytest
+
 from maths_ai.gnn_inference.atp_lean_gnn.graph import (
     BINDER_KIND_FORALL,
     BINDER_KIND_LAMBDA,
+    BINDER_KIND_LET,
     BINDER_KIND_NONE,
     DAGBuilder,
     get_node_labels,
@@ -34,11 +37,40 @@ def test_nested_forall():
     assert "q" in labels
 
 
+def test_nested_forall_resolves_exact_debruijn_argument_order():
+    dag = sexp_to_dag(
+        "(:forall p (:sort 0) (:forall q (:sort 0) ((:c Or) 1 0)))"
+    )
+    p_node = next(node for node in dag.nodes if node.label == "p" and node.is_bound)
+    q_node = next(node for node in dag.nodes if node.label == "q" and node.is_bound)
+    application = next(node for node in dag.nodes if node.label == "App")
+
+    assert [dag.nodes[node_id].label for node_id in application.children] == [
+        "Or",
+        "p",
+        "q",
+    ]
+    assert application.children[1:] == (p_node.id, q_node.id)
+
+
 def test_arrow():
     dag = sexp_to_dag("(:forall a (:c Nat) (:forall a (:c Nat) (:c Nat)))")
     labels = get_node_labels(dag)
     assert labels.count(":forall") == 2
     assert "Nat" in labels
+
+
+def test_same_named_binders_have_distinct_scoped_nodes():
+    dag = sexp_to_dag(
+        "(:forall a (:sort 0) (:forall a (:sort 0) ((:c Eq) 1 0)))"
+    )
+    binders = [node for node in dag.nodes if node.label == "a" and node.is_bound]
+    application = next(node for node in dag.nodes if node.label == "App")
+
+    assert len(binders) == 2
+    assert binders[0].id != binders[1].id
+    assert [node.binder_depth for node in binders] == [1, 2]
+    assert application.children[1:] == (binders[0].id, binders[1].id)
 
 
 def test_constants():
@@ -54,6 +86,43 @@ def test_lambda():
     assert ":lambda" in labels
     assert "And" in labels
     assert "Not" in labels
+
+
+@pytest.mark.parametrize("binder_tag", [":forall", ":lambda"])
+def test_binder_type_uses_old_context_and_body_uses_new_context(binder_tag):
+    dag = sexp_to_dag(
+        f"(:forall alpha (:sort 1) "
+        f"({binder_tag} x 0 ((:c Eq) 1 0)))"
+    )
+    alpha = next(node for node in dag.nodes if node.label == "alpha" and node.is_bound)
+    x = next(node for node in dag.nodes if node.label == "x" and node.is_bound)
+    inner_binder = next(
+        node
+        for node in dag.nodes
+        if node.label == binder_tag and node.children[0] == x.id
+    )
+    application = next(node for node in dag.nodes if node.label == "App")
+
+    assert inner_binder.children[1] == alpha.id
+    assert application.children[1:] == (alpha.id, x.id)
+
+
+def test_let_binder_scope_and_children_are_exact():
+    dag = sexp_to_dag(
+        "(:forall x (:c Nat) (:let x 0 0 ((:c Eq) (:c Nat) 1 0)))"
+    )
+    outer_x, inner_x = [
+        node for node in dag.nodes if node.label == "x" and node.is_bound
+    ]
+    let_node = next(node for node in dag.nodes if node.label == ":let")
+    body = dag.nodes[let_node.children[3]]
+
+    assert let_node.label == ":let"
+    assert let_node.node_type == "sbinder"
+    assert inner_x.binder_kind == BINDER_KIND_LET
+    assert let_node.children[:3] == (inner_x.id, outer_x.id, outer_x.id)
+    assert body.label == "App"
+    assert body.children[-2:] == (outer_x.id, inner_x.id)
 
 
 def test_complex_expression():
@@ -145,6 +214,74 @@ def test_free_variable():
     assert "_uniq.28" in labels
 
 
+def test_special_forms_preserve_semantic_node_types():
+    cases = {
+        "(:c Nat)": ("Nat", "const"),
+        "(:fv _uniq.28)": ("_uniq.28", "var"),
+        "(:sort 0)": ("Prop", "type"),
+        "(:lit 42)": ("Lit:42", "const"),
+        "(:lambda x (:c Nat) 0)": (":lambda", "sbinder"),
+    }
+
+    for sexp, (expected_label, expected_type) in cases.items():
+        dag = sexp_to_dag(sexp)
+        root = dag.nodes[dag.expression_root_id]
+        assert (root.label, root.node_type) == (expected_label, expected_type)
+
+
+def test_metadata_form_retains_metadata_and_expression_children():
+    dag = sexp_to_dag("(:mdata (key value) (:c Nat))")
+    root = dag.nodes[dag.expression_root_id]
+
+    assert root.label == ":mdata"
+    assert root.node_type == "meta"
+    assert [dag.nodes[node_id].label for node_id in root.children] == [
+        "Metadata:(key value)",
+        "Nat",
+    ]
+
+
+def test_projection_form_retains_structure_index_and_expression():
+    dag = sexp_to_dag("(:proj Prod 1 (:fv pair))")
+    root = dag.nodes[dag.expression_root_id]
+
+    assert root.label == ":proj"
+    assert root.node_type == "sapp"
+    assert [dag.nodes[node_id].label for node_id in root.children] == [
+        "Prod",
+        "Field:1",
+        "pair",
+    ]
+
+
+def test_unknown_tagged_form_is_not_misparsed_as_application():
+    dag = sexp_to_dag("(:custom (:c Nat) (:fv x))")
+    root = dag.nodes[dag.expression_root_id]
+
+    assert root.label == ":custom"
+    assert root.node_type == "sconst"
+    assert [dag.nodes[node_id].label for node_id in root.children] == ["Nat", "x"]
+
+
+@pytest.mark.parametrize(
+    "sexp, expected_tag",
+    [
+        ("(:forall x (:c Nat))", ":forall"),
+        ("(:lambda x (:c Nat))", ":lambda"),
+        ("(:let x (:c Nat) (:lit 1))", ":let"),
+        ("(:c Nat extra)", ":c"),
+        ("(:fv x extra)", ":fv"),
+        ("(:sort 0 extra)", ":sort"),
+        ("(:lit 1 extra)", ":lit"),
+        ("(:mdata key)", ":mdata"),
+        ("(:proj Prod 0)", ":proj"),
+    ],
+)
+def test_malformed_known_forms_fail_explicitly(sexp, expected_tag):
+    with pytest.raises(ValueError, match=expected_tag):
+        sexp_to_dag(sexp)
+
+
 def test_sort_prop():
     dag = sexp_to_dag("(:sort 0)")
     labels = get_node_labels(dag)
@@ -175,6 +312,13 @@ def test_root_nodes():
     assert len(roots) >= 1
 
 
+def test_sexp_parser_records_the_explicit_expression_root():
+    dag = sexp_to_dag("(:forall q (:sort 0) ((:c Or) 0 0))")
+
+    assert dag.expression_root_id is not None
+    assert dag.nodes[dag.expression_root_id].label == ":forall"
+
+
 def test_leaf_nodes():
     dag = sexp_to_dag("(:forall q (:sort 0) 0)")
     leaves = dag.leaf_nodes()
@@ -196,6 +340,9 @@ def test_proof_state_with_sexp():
     assert "Goal" in labels
     assert "Hyp" in labels
     assert "State" in labels
+
+    goal = next(node for node in dag.nodes if node.label == "Goal")
+    assert goal.children == (dag.expression_root_id,)
 
 
 def test_proof_state_without_sexp_fallback():

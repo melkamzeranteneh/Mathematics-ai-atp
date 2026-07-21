@@ -313,13 +313,16 @@ def prepare_example(
     sexpr_cache: Optional[SExprCache] = None,
     sexpr_data: Optional[dict] = None,
     use_sexpr: bool = True,
-) -> tuple:
-    """Prepare a single example, returning (dag, tactic_name).
+) -> PreparedExample:
+    """Prepare a single example with phase-specific error reporting.
 
     If ``sexpr_data`` is provided, uses it for S-expression DAG construction.
     Otherwise falls back to the text parser.
     """
-    parsed_state = parse_state(row.state)
+    try:
+        parsed_state = parse_state(row.state)
+    except Exception as exc:
+        raise PreparationPhaseError(phase="parse_state", cause=exc) from exc
 
     goal_sexp = None
     hyp_sexps = None
@@ -337,13 +340,27 @@ def prepare_example(
                 (item["name"], item["sexp"]) for item in cached.get("hyp_sexps", [])
             ]
 
-    dag = proof_state_to_dag(
-        row.state,
-        goal_sexp=goal_sexp,
-        hyp_sexps=hyp_sexps,
-    )
+    try:
+        if goal_sexp is not None or hyp_sexps is not None:
+            dag = proof_state_to_dag(
+                parsed_state,
+                goal_sexp=goal_sexp,
+                hyp_sexps=hyp_sexps,
+            )
+        else:
+            dag = proof_state_to_dag(parsed_state)
+    except Exception as exc:
+        raise PreparationPhaseError(phase="proof_state_to_dag", cause=exc) from exc
 
-    label_info = label_example(row.tactic)
+    try:
+        label_info = label_example(row.tactic)
+    except Exception as exc:
+        raise PreparationPhaseError(phase="label_example", cause=exc) from exc
     tactic_name = str(label_info["tactic_name"])
 
-    return dag, tactic_name
+    return PreparedExample(
+        row=row,
+        parsed_state=parsed_state,
+        dag=dag,
+        tactic_name=tactic_name,
+    )

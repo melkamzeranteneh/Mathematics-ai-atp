@@ -149,19 +149,74 @@ class DAGBuilder:
 
     nodes: list[GraphNode] = field(default_factory=list)
     edges: list[tuple[int, int]] = field(default_factory=list)
-    _memo: dict[tuple[str, tuple[int, ...]], int] = field(default_factory=dict)
+    expression_root_id: int | None = None
+    _memo: dict[tuple[str, str, tuple[int, ...]], int] = field(default_factory=dict)
 
-    def get_or_create(self, label: str, children: tuple[int, ...]) -> int:
-        key = (label, children)
-        if key in self._memo:
+    def add_node(
+        self,
+        label: str,
+        children: tuple[int, ...],
+        *,
+        node_type: str | None = None,
+        is_bound: int = BINDER_KIND_NONE,
+        binder_depth: int = 0,
+        binder_kind: int = BINDER_KIND_UNKNOWN,
+        hash_cons: bool = True,
+    ) -> int:
+        """Add a node, optionally hash-consing semantically identical nodes.
+
+        Bound variables use ``hash_cons=False`` because their identity is their
+        lexical scope, not their display name. References to a bound variable
+        reuse its node id directly from the De Bruijn context.
+        """
+        resolved_node_type = node_type or _classify_label(label)
+        key = (label, resolved_node_type, children)
+        if hash_cons and key in self._memo:
             return self._memo[key]
 
         node_id = len(self.nodes)
-        self.nodes.append(GraphNode(node_id, label, _classify_label(label), children))
+        self.nodes.append(
+            GraphNode(
+                node_id,
+                label,
+                resolved_node_type,
+                children,
+                is_bound=is_bound,
+                binder_depth=binder_depth,
+                binder_kind=binder_kind,
+            )
+        )
         for child_id in children:
             self.edges.append((child_id, node_id))
-        self._memo[key] = node_id
+        if hash_cons:
+            self._memo[key] = node_id
         return node_id
+
+    def get_or_create(
+        self,
+        label: str,
+        children: tuple[int, ...],
+        *,
+        node_type: str | None = None,
+    ) -> int:
+        return self.add_node(label, children, node_type=node_type)
+
+    def create_bound_variable(
+        self,
+        label: str,
+        *,
+        binder_depth: int,
+        binder_kind: int,
+    ) -> int:
+        return self.add_node(
+            label,
+            (),
+            node_type="var",
+            is_bound=1,
+            binder_depth=binder_depth,
+            binder_kind=binder_kind,
+            hash_cons=False,
+        )
 
     @property
     def num_nodes(self) -> int:
@@ -225,7 +280,7 @@ def sexp_to_dag(sexp: str) -> DAGBuilder:
     """
     dag = DAGBuilder()
     parsed = parse_sexp_string(sexp)
-    _sexp_walk(parsed, [], dag)
+    dag.expression_root_id = _sexp_walk(parsed, [], dag)
     return dag
 
 
@@ -234,12 +289,12 @@ def get_node_labels(dag: DAGBuilder) -> list[str]:
     return [n.label for n in dag.nodes]
 
 
-def _sexp_walk(sexp, ctx: list[str], dag: DAGBuilder) -> int:
+def _sexp_walk(sexp, ctx: list[int], dag: DAGBuilder) -> int:
     """Walk a parsed S-expression and build DAG nodes.
 
     Args:
         sexp: Nested list from parse_sexp_string
-        ctx: Context stack of bound variable names (for de Bruijn resolution)
+        ctx: Bound-variable node ids, newest first (De Bruijn index order)
         dag: DAGBuilder to populate
 
     Returns:
@@ -248,51 +303,114 @@ def _sexp_walk(sexp, ctx: list[str], dag: DAGBuilder) -> int:
     if not isinstance(sexp, list):
         return _sexp_leaf(sexp, ctx, dag)
 
-    if len(sexp) < 2:
-        return dag.get_or_create("()", ())
+    if not sexp:
+        return dag.get_or_create("()", (), node_type="sconst")
 
     head = sexp[0]
 
-    # Binder: (:forall name type body) or (:lambda name type body)
+    # Binder: (:forall name type body) or (:lambda name type body).
+    # The binder is not in scope in its own type, but is index 0 in its body.
     if head in (":forall", ":lambda"):
+        if len(sexp) != 4:
+            raise ValueError(f"Malformed {head} S-expression: expected 4 fields, got {len(sexp)}")
         name = sexp[1]
         ty = sexp[2]
         body = sexp[3]
         binder_kind = BINDER_KIND_FORALL if head == ":forall" else BINDER_KIND_LAMBDA
 
-        # Variable node (leaf, annotated inline)
-        var_id = dag.get_or_create(name, ())
-        dag.nodes[var_id] = GraphNode(
-            id=var_id,
-            label=name,
-            node_type="var",
-            children=(),
-            is_bound=1,
+        var_id = dag.create_bound_variable(
+            str(name),
             binder_depth=len(ctx) + 1,
             binder_kind=binder_kind,
         )
-
-        # Type and body — both may reference this binder via de Bruijn
-        ctx_with_var = ctx + [name]
-        ty_id = _sexp_walk(ty, ctx_with_var, dag)
-        body_id = _sexp_walk(body, ctx_with_var, dag)
+        ty_id = _sexp_walk(ty, ctx, dag)
+        body_id = _sexp_walk(body, [var_id, *ctx], dag)
 
         # (:forall name type body) — 3 children
-        return dag.get_or_create(head, (var_id, ty_id, body_id))
+        return dag.get_or_create(head, (var_id, ty_id, body_id), node_type="sbinder")
+
+    # Let binder: (:let name type value body). The name is in scope only in
+    # the body; neither its type nor defining value may refer to itself.
+    if head == ":let":
+        if len(sexp) != 5:
+            raise ValueError(f"Malformed :let S-expression: expected 5 fields, got {len(sexp)}")
+        name, ty, value, body = sexp[1:]
+        var_id = dag.create_bound_variable(
+            str(name),
+            binder_depth=len(ctx) + 1,
+            binder_kind=BINDER_KIND_LET,
+        )
+        ty_id = _sexp_walk(ty, ctx, dag)
+        value_id = _sexp_walk(value, ctx, dag)
+        body_id = _sexp_walk(body, [var_id, *ctx], dag)
+        return dag.get_or_create(
+            ":let",
+            (var_id, ty_id, value_id, body_id),
+            node_type="sbinder",
+        )
 
     # Constant: (:c Name)
-    if head == ":c" and len(sexp) == 2:
-        return dag.get_or_create(str(sexp[1]), ())
+    if head == ":c":
+        if len(sexp) != 2:
+            raise ValueError(f"Malformed :c S-expression: expected 2 fields, got {len(sexp)}")
+        return dag.get_or_create(str(sexp[1]), (), node_type="const")
 
     # Sort: (:sort N)
-    if head == ":sort" and len(sexp) == 2:
+    if head == ":sort":
+        if len(sexp) != 2:
+            raise ValueError(f"Malformed :sort S-expression: expected 2 fields, got {len(sexp)}")
         n = sexp[1]
         label = "Prop" if n == "0" else "Type" if n == "1" else f"Sort-{n}"
-        return dag.get_or_create(label, ())
+        return dag.get_or_create(label, (), node_type="type")
 
     # Free variable: (:fv Name)
-    if head == ":fv" and len(sexp) == 2:
-        return dag.get_or_create(str(sexp[1]), ())
+    if head == ":fv":
+        if len(sexp) != 2:
+            raise ValueError(f"Malformed :fv S-expression: expected 2 fields, got {len(sexp)}")
+        return dag.get_or_create(str(sexp[1]), (), node_type="var")
+
+    # Literal: (:lit value). Keep the payload in the visible label while its
+    # semantic node type records that it is a constant rather than a variable.
+    if head == ":lit":
+        if len(sexp) != 2:
+            raise ValueError(f"Malformed :lit S-expression: expected 2 fields, got {len(sexp)}")
+        return dag.get_or_create(f"Lit:{_sexp_payload_text(sexp[1])}", (), node_type="const")
+
+    # Metadata: (:mdata metadata expression). Metadata is retained as a
+    # structural node instead of being mistaken for a function application.
+    if head == ":mdata":
+        if len(sexp) != 3:
+            raise ValueError(f"Malformed :mdata S-expression: expected 3 fields, got {len(sexp)}")
+        metadata_id = dag.get_or_create(
+            f"Metadata:{_sexp_payload_text(sexp[1])}",
+            (),
+            node_type="sconst",
+        )
+        expression_id = _sexp_walk(sexp[2], ctx, dag)
+        return dag.get_or_create(
+            ":mdata",
+            (metadata_id, expression_id),
+            node_type="meta",
+        )
+
+    # Projection: (:proj Structure index expression).
+    if head == ":proj":
+        if len(sexp) != 4:
+            raise ValueError(f"Malformed :proj S-expression: expected 4 fields, got {len(sexp)}")
+        structure_id = dag.get_or_create(str(sexp[1]), (), node_type="const")
+        index_id = dag.get_or_create(f"Field:{sexp[2]}", (), node_type="sconst")
+        expression_id = _sexp_walk(sexp[3], ctx, dag)
+        return dag.get_or_create(
+            ":proj",
+            (structure_id, index_id, expression_id),
+            node_type="sapp",
+        )
+
+    # Preserve unknown tagged Lean expression forms as tagged structural
+    # nodes. This is safer than treating the tag itself as a callable term.
+    if isinstance(head, str) and head.startswith(":"):
+        children = tuple(_sexp_walk(item, ctx, dag) for item in sexp[1:])
+        return dag.get_or_create(head, children, node_type="sconst")
 
     # Application: (f a b ...) — first is function, rest are args
     if len(sexp) >= 2:
@@ -300,22 +418,29 @@ def _sexp_walk(sexp, ctx: list[str], dag: DAGBuilder) -> int:
         children = [fn_id]
         for arg in sexp[1:]:
             children.append(_sexp_walk(arg, ctx, dag))
-        return dag.get_or_create("App", tuple(children))
+        return dag.get_or_create("App", tuple(children), node_type="sapp")
 
     return dag.get_or_create(str(sexp), ())
 
 
-def _sexp_leaf(token: str, ctx: list[str], dag: DAGBuilder) -> int:
+def _sexp_payload_text(value) -> str:
+    if isinstance(value, list):
+        return "(" + " ".join(_sexp_payload_text(item) for item in value) + ")"
+    return str(value)
+
+
+def _sexp_leaf(token: str, ctx: list[int], dag: DAGBuilder) -> int:
     """Handle a bare token (not a list)."""
     # De Bruijn index (bare number)
-    if token.isdigit() or (token.startswith("-") and token[1:].isdigit()):
-        idx = int(token)
+    token_text = str(token)
+    if token_text.isdigit() or (token_text.startswith("-") and token_text[1:].isdigit()):
+        idx = int(token_text)
         if 0 <= idx < len(ctx):
-            return dag.get_or_create(ctx[idx], ())
-        return dag.get_or_create(f"?db-{idx}", ())
+            return ctx[idx]
+        return dag.get_or_create(f"?db-{idx}", (), node_type="var")
 
     # Named constant
-    return dag.get_or_create(token, ())
+    return dag.get_or_create(token_text, (), node_type="sconst")
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +469,9 @@ def proof_state_to_dag(
     if goal_sexp is not None and hyp_sexps is not None:
         # Best path: S-expressions for both goal and hypothesis types
         dag = sexp_to_dag(goal_sexp)
-        goal_expr_id = dag.num_nodes - 1
+        if dag.expression_root_id is None:
+            raise ValueError("Goal S-expression did not produce an expression root.")
+        goal_expr_id = dag.expression_root_id
 
         root_ids: list[int] = []
         for hyp, (hyp_name, hyp_sexp) in zip(parsed.hypotheses, hyp_sexps):
@@ -368,7 +495,9 @@ def proof_state_to_dag(
     if sexp is not None:
         # Goal has S-expression, hypothesis types use text parser
         dag = sexp_to_dag(sexp)
-        goal_expr_id = dag.num_nodes - 1
+        if dag.expression_root_id is None:
+            raise ValueError("Goal S-expression did not produce an expression root.")
+        goal_expr_id = dag.expression_root_id
 
         from .parser import ExprParser
         _hyp_parser = ExprParser(dag)
@@ -414,7 +543,9 @@ def lemma_statement_to_dag(statement: str, *, sexp: str | None = None) -> DAGBui
     """
     if sexp is not None:
         dag = sexp_to_dag(sexp)
-        goal_node = dag.get_or_create("Goal", (dag.num_nodes - 1,))
+        if dag.expression_root_id is None:
+            raise ValueError("Lemma S-expression did not produce an expression root.")
+        goal_node = dag.get_or_create("Goal", (dag.expression_root_id,))
         dag.get_or_create("State", (goal_node,))
         return dag
 
@@ -437,6 +568,7 @@ def dag_to_dict(dag: DAGBuilder, metadata: dict[str, object] | None = None) -> d
     return {
         "metadata": metadata or {},
         "stats": dag.stats().as_dict(),
+        "expression_root_id": dag.expression_root_id,
         "nodes": [
             {
                 **node.as_dict(),

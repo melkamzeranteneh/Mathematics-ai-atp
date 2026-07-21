@@ -176,7 +176,7 @@ def scan_train_split(
     for row in rows:
         try:
             sd = sexpr_map.get(row.row_index)
-            dag, tactic_name = prepare_example(
+            example = prepare_example(
                 row,
                 sexpr_cache=sexpr_cache,
                 sexpr_data=sd,
@@ -190,9 +190,9 @@ def scan_train_split(
             )
             continue
 
-        report.record_success(dag=dag, tactic_name=tactic_name)
-        node_labels.update(node.label for node in dag.nodes)
-        tactic_names.append(tactic_name)
+        report.record_success(dag=example.dag, tactic_name=example.tactic_name)
+        node_labels.update(node.label for node in example.dag.nodes)
+        tactic_names.append(example.tactic_name)
 
     if report.success_count == 0:
         raise RuntimeError("The train split produced zero successful examples while building vocabularies.")
@@ -245,7 +245,6 @@ def process_split(
 
     from .labels import parse_tactic_arguments
     from .pyg import build_premise_mask
-    from .state import parse_state
 
     report = SplitReport(split=split)
 
@@ -255,7 +254,7 @@ def process_split(
     for row in rows:
         try:
             sd = sexpr_map.get(row.row_index)
-            dag, tactic_name = prepare_example(
+            example = prepare_example(
                 row,
                 sexpr_cache=sexpr_cache,
                 sexpr_data=sd,
@@ -270,12 +269,11 @@ def process_split(
             )
             continue
 
-        parsed_state = parse_state(row.state)
         json_payload = build_json_payload(
             row,
-            parsed_state=parsed_state,
-            dag=dag,
-            tactic_name=tactic_name,
+            parsed_state=example.parsed_state,
+            dag=example.dag,
+            tactic_name=example.tactic_name,
         )
         write_json_artifact(
             output_root,
@@ -284,6 +282,8 @@ def process_split(
             payload=json_payload,
         )
 
+        dag = example.dag
+        tactic_name = example.tactic_name
         data = dag_to_pyg(dag, node_vocab)
         data.y = torch.tensor(
             [encode_tactic_name(tactic_name, tactic_vocab)],
