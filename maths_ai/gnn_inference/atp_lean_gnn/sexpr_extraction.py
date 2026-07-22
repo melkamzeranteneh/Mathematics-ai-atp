@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import subprocess
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -140,7 +142,8 @@ class PantographInvocationClient:
         if not isinstance(result, dict):
             raise RuntimeError(f"Pantograph returned a non-object for '{command}'.")
         if "error" in result:
-            raise RuntimeError(f"Pantograph '{command}' failed: {result['error']}")
+            detail = json.dumps(result, ensure_ascii=False, sort_keys=True)
+            raise RuntimeError(f"Pantograph '{command}' failed: {detail}")
         return result
 
     async def process_file(self, file_path: str) -> list[dict[str, object]]:
@@ -151,15 +154,37 @@ class PantographInvocationClient:
             absolute.relative_to(self.source_root)
         except ValueError as exc:
             raise RuntimeError(f"Dataset file escapes the source checkout: {file_path}") from exc
-        result = await self.call(
-            "frontend.process",
-            {"fileName": str(absolute), "invocations": True, "sorrys": False},
-            timeout=self.file_timeout,
+        descriptor, output_name = tempfile.mkstemp(
+            prefix="maths_ai_invocations_", suffix=".json"
         )
-        units = result.get("units")
-        if not isinstance(units, list):
-            raise RuntimeError("Pantograph frontend response has no compilation units.")
-        return units
+        os.close(descriptor)
+        output_path = Path(output_name)
+        try:
+            await self.call(
+                "frontend.process",
+                {
+                    "fileName": str(absolute),
+                    "invocations": True,
+                    "sorrys": False,
+                    "outputFile": str(output_path),
+                },
+                timeout=self.file_timeout,
+            )
+            try:
+                with output_path.open(encoding="utf-8") as handle:
+                    result = json.load(handle)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "Pantograph did not write a valid frontend trace."
+                ) from exc
+            if not isinstance(result, dict):
+                raise RuntimeError("Pantograph frontend trace is not an object.")
+            units = result.get("units")
+            if not isinstance(units, list):
+                raise RuntimeError("Pantograph frontend trace has no compilation units.")
+            return units
+        finally:
+            output_path.unlink(missing_ok=True)
 
     async def close(self) -> None:
         proc, self.proc = self.proc, None
@@ -192,10 +217,25 @@ class PantographInvocationClient:
 
 
 def _normalized_text(text: str) -> str:
-    return "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").strip().splitlines())
+    normalized = "\n".join(
+        line.rstrip()
+        for line in text.replace("\r\n", "\n").strip().splitlines()
+    )
+    if normalized.lower() in {"no goals", "no goals to be solved"}:
+        return ""
+    return normalized
 
 
 def _normalized_tactic(text: str) -> str:
+    # LeanDojo adds HTML-like links around referenced declarations, and the
+    # link text may be fully qualified even when Lean's tactic pretty-printer
+    # chooses the short name. These decorations are not part of Lean syntax.
+    text = re.sub(r"</?a(?:\s[^>]*)?>", "", text)
+    text = re.sub(
+        r"(?<![\w'])(?:[\w'][\w'!?]*\.)+([\w'][\w'!?]*)",
+        r"\1",
+        text,
+    )
     return " ".join(text.split())
 
 
@@ -338,6 +378,14 @@ def _align_rows(
 def _make_record(row: DatasetRow, candidate: dict[str, object]) -> dict[str, object]:
     invocation = candidate["invocation"]
     assert isinstance(invocation, dict)
+    capture_error = invocation.get("captureError")
+    if capture_error:
+        raise SourceExtractionError(
+            f"Pantograph could not serialize this tactic's proof state: {capture_error}",
+            phase="sexpr_capture",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        )
     goals = invocation.get("goalsBefore")
     if not isinstance(goals, list) or len(goals) != 1:
         raise SourceExtractionError(

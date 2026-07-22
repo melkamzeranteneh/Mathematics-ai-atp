@@ -105,14 +105,19 @@ def main(argv: list[str] | None = None) -> int:
     output_root = args.output_root.resolve()
     mathlib = output_root / "mathlib4"
     pantograph = output_root / "Pantograph"
-    patch = repo_root / "maths_ai" / "gnn_inference" / "lean_extractor" / "pantograph_v410_invocation_sexprs.patch"
+    patch_root = repo_root / "maths_ai" / "gnn_inference" / "lean_extractor"
+    patches = (
+        patch_root / "pantograph_v410_invocation_sexprs.patch",
+        patch_root / "pantograph_v410_source_trace_v2.patch",
+    )
 
     _ensure_toolchain(LEAN_TOOLCHAIN)
     _checkout(MATHLIB_URL, MATHLIB_COMMIT, mathlib)
     if not args.skip_mathlib_cache:
         _run("lake", "exe", "cache", "get", cwd=mathlib)
     _checkout(PANTOGRAPH_URL, PANTOGRAPH_COMMIT, pantograph, allow_existing_patch=True)
-    _apply_patch(pantograph, patch)
+    for patch in patches:
+        _apply_patch(pantograph, patch)
     _run("lake", "build", cwd=pantograph)
 
     repl = pantograph / ".lake" / "build" / "bin" / "repl"

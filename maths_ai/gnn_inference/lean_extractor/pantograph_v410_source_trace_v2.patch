@@ -1,0 +1,93 @@
+diff --git a/Pantograph/Frontend/Basic.lean b/Pantograph/Frontend/Basic.lean
+index 2bd4d7f..b82658d 100644
+--- a/Pantograph/Frontend/Basic.lean
++++ b/Pantograph/Frontend/Basic.lean
+@@ -107,7 +107,7 @@ def createContextStateFromFile
+     | .some env => pure (env, {}, .empty)
+     | .none =>
+       let (header, parserState, messages) ← Parser.parseHeader inputCtx
+-      let (env, messages) ← Elab.processHeader header opts messages inputCtx
++      let (env, messages) ← Elab.processHeader header opts messages inputCtx (leakEnv := true)
+       pure (env, parserState, messages)
+   let env ← if fileName == "<anonymous>" then
+       pure env
+diff --git a/Pantograph/Frontend/Elab.lean b/Pantograph/Frontend/Elab.lean
+index bad4a8e..c15e20b 100644
+--- a/Pantograph/Frontend/Elab.lean
++++ b/Pantograph/Frontend/Elab.lean
+@@ -157,18 +157,27 @@ def collectTacticsFromCompilationStep (step : CompilationStep)
+   tactics.mapM λ invocation => do
+     let goalBefore := (Format.joinSep (← invocation.goalState) "\n").pretty
+     let goalAfter := (Format.joinSep (← invocation.goalStateAfter) "\n").pretty
+-    let goalsBefore ← invocation.runMetaMGoalsBefore fun goals =>
+-      goals.toArray.mapM fun goal => do
+-        let decl ← goal.getDecl
+-        Pantograph.serializeGoal options goal decl
+-    let goalsAfter ← invocation.runMetaMGoalsAfter fun goals =>
+-      goals.toArray.mapM fun goal => do
+-        let decl ← goal.getDecl
+-        Pantograph.serializeGoal options goal decl
+-    let tactic ← invocation.ctx.runMetaM {} do
+-      let t ← PrettyPrinter.ppTactic ⟨invocation.info.stx⟩
+-      return t.pretty
+-    return { goalBefore, goalAfter, goalsBefore, goalsAfter, tactic }
++    let tactic := invocation.info.stx.reprint.getD (toString invocation.info.stx)
++    try
++      let goalsBefore ← invocation.runMetaMGoalsBefore fun goals =>
++        goals.toArray.mapM fun goal => do
++          let decl ← goal.getDecl
++          Pantograph.serializeGoal options goal decl
++      let goalsAfter ← invocation.runMetaMGoalsAfter fun goals =>
++        goals.toArray.mapM fun goal => do
++          let decl ← goal.getDecl
++          Pantograph.serializeGoal options goal decl
++      return { goalBefore, goalAfter, goalsBefore, goalsAfter, tactic }
++    catch e =>
++      let captureError := toString e
++      return {
++        goalBefore,
++        goalAfter,
++        goalsBefore := #[],
++        goalsAfter := #[],
++        captureError? := some captureError,
++        tactic,
++      }
+ 
+ structure InfoWithContext where
+   info: Elab.Info
+diff --git a/Pantograph/Protocol.lean b/Pantograph/Protocol.lean
+index 9e1cb3f..ec55d14 100644
+--- a/Pantograph/Protocol.lean
++++ b/Pantograph/Protocol.lean
+@@ -292,12 +292,14 @@ structure FrontendProcess where
+   invocations: Bool := false
+   -- If set to true, collect `sorry`s
+   sorrys: Bool := false
++  outputFile?: Option String := .none
+   deriving Lean.FromJson
+ structure InvokedTactic where
+   goalBefore: String
+   goalAfter: String
+   goalsBefore: Array Goal
+   goalsAfter: Array Goal
++  captureError?: Option String := .none
+   tactic: String
+   deriving Lean.ToJson
+ 
+diff --git a/Repl.lean b/Repl.lean
+index 5b922cb..3008c66 100644
+--- a/Repl.lean
++++ b/Repl.lean
+@@ -245,6 +245,11 @@ def execute (command: Protocol.Command): MainM Lean.Json := do
+           goals,
+           messages,
+         }
+-      return .ok { units }
++      let result : Protocol.FrontendProcessResult := { units }
++      if let some outputFile := args.outputFile? then
++        IO.FS.writeFile outputFile (Lean.Json.compress (Lean.toJson result))
++        return .ok { units := [] }
++      else
++        return .ok result
+     catch e =>
+       return .error $ errorI "frontend" (← e.toMessageData.toString)

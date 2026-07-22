@@ -113,7 +113,7 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
                 "messages": [],
                 "invocations": [
                     _invocation(self.rows[0].state, "advance", self.rows[0].target_state, "First"),
-                    _invocation(self.rows[1].state, "finish", self.rows[1].target_state, "Second"),
+                    _invocation(self.rows[1].state, "finish", "", "Second"),
                 ],
             }
         ]
@@ -139,7 +139,7 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.files, [self.file_path])
         first = self.cache.load("train", 10)
         self.assertEqual(first["schema_version"], SExprCache.SCHEMA_VERSION)
-        self.assertEqual(first["extractor_version"], "source-invocation-v3")
+        self.assertEqual(first["extractor_version"], "source-invocation-v4")
         self.assertEqual(first["repo_commit"], DATASET_MATHLIB_COMMIT)
         self.assertEqual(first["file_path"], self.file_path)
         self.assertEqual(first["goal_sexp"], "((:c First) 0)")
@@ -166,6 +166,23 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manifest["failed_rows"], 1)
         self.assertEqual(manifest["failure_phases"], {"invocation_alignment": 1})
 
+    async def test_dataset_links_and_qualified_names_match_lean_tactics(self):
+        linked = DatasetRow(
+            **{
+                **self.rows[0].__dict__,
+                "tactic": (
+                    "apply <a>Namespace.Theorem</a> "
+                    "(<a>Algebra.helper</a> p)"
+                ),
+            }
+        )
+        units = self._units()
+        units[0]["invocations"][0]["tactic"] = "apply Theorem (helper p)"
+
+        manifest = await self._extract(_FakeClient(units), [linked])
+
+        self.assertEqual(manifest["coverage"], 1.0)
+
     async def test_ambiguous_source_match_is_rejected_instead_of_guessed(self):
         units = self._units()
         units[0]["invocations"].insert(1, units[0]["invocations"][0].copy())
@@ -178,6 +195,16 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
     async def test_capture_failure_commits_no_partial_theorem(self):
         units = self._units()
         units[0]["invocations"][1]["goalsBefore"][0]["target"].pop("sexp")
+        manifest = await self._extract(_FakeClient(units))
+
+        self.assertEqual(manifest["failed_rows"], 2)
+        self.assertEqual(manifest["failure_phases"], {"sexpr_capture": 2})
+        self.assertIsNone(self.cache.load("train", 10))
+        self.assertIsNone(self.cache.load("train", 11))
+
+    async def test_reported_pantograph_capture_error_commits_no_partial_theorem(self):
+        units = self._units()
+        units[0]["invocations"][1]["captureError"] = "synthetic serializer failure"
         manifest = await self._extract(_FakeClient(units))
 
         self.assertEqual(manifest["failed_rows"], 2)

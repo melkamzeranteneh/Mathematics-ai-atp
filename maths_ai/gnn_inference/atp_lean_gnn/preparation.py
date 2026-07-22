@@ -35,8 +35,8 @@ class PreparationPhaseError(Exception):
 class SExprCache:
     """Disk cache for validated source-invocation S-expression records."""
 
-    SCHEMA_VERSION = 3
-    EXTRACTOR_VERSION = "source-invocation-v3"
+    SCHEMA_VERSION = 4
+    EXTRACTOR_VERSION = "source-invocation-v4"
 
     @staticmethod
     def row_state_sha256(row: DatasetRow) -> str:
