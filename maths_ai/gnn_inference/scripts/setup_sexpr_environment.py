@@ -13,6 +13,12 @@ MATHLIB_COMMIT = "29dcec074de168ac2bf835a77ef68bbe069194c5"
 PANTOGRAPH_URL = "https://github.com/leanprover/Pantograph.git"
 PANTOGRAPH_COMMIT = "22ddfaaf2124d323dec59220f567273f01623458"
 LEAN_TOOLCHAIN = "leanprover/lean4:v4.10.0-rc1"
+PANTOGRAPH_PATCHED_FILES = {
+    "Pantograph/Frontend/Basic.lean",
+    "Pantograph/Frontend/Elab.lean",
+    "Pantograph/Protocol.lean",
+    "Repl.lean",
+}
 
 
 def _run(*command: str, cwd: Path | None = None) -> None:
@@ -35,12 +41,20 @@ def _checkout(
     if not (destination / ".git").exists():
         raise RuntimeError(f"Refusing to reuse non-git directory: {destination}")
     dirty = _output("git", "status", "--porcelain", cwd=destination)
-    if dirty and not (
-        allow_existing_patch
-        and _output("git", "rev-parse", "HEAD", cwd=destination) == commit
-    ):
-        raise RuntimeError(f"Checkout has local modifications; refusing to overwrite: {destination}")
-    if dirty:
+    worktree_is_empty = not any(
+        path.name != ".git" for path in destination.iterdir()
+    )
+    if dirty and not worktree_is_empty:
+        changed_paths = {line[3:] for line in dirty.splitlines() if len(line) > 3}
+        is_expected_patch = (
+            allow_existing_patch
+            and _output("git", "rev-parse", "HEAD", cwd=destination) == commit
+            and changed_paths == PANTOGRAPH_PATCHED_FILES
+        )
+        if not is_expected_patch:
+            raise RuntimeError(
+                f"Checkout has local modifications; refusing to overwrite: {destination}"
+            )
         return
     _run("git", "fetch", "--depth=1", "origin", commit, cwd=destination)
     _run("git", "checkout", "--detach", commit, cwd=destination)
