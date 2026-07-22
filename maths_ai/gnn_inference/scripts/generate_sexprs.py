@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract validated Lean S-expressions by replaying complete theorems."""
+"""Extract S-expressions from original, dataset-version Mathlib sources."""
 
 from __future__ import annotations
 
@@ -25,8 +25,8 @@ from maths_ai.gnn_inference.atp_lean_gnn.sexpr_extraction import (
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Replay each LeanDojo theorem from its declaration and cache the "
-            "S-expression state immediately before every dataset tactic."
+            "Compile each original Mathlib file and cache the authentic "
+            "S-expression state recorded at every matched tactic invocation."
         )
     )
     parser.add_argument(
@@ -38,22 +38,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-name", default=DATASET_NAME)
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"])
     parser.add_argument("--max-items", type=int, default=None)
-    parser.add_argument("--project-path", default="maths_ai/lean_mathlib")
+    parser.add_argument(
+        "--source-root",
+        type=Path,
+        required=True,
+        help="Mathlib checkout at the exact commit stored in the dataset.",
+    )
+    parser.add_argument(
+        "--pantograph-repl",
+        type=Path,
+        required=True,
+        help="Patched Lean-4.10 Pantograph REPL built by setup_sexpr_environment.",
+    )
     parser.add_argument(
         "--server-timeout",
         type=int,
         default=600,
-        help="Seconds allowed for Pantograph to import Mathlib and become ready.",
+        help="Seconds allowed for Pantograph to become ready.",
+    )
+    parser.add_argument(
+        "--file-timeout",
+        type=int,
+        default=600,
+        help="Seconds allowed to compile one original Mathlib source file.",
     )
     parser.add_argument(
         "--no-resume",
         action="store_true",
-        help="Replay every theorem even when all of its versioned rows exist.",
-    )
-    parser.add_argument(
-        "--allow-incomplete-theorems",
-        action="store_true",
-        help="Do not require the final replayed tactic to close every goal.",
+        help="Re-extract rows even when their validated versioned cache exists.",
     )
     return parser
 
@@ -62,18 +74,19 @@ def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     config = SExprExtractionConfig(
         prepared_root=args.prepared_root,
+        source_root=args.source_root,
+        pantograph_repl=args.pantograph_repl,
         dataset_name=args.dataset_name,
         splits=tuple(args.splits),
-        project_path=args.project_path,
         sample_per_split=args.max_items,
         resume=not args.no_resume,
-        require_solved_theorem=not args.allow_incomplete_theorems,
         server_startup_timeout=args.server_timeout,
+        file_timeout=args.file_timeout,
     )
     try:
         summary = asyncio.run(extract_sexpressions(config))
     except KeyboardInterrupt:
-        print("Interrupted; completed theorem caches remain valid and resumable.")
+        print("Interrupted; completed row caches remain valid and resumable.")
         return 130
     except Exception as exc:
         print(f"S-expression extraction failed: {exc}")

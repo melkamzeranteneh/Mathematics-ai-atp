@@ -1,155 +1,374 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import re
+import subprocess
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 from .dataset import DATASET_NAME, DatasetRow, canonicalize_split_name, iter_dataset_rows
-from .graph import goal_state_to_proof_state, patch_pantograph_for_sexp
-from .preparation import SExprCache, _fix_pp_for_goal_start
+from .preparation import SExprCache
 from .reporting import console_print
 from .state import parse_state
 
 
 EXTRACTION_VERSION = SExprCache.EXTRACTOR_VERSION
+DATASET_MATHLIB_COMMIT = "29dcec074de168ac2bf835a77ef68bbe069194c5"
+PANTOGRAPH_COMMIT = "22ddfaaf2124d323dec59220f567273f01623458"
 
 
 @dataclass(frozen=True)
 class SExprExtractionConfig:
     prepared_root: Path
+    source_root: Path
+    pantograph_repl: Path
     dataset_name: str = DATASET_NAME
     splits: tuple[str, ...] = ("train", "val", "test")
-    project_path: str = "maths_ai/lean_mathlib"
-    imports: tuple[str, ...] = ("Init", "Mathlib")
     sample_per_split: int | None = None
     resume: bool = True
-    require_solved_theorem: bool = True
-    server_startup_timeout: int = 600
+    expected_commit: str = DATASET_MATHLIB_COMMIT
+    expected_pantograph_commit: str = PANTOGRAPH_COMMIT
+    server_startup_timeout: int = 120
+    file_timeout: int = 600
+    buffer_limit: int = 256 * 1024 * 1024
+    verify_source_commit: bool = True
 
 
-class TheoremReplayError(RuntimeError):
+class SourceExtractionError(RuntimeError):
     def __init__(
         self,
         message: str,
         *,
         phase: str,
-        theorem: str,
-        step_index: int | None = None,
+        theorem: str = "",
         row_index: int | None = None,
     ) -> None:
         self.phase = phase
         self.theorem = theorem
-        self.step_index = step_index
         self.row_index = row_index
         super().__init__(message)
 
 
+class PantographInvocationClient:
+    """Small client for the Lean-4.10-compatible Pantograph JSON REPL.
+
+    We intentionally do not import the Python Pantograph package: the project's
+    regular environment may use another Lean/Pantograph version.  ``lake env``
+    selects the exact toolchain recorded by the dataset checkout.
+    """
+
+    def __init__(
+        self,
+        *,
+        source_root: Path,
+        pantograph_repl: Path,
+        startup_timeout: int = 120,
+        file_timeout: int = 600,
+        buffer_limit: int = 256 * 1024 * 1024,
+    ) -> None:
+        self.source_root = Path(source_root).resolve()
+        self.pantograph_repl = Path(pantograph_repl).resolve()
+        self.startup_timeout = startup_timeout
+        self.file_timeout = file_timeout
+        self.buffer_limit = buffer_limit
+        self.proc: asyncio.subprocess.Process | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
+        self.stderr_tail: list[str] = []
+
+    async def start(self) -> "PantographInvocationClient":
+        if self.proc is not None:
+            return self
+        self.proc = await asyncio.create_subprocess_exec(
+            "lake",
+            "env",
+            "stdbuf",
+            "-oL",
+            str(self.pantograph_repl),
+            "Init",
+            cwd=self.source_root,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=self.buffer_limit,
+        )
+        assert self.proc.stdout is not None
+        try:
+            ready = await asyncio.wait_for(
+                self.proc.stdout.readline(), timeout=self.startup_timeout
+            )
+        except asyncio.TimeoutError as exc:
+            await self.close()
+            raise RuntimeError("Pantograph did not become ready in time.") from exc
+        if ready.decode("utf-8", errors="replace").strip() != "ready.":
+            await self.close()
+            raise RuntimeError(f"Pantograph emitted an invalid ready signal: {ready!r}")
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+        await self.call("options.set", {"printExprAST": True}, timeout=self.startup_timeout)
+        return self
+
+    async def _drain_stderr(self) -> None:
+        assert self.proc is not None and self.proc.stderr is not None
+        while line := await self.proc.stderr.readline():
+            self.stderr_tail.append(line.decode("utf-8", errors="replace").rstrip())
+            del self.stderr_tail[:-30]
+
+    async def call(
+        self, command: str, payload: dict[str, object], *, timeout: int
+    ) -> dict[str, object]:
+        if self.proc is None or self.proc.stdin is None or self.proc.stdout is None:
+            raise RuntimeError("Pantograph client is not running.")
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        self.proc.stdin.write(f"{command} {encoded}\n".encode("utf-8"))
+        await self.proc.stdin.drain()
+        try:
+            raw = await asyncio.wait_for(self.proc.stdout.readline(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            await self.close()
+            raise RuntimeError(f"Pantograph command '{command}' timed out.") from exc
+        if not raw:
+            detail = "\n".join(self.stderr_tail[-10:])
+            await self.close()
+            raise RuntimeError(f"Pantograph exited during '{command}'. {detail}")
+        try:
+            result = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            await self.close()
+            raise RuntimeError(f"Pantograph returned invalid JSON for '{command}'.") from exc
+        if not isinstance(result, dict):
+            raise RuntimeError(f"Pantograph returned a non-object for '{command}'.")
+        if "error" in result:
+            raise RuntimeError(f"Pantograph '{command}' failed: {result['error']}")
+        return result
+
+    async def process_file(self, file_path: str) -> list[dict[str, object]]:
+        if self.proc is None:
+            await self.start()
+        absolute = (self.source_root / file_path).resolve()
+        try:
+            absolute.relative_to(self.source_root)
+        except ValueError as exc:
+            raise RuntimeError(f"Dataset file escapes the source checkout: {file_path}") from exc
+        result = await self.call(
+            "frontend.process",
+            {"fileName": str(absolute), "invocations": True, "sorrys": False},
+            timeout=self.file_timeout,
+        )
+        units = result.get("units")
+        if not isinstance(units, list):
+            raise RuntimeError("Pantograph frontend response has no compilation units.")
+        return units
+
+    async def close(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is not None and proc.stdin is not None:
+            proc.stdin.close()
+            try:
+                await proc.stdin.wait_closed()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        if proc is not None and proc.returncode is None:
+            try:
+                await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=2)
+            except asyncio.TimeoutError:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=5)
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            await asyncio.gather(self._stderr_task, return_exceptions=True)
+            self._stderr_task = None
+
+
+def _normalized_text(text: str) -> str:
+    return "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").strip().splitlines())
+
+
+def _normalized_tactic(text: str) -> str:
+    return " ".join(text.split())
+
+
 def _expanded_hypothesis_names(state: str) -> list[str]:
-    """Return local names, expanding Lean's grouped ``a b : T`` display."""
-    parsed = parse_state(state)
     names: list[str] = []
-    for hypothesis in parsed.hypotheses:
-        grouped = hypothesis.name.split()
-        names.extend(grouped or [hypothesis.name])
+    for hypothesis in parse_state(state).hypotheses:
+        names.extend(hypothesis.name.split() or [hypothesis.name])
     return names
 
 
-def _group_rows(rows: Iterable[DatasetRow]) -> dict[str, list[DatasetRow]]:
-    grouped: dict[str, list[DatasetRow]] = defaultdict(list)
+def _group_rows_by_file(rows: Iterable[DatasetRow]) -> dict[str, dict[str, list[DatasetRow]]]:
+    grouped: dict[str, dict[str, list[DatasetRow]]] = defaultdict(lambda: defaultdict(list))
     for row in rows:
-        grouped[row.theorem.strip()].append(row)
-
-    result: dict[str, list[DatasetRow]] = {}
-    for theorem, theorem_rows in grouped.items():
-        ordered = sorted(theorem_rows, key=lambda row: row.row_index)
-        indices = [row.row_index for row in ordered]
-        if len(indices) != len(set(indices)):
-            raise ValueError(f"Theorem '{theorem}' contains duplicate dataset row indices.")
-        result[theorem] = ordered
-    return result
-
-
-def _theorem_is_cached(
-    cache: SExprCache,
-    rows: list[DatasetRow],
-) -> bool:
-    return all(
-        (
-            record := cache.load_for_row(
-                row,
-                step_index=step_index,
-                extractor_version=EXTRACTION_VERSION,
+        if not row.file_path:
+            raise SourceExtractionError(
+                "Dataset row has no file_path metadata.",
+                phase="source_metadata",
+                theorem=row.theorem,
+                row_index=row.row_index,
             )
-        )
-        is not None
-        and isinstance(record.get("goal_sexp"), str)
-        and isinstance(record.get("hyp_sexps"), list)
-        for step_index, row in enumerate(rows)
+        if not row.repo_commit:
+            raise SourceExtractionError(
+                "Dataset row has no commit metadata.",
+                phase="source_metadata",
+                theorem=row.theorem,
+                row_index=row.row_index,
+            )
+        grouped[row.file_path][row.theorem].append(row)
+    return {
+        file_path: {
+            theorem: sorted(theorem_rows, key=lambda item: item.row_index)
+            for theorem, theorem_rows in theorem_groups.items()
+        }
+        for file_path, theorem_groups in grouped.items()
+    }
+
+
+def _unit_source(source_bytes: bytes, unit: dict[str, object]) -> str:
+    boundary = unit.get("boundary")
+    if not isinstance(boundary, list) or len(boundary) != 2:
+        return ""
+    try:
+        return source_bytes[int(boundary[0]) : int(boundary[1])].decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return ""
+
+
+def _unit_declares_theorem(source: str, theorem: str) -> bool:
+    if not theorem:
+        return False
+    short_name = theorem.rsplit(".", 1)[-1].strip("«»")
+    declaration = re.compile(
+        rf"\b(?:theorem|lemma)\s+(?:[A-Za-z0-9_'.]+\.)?«?{re.escape(short_name)}»?(?=\s|[:(])"
     )
+    return declaration.search(source) is not None
 
 
-def _make_record(
-    *,
-    row: DatasetRow,
-    step_index: int,
-    goal_state,
-) -> dict[str, object]:
-    if not goal_state.goals:
-        raise TheoremReplayError(
-            "The replayed proof was solved before the dataset row was reached.",
-            phase="state_alignment",
+def _candidate_invocations(
+    *, source_bytes: bytes, units: list[dict[str, object]], theorem: str
+) -> list[dict[str, object]]:
+    candidates: list[dict[str, object]] = []
+    ordinal = 0
+    for unit_index, unit in enumerate(units):
+        source = _unit_source(source_bytes, unit)
+        invocations = unit.get("invocations") or []
+        if not isinstance(invocations, list):
+            continue
+        is_theorem_unit = _unit_declares_theorem(source, theorem)
+        for invocation_index, invocation in enumerate(invocations):
+            if is_theorem_unit and isinstance(invocation, dict):
+                candidates.append(
+                    {
+                        "ordinal": ordinal,
+                        "unit_index": unit_index,
+                        "invocation_index": invocation_index,
+                        "unit_boundary": unit.get("boundary"),
+                        "invocation": invocation,
+                    }
+                )
+            ordinal += 1
+    return candidates
+
+
+def _invocation_matches(row: DatasetRow, candidate: dict[str, object]) -> bool:
+    invocation = candidate["invocation"]
+    assert isinstance(invocation, dict)
+    if _normalized_text(str(invocation.get("goalBefore", ""))) != _normalized_text(row.state):
+        return False
+    if _normalized_tactic(str(invocation.get("tactic", ""))) != _normalized_tactic(row.tactic):
+        return False
+    if row.target_state and _normalized_text(str(invocation.get("goalAfter", ""))) != _normalized_text(row.target_state):
+        return False
+    return True
+
+
+def _align_rows(
+    rows: list[DatasetRow], candidates: list[dict[str, object]]
+) -> list[dict[str, object]]:
+    choices = [[item for item in candidates if _invocation_matches(row, item)] for row in rows]
+    for row, matches in zip(rows, choices):
+        if not matches:
+            raise SourceExtractionError(
+                "No original tactic invocation matches state + tactic + target_state.",
+                phase="invocation_alignment",
+                theorem=row.theorem,
+                row_index=row.row_index,
+            )
+
+    solutions: list[list[dict[str, object]]] = []
+
+    def search(index: int, previous: int, selected: list[dict[str, object]]) -> None:
+        if len(solutions) >= 2:
+            return
+        if index == len(rows):
+            solutions.append(selected.copy())
+            return
+        for candidate in choices[index]:
+            ordinal = int(candidate["ordinal"])
+            if ordinal > previous:
+                selected.append(candidate)
+                search(index + 1, ordinal, selected)
+                selected.pop()
+
+    search(0, -1, [])
+    if not solutions:
+        raise SourceExtractionError(
+            "Matching invocations exist but cannot be aligned in dataset order.",
+            phase="invocation_order",
+            theorem=rows[0].theorem,
+        )
+    if len(solutions) > 1:
+        raise SourceExtractionError(
+            "More than one source invocation sequence matches these rows; refusing a guessed cache.",
+            phase="ambiguous_invocation",
+            theorem=rows[0].theorem,
+        )
+    return solutions[0]
+
+
+def _make_record(row: DatasetRow, candidate: dict[str, object]) -> dict[str, object]:
+    invocation = candidate["invocation"]
+    assert isinstance(invocation, dict)
+    goals = invocation.get("goalsBefore")
+    if not isinstance(goals, list) or len(goals) != 1:
+        raise SourceExtractionError(
+            f"Invocation has {len(goals) if isinstance(goals, list) else 'invalid'} active goals; expected one.",
+            phase="goal_cardinality",
             theorem=row.theorem,
-            step_index=step_index,
             row_index=row.row_index,
         )
+    goal = goals[0]
+    if not isinstance(goal, dict):
+        raise SourceExtractionError("Serialized goal is invalid.", phase="sexpr_capture", theorem=row.theorem)
+    target = goal.get("target")
+    variables = goal.get("vars")
+    if not isinstance(target, dict) or not isinstance(target.get("sexp"), str):
+        raise SourceExtractionError("Goal S-expression is missing.", phase="sexpr_capture", theorem=row.theorem)
+    if not isinstance(variables, list):
+        raise SourceExtractionError("Goal variables are missing.", phase="sexpr_capture", theorem=row.theorem)
 
-    expected_goal_count = sum(
-        1
-        for line in row.state.splitlines()
-        if line.lstrip().startswith(("⊢", "|-"))
-    )
-    if expected_goal_count != 1:
-        raise TheoremReplayError(
-            f"Dataset row has {expected_goal_count} textual goals; exactly one is required.",
-            phase="state_alignment",
-            theorem=row.theorem,
-            step_index=step_index,
-            row_index=row.row_index,
-        )
+    hyp_sexps: list[dict[str, str]] = []
+    actual_names: list[str] = []
+    for variable in variables:
+        if not isinstance(variable, dict) or not isinstance(variable.get("type"), dict):
+            raise SourceExtractionError("Variable serialization is invalid.", phase="sexpr_capture", theorem=row.theorem)
+        sexp = variable["type"].get("sexp")
+        if not isinstance(sexp, str):
+            raise SourceExtractionError("Variable type S-expression is missing.", phase="sexpr_capture", theorem=row.theorem)
+        name = str(variable.get("userName", "_"))
+        actual_names.append(name)
+        hyp_sexps.append({"name": name, "sexp": sexp})
 
     expected_names = _expanded_hypothesis_names(row.state)
-    active_goal = goal_state.goals[0]
-    actual_names = [variable.name or "_" for variable in active_goal.variables]
-    if len(actual_names) != len(expected_names):
-        raise TheoremReplayError(
-            "Hypothesis-count mismatch at replay step "
-            f"{step_index}: dataset={len(expected_names)}, pantograph={len(actual_names)}.",
-            phase="state_alignment",
-            theorem=row.theorem,
-            step_index=step_index,
-            row_index=row.row_index,
-        )
-
-    text_state, hyp_sexps, goal_sexp = goal_state_to_proof_state(goal_state)
-    if not isinstance(goal_sexp, str) or not goal_sexp:
-        raise TheoremReplayError(
-            "Pantograph returned no S-expression for the active goal.",
-            phase="sexpr_capture",
-            theorem=row.theorem,
-            step_index=step_index,
-            row_index=row.row_index,
-        )
-    if len(hyp_sexps) != len(expected_names):
-        raise TheoremReplayError(
-            "Captured hypothesis S-expression count does not match the dataset state.",
-            phase="sexpr_capture",
-            theorem=row.theorem,
-            step_index=step_index,
-            row_index=row.row_index,
-        )
-
     return {
         "schema_version": SExprCache.SCHEMA_VERSION,
         "extractor_version": EXTRACTION_VERSION,
@@ -157,133 +376,44 @@ def _make_record(
         "split": row.split,
         "row_index": row.row_index,
         "theorem": row.theorem,
-        "step_index": step_index,
+        "repo_url": row.repo_url,
+        "repo_commit": row.repo_commit,
+        "pantograph_commit": PANTOGRAPH_COMMIT,
+        "file_path": row.file_path,
+        "unit_index": candidate["unit_index"],
+        "unit_boundary": candidate["unit_boundary"],
+        "invocation_index": candidate["invocation_index"],
         "state_sha256": SExprCache.row_state_sha256(row),
         "tactic_sha256": SExprCache.row_tactic_sha256(row),
+        "target_state_sha256": SExprCache.row_target_state_sha256(row),
         "tactic": row.tactic,
-        "pending_goal_count": len(goal_state.goals),
+        "pending_goal_count": len(goals),
         "hypothesis_count": len(hyp_sexps),
         "hypothesis_names_match": actual_names == expected_names,
-        "goal_sexp": goal_sexp,
-        "hyp_sexps": [
-            {"name": name, "sexp": sexp} for name, sexp in hyp_sexps
-        ],
-        "text_state": text_state,
+        "goal_sexp": target["sexp"],
+        "hyp_sexps": hyp_sexps,
+        "text_state": str(invocation.get("goalBefore", "")),
+        "text_target_state": str(invocation.get("goalAfter", "")),
     }
 
 
-async def replay_theorem_rows(
-    server,
-    theorem: str,
-    rows: list[DatasetRow],
-    *,
-    require_solved: bool = True,
-) -> list[dict[str, object]]:
-    """Replay one theorem once and capture the state immediately before each tactic."""
-    if not theorem:
-        raise TheoremReplayError(
-            "Dataset theorem name is empty.",
-            phase="theorem_identity",
-            theorem=theorem,
-        )
-    if not rows:
-        return []
-    if any(row.theorem.strip() != theorem for row in rows):
-        raise TheoremReplayError(
-            "Rows from different theorems were passed to one replay.",
-            phase="theorem_identity",
-            theorem=theorem,
-        )
-
-    try:
-        inspection = await server.env_inspect_async(theorem)
-        theorem_type = inspection["type"]["pp"]
-    except Exception as exc:
-        raise TheoremReplayError(
-            f"Could not inspect theorem '{theorem}': {exc}",
-            phase="theorem_inspect",
-            theorem=theorem,
-        ) from exc
-
-    try:
-        goal_state = await server.goal_start_async(_fix_pp_for_goal_start(theorem_type))
-    except Exception as exc:
-        raise TheoremReplayError(
-            f"Could not start theorem '{theorem}': {exc}",
-            phase="theorem_start",
-            theorem=theorem,
-        ) from exc
-
-    # A traced tactic state begins inside the theorem declaration, after its
-    # declaration binders have become local hypotheses. Recreate precisely the
-    # number and order shown in the first dataset state.
-    first_names = _expanded_hypothesis_names(rows[0].state)
-    while goal_state.goals and len(goal_state.goals[0].variables) < len(first_names):
-        previous_count = len(goal_state.goals[0].variables)
-        name = first_names[previous_count]
-        tactic = f"intro {name}" if name and not any(c.isspace() for c in name) else "intro"
-        try:
-            goal_state = await server.goal_tactic_async(goal_state, tactic)
-        except Exception as named_exc:
-            try:
-                goal_state = await server.goal_tactic_async(goal_state, "intro")
-            except Exception as exc:
-                raise TheoremReplayError(
-                    "Could not recreate the theorem's initial local context: "
-                    f"failed while introducing '{name}' "
-                    f"(named={named_exc}; unnamed={exc}).",
-                    phase="initial_context",
-                    theorem=theorem,
-                    step_index=0,
-                    row_index=rows[0].row_index,
-                ) from exc
-        if not goal_state.goals:
-            break
-        current_count = len(goal_state.goals[0].variables)
-        if current_count <= previous_count:
-            raise TheoremReplayError(
-                "Introducing the initial theorem context made no progress: "
-                f"still at {current_count}/{len(first_names)} hypotheses.",
-                phase="initial_context",
-                theorem=theorem,
-                step_index=0,
-                row_index=rows[0].row_index,
-            )
-
-    records: list[dict[str, object]] = []
-    for step_index, row in enumerate(rows):
-        records.append(
-            _make_record(row=row, step_index=step_index, goal_state=goal_state)
-        )
-        try:
-            goal_state = await server.goal_tactic_async(goal_state, row.tactic)
-        except Exception as exc:
-            raise TheoremReplayError(
-                f"Tactic replay failed at step {step_index}: {row.tactic!r}: {exc}",
-                phase="tactic_replay",
-                theorem=theorem,
-                step_index=step_index,
-                row_index=row.row_index,
-            ) from exc
-
-    if require_solved and not goal_state.is_solved:
-        raise TheoremReplayError(
-            f"Replay ended with {len(goal_state.goals)} unsolved goal(s).",
-            phase="incomplete_theorem",
-            theorem=theorem,
-            step_index=len(rows),
-        )
-    return records
+def _row_is_cached(cache: SExprCache, row: DatasetRow) -> bool:
+    record = cache.load_for_row(row, extractor_version=EXTRACTION_VERSION)
+    return (
+        record is not None
+        and isinstance(record.get("goal_sexp"), str)
+        and isinstance(record.get("hyp_sexps"), list)
+    )
 
 
-def _failure_record(exc: Exception, theorem: str, rows: list[DatasetRow]) -> dict[str, object]:
+def _failure_record(exc: Exception, file_path: str, theorem: str, rows: list[DatasetRow]) -> dict[str, object]:
     return {
+        "file_path": file_path,
         "theorem": theorem,
         "split": rows[0].split if rows else None,
         "row_indices": [row.row_index for row in rows],
         "failed_row_count": len(rows),
         "phase": getattr(exc, "phase", "unexpected_error"),
-        "step_index": getattr(exc, "step_index", None),
         "row_index": getattr(exc, "row_index", None),
         "error_type": type(exc).__name__,
         "error": str(exc),
@@ -293,10 +423,7 @@ def _failure_record(exc: Exception, theorem: str, rows: list[DatasetRow]) -> dic
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True),
-        encoding="utf-8",
-    )
+    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     temporary.replace(path)
 
 
@@ -306,99 +433,119 @@ def _write_summary_markdown(path: Path, summary: dict[str, object]) -> None:
         "",
         f"- extractor: `{summary['extractor_version']}`",
         f"- dataset: `{summary['dataset']}`",
+        f"- source commit: `{summary['source_commit']}`",
         f"- attempted rows: `{summary['attempted_rows']}`",
         f"- covered rows: `{summary['covered_rows']}`",
         f"- failed rows: `{summary['failed_rows']}`",
         f"- coverage: `{float(summary['coverage']):.4%}`",
         "",
-        "| Split | Theorems | Cached | Extracted | Failed | Rows | Covered | Coverage |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Split | Files | Theorems | Cached rows | Extracted rows | Failed rows | Coverage |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     manifests = summary["manifests"]
     for split in summary["splits"]:
         manifest = manifests[split]
         lines.append(
-            f"| {split} | {manifest['attempted_theorems']} | "
-            f"{manifest['cached_theorems']} | {manifest['extracted_theorems']} | "
-            f"{manifest['failed_theorems']} | {manifest['attempted_rows']} | "
-            f"{manifest['covered_rows']} | {float(manifest['coverage']):.4%} |"
+            f"| {split} | {manifest['attempted_files']} | {manifest['attempted_theorems']} | "
+            f"{manifest['cached_rows']} | {manifest['extracted_rows']} | "
+            f"{manifest['failed_rows']} | {float(manifest['coverage']):.4%} |"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-async def extract_split_with_server(
-    server,
+async def extract_split_with_client(
+    client,
     *,
     rows: list[DatasetRow],
     cache: SExprCache,
     prepared_root: Path,
+    source_root: Path,
     split: str,
+    expected_commit: str = DATASET_MATHLIB_COMMIT,
     resume: bool = True,
-    require_solved: bool = True,
 ) -> dict[str, object]:
-    theorem_groups = _group_rows(rows)
     report_root = Path(prepared_root) / "sexpr_extraction"
     failure_path = report_root / "failures" / f"{split}.jsonl"
     failure_path.parent.mkdir(parents=True, exist_ok=True)
     failure_path.write_text("", encoding="utf-8")
 
-    cached_theorems = 0
-    extracted_theorems = 0
-    failed_theorems = 0
-    cached_rows = 0
-    extracted_rows = 0
-    failed_rows = 0
-    failure_phases: Counter[str] = Counter()
+    try:
+        file_groups = _group_rows_by_file(rows)
+    except Exception as exc:
+        file_groups = {}
+        failure = _failure_record(exc, "", getattr(exc, "theorem", ""), rows)
+        failure_path.write_text(json.dumps(failure, ensure_ascii=False) + "\n", encoding="utf-8")
+        failure_phases = Counter({str(failure["phase"]): len(rows)})
+        cached_rows = extracted_rows = compiled_files = 0
+        failed_rows = len(rows)
+    else:
+        cached_rows = sum(1 for row in rows if resume and _row_is_cached(cache, row))
+        extracted_rows = failed_rows = compiled_files = 0
+        failure_phases: Counter[str] = Counter()
+        console_print(f"  [{split}] source extraction: {len(file_groups)} files, {len(rows)} rows")
 
-    console_print(
-        f"  [{split}] theorem replay: {len(theorem_groups)} theorems, {len(rows)} rows"
-    )
-    for theorem_index, (theorem, theorem_rows) in enumerate(theorem_groups.items(), 1):
-        if resume and _theorem_is_cached(cache, theorem_rows):
-            cached_theorems += 1
-            cached_rows += len(theorem_rows)
-            continue
-
-        try:
-            records = await replay_theorem_rows(
-                server,
-                theorem,
-                theorem_rows,
-                require_solved=require_solved,
-            )
-            if len(records) != len(theorem_rows):
-                raise TheoremReplayError(
-                    "Replay produced a different number of states than dataset rows.",
-                    phase="state_count",
-                    theorem=theorem,
+        for file_index, (file_path, theorem_groups) in enumerate(file_groups.items(), 1):
+            file_rows = [row for theorem_rows in theorem_groups.values() for row in theorem_rows]
+            uncached_file_rows = [row for row in file_rows if not (resume and _row_is_cached(cache, row))]
+            if not uncached_file_rows:
+                continue
+            bad_commits = sorted({row.repo_commit for row in file_rows if row.repo_commit != expected_commit})
+            if bad_commits:
+                exc = SourceExtractionError(
+                    f"Dataset row commit does not match extractor checkout: {bad_commits}",
+                    phase="commit_mismatch",
                 )
-            # Commit only after the entire theorem replay and all alignment
-            # checks have succeeded. A failed theorem never leaves a partial
-            # set of apparently valid cache records.
-            for row, record in zip(theorem_rows, records):
-                cache.save(row.split, row.row_index, record)
-            extracted_theorems += 1
-            extracted_rows += len(theorem_rows)
-        except Exception as exc:
-            failure = _failure_record(exc, theorem, theorem_rows)
-            with failure_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(failure, ensure_ascii=False, sort_keys=True))
-                handle.write("\n")
-            failed_theorems += 1
-            failed_rows += len(theorem_rows)
-            failure_phases[str(failure["phase"])] += 1
-            console_print(
-                f"  [{split}] replay failed for {theorem}: "
-                f"{failure['phase']}: {failure['error']}"
-            )
+                units = None
+            else:
+                try:
+                    units = await client.process_file(file_path)
+                    compiled_files += 1
+                    source_bytes = (Path(source_root) / file_path).read_bytes()
+                except Exception as caught:
+                    exc = SourceExtractionError(str(caught), phase="file_compile")
+                    units = None
 
-        if theorem_index == 1 or theorem_index % 100 == 0 or theorem_index == len(theorem_groups):
-            console_print(
-                f"  [{split}] {theorem_index}/{len(theorem_groups)} theorems | "
-                f"cached={cached_theorems} extracted={extracted_theorems} "
-                f"failed={failed_theorems}"
-            )
+            for theorem, theorem_rows in theorem_groups.items():
+                uncached_rows = [row for row in theorem_rows if not (resume and _row_is_cached(cache, row))]
+                if not uncached_rows:
+                    continue
+                try:
+                    if units is None:
+                        raise exc
+                    candidates = _candidate_invocations(
+                        source_bytes=source_bytes, units=units, theorem=theorem
+                    )
+                    if not candidates:
+                        raise SourceExtractionError(
+                            "Could not identify the theorem's compilation unit.",
+                            phase="theorem_identity",
+                            theorem=theorem,
+                        )
+                    aligned = _align_rows(theorem_rows, candidates)
+                    records = [
+                        _make_record(row, candidate)
+                        for row, candidate in zip(theorem_rows, aligned)
+                    ]
+                    # Validate every row in the theorem before committing any
+                    # of them, so a capture error cannot leave a partial group.
+                    for row, record in zip(theorem_rows, records):
+                        if row in uncached_rows:
+                            cache.save(row.split, row.row_index, record)
+                            extracted_rows += 1
+                except Exception as caught:
+                    failure = _failure_record(caught, file_path, theorem, uncached_rows)
+                    with failure_path.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(failure, ensure_ascii=False, sort_keys=True) + "\n")
+                    failed_rows += len(uncached_rows)
+                    failure_phases[str(failure["phase"])] += len(uncached_rows)
+                    console_print(f"  [{split}] failed {theorem}: {failure['phase']}: {failure['error']}")
+
+            if file_index == 1 or file_index % 25 == 0 or file_index == len(file_groups):
+                console_print(
+                    f"  [{split}] {file_index}/{len(file_groups)} files | cached={cached_rows} "
+                    f"extracted={extracted_rows} failed={failed_rows}"
+                )
 
     attempted_rows = len(rows)
     covered_rows = cached_rows + extracted_rows
@@ -406,11 +553,11 @@ async def extract_split_with_server(
         "schema_version": SExprCache.SCHEMA_VERSION,
         "extractor_version": EXTRACTION_VERSION,
         "dataset": rows[0].dataset_name if rows else None,
+        "source_commit": expected_commit,
         "split": split,
-        "attempted_theorems": len(theorem_groups),
-        "cached_theorems": cached_theorems,
-        "extracted_theorems": extracted_theorems,
-        "failed_theorems": failed_theorems,
+        "attempted_files": len(file_groups),
+        "compiled_files": compiled_files,
+        "attempted_theorems": sum(len(groups) for groups in file_groups.values()),
         "attempted_rows": attempted_rows,
         "cached_rows": cached_rows,
         "extracted_rows": extracted_rows,
@@ -424,26 +571,59 @@ async def extract_split_with_server(
     return manifest
 
 
-async def extract_sexpressions(
-    config: SExprExtractionConfig,
-    *,
-    server_factory=None,
-) -> dict[str, object]:
-    if server_factory is None:
-        patch_pantograph_for_sexp()
-        from pantograph.server import Server
-
-        factory = Server.create
-    else:
-        factory = server_factory
-    server = await factory(
-        project_path=config.project_path,
-        imports=list(config.imports),
-        options={"printExprAST": True},
-        timeout=config.server_startup_timeout,
+def _git_head(source_root: Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(source_root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    cache = SExprCache(config.prepared_root, config.project_path, enabled=True)
+    return result.stdout.strip()
+
+
+async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=None) -> dict[str, object]:
+    source_root = Path(config.source_root).resolve()
+    repl = Path(config.pantograph_repl).resolve()
+    if not source_root.is_dir():
+        raise RuntimeError(f"Mathlib source checkout does not exist: {source_root}")
+    if client_factory is None and not repl.is_file():
+        raise RuntimeError(f"Patched Pantograph REPL does not exist: {repl}")
+    if config.verify_source_commit:
+        actual_commit = _git_head(source_root)
+        if actual_commit != config.expected_commit:
+            raise RuntimeError(
+                f"Mathlib checkout is {actual_commit}, but dataset requires {config.expected_commit}."
+            )
+    if client_factory is None:
+        try:
+            pantograph_root = repl.parents[3]
+            actual_pantograph_commit = _git_head(pantograph_root)
+        except (IndexError, subprocess.CalledProcessError) as exc:
+            raise RuntimeError(
+                f"Could not identify the Pantograph checkout containing {repl}."
+            ) from exc
+        if actual_pantograph_commit != config.expected_pantograph_commit:
+            raise RuntimeError(
+                "Pantograph checkout is "
+                f"{actual_pantograph_commit}, but extraction requires "
+                f"{config.expected_pantograph_commit}."
+            )
+
+    if client_factory is None:
+        client = PantographInvocationClient(
+            source_root=source_root,
+            pantograph_repl=repl,
+            startup_timeout=config.server_startup_timeout,
+            file_timeout=config.file_timeout,
+            buffer_limit=config.buffer_limit,
+        )
+    else:
+        client = client_factory(config)
+        if asyncio.iscoroutine(client):
+            client = await client
+    cache = SExprCache(config.prepared_root, str(source_root), enabled=True)
     manifests: dict[str, dict[str, object]] = {}
+    started = False
     try:
         for raw_split in config.splits:
             split = canonicalize_split_name(raw_split)
@@ -454,22 +634,22 @@ async def extract_sexpressions(
                     sample_limit=config.sample_per_split,
                 )
             )
-            manifests[split] = await extract_split_with_server(
-                server,
+            if not started:
+                await client.start()
+                started = True
+            manifests[split] = await extract_split_with_client(
+                client,
                 rows=rows,
                 cache=cache,
                 prepared_root=config.prepared_root,
+                source_root=source_root,
                 split=split,
+                expected_commit=config.expected_commit,
                 resume=config.resume,
-                require_solved=config.require_solved_theorem,
             )
     finally:
-        try:
-            await server.shutdown_async()
-        except Exception:
-            close = getattr(server, "_close", None)
-            if close is not None:
-                close()
+        if started:
+            await client.close()
 
     attempted_rows = sum(int(item["attempted_rows"]) for item in manifests.values())
     covered_rows = sum(int(item["covered_rows"]) for item in manifests.values())
@@ -477,6 +657,10 @@ async def extract_sexpressions(
         "schema_version": SExprCache.SCHEMA_VERSION,
         "extractor_version": EXTRACTION_VERSION,
         "dataset": config.dataset_name,
+        "source_root": str(source_root),
+        "source_commit": config.expected_commit,
+        "pantograph_commit": config.expected_pantograph_commit,
+        "pantograph_repl": str(repl),
         "prepared_root": str(config.prepared_root),
         "splits": list(manifests),
         "manifests": manifests,

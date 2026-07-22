@@ -33,10 +33,10 @@ class PreparationPhaseError(Exception):
 
 
 class SExprCache:
-    """Disk cache for validated theorem-replay S-expression records."""
+    """Disk cache for validated source-invocation S-expression records."""
 
-    SCHEMA_VERSION = 2
-    EXTRACTOR_VERSION = "theorem-replay-v2"
+    SCHEMA_VERSION = 3
+    EXTRACTOR_VERSION = "source-invocation-v3"
 
     @staticmethod
     def row_state_sha256(row: DatasetRow) -> str:
@@ -45,6 +45,10 @@ class SExprCache:
     @staticmethod
     def row_tactic_sha256(row: DatasetRow) -> str:
         return hashlib.sha256(row.tactic.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def row_target_state_sha256(row: DatasetRow) -> str:
+        return hashlib.sha256(row.target_state.encode("utf-8")).hexdigest()
 
     def __init__(
         self,
@@ -100,6 +104,9 @@ class SExprCache:
             "theorem": row.theorem,
             "state_sha256": self.row_state_sha256(row),
             "tactic_sha256": self.row_tactic_sha256(row),
+            "target_state_sha256": self.row_target_state_sha256(row),
+            "repo_commit": row.repo_commit,
+            "file_path": row.file_path,
         }
         if any(payload.get(key) != value for key, value in expected.items()):
             return None
