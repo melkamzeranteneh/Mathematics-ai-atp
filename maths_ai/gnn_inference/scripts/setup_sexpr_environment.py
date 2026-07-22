@@ -32,6 +32,18 @@ def _output(*command: str, cwd: Path | None = None) -> str:
     ).stdout.strip()
 
 
+def _ensure_toolchain(toolchain: str) -> None:
+    installed = {
+        line.split()[0]
+        for line in _output("elan", "toolchain", "list").splitlines()
+        if line.split()
+    }
+    if toolchain in installed:
+        print(f"Lean toolchain is already installed: {toolchain}")
+        return
+    _run("elan", "toolchain", "install", toolchain)
+
+
 def _checkout(
     url: str, commit: str, destination: Path, *, allow_existing_patch: bool = False
 ) -> None:
@@ -95,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
     pantograph = output_root / "Pantograph"
     patch = repo_root / "maths_ai" / "gnn_inference" / "lean_extractor" / "pantograph_v410_invocation_sexprs.patch"
 
-    _run("elan", "toolchain", "install", LEAN_TOOLCHAIN)
+    _ensure_toolchain(LEAN_TOOLCHAIN)
     _checkout(MATHLIB_URL, MATHLIB_COMMIT, mathlib)
     if not args.skip_mathlib_cache:
         _run("lake", "exe", "cache", "get", cwd=mathlib)
