@@ -32,6 +32,17 @@ def _output(*command: str, cwd: Path | None = None) -> str:
     ).stdout.strip()
 
 
+def _status_porcelain(repository: Path) -> str:
+    """Return Git's fixed-column status without trimming its leading column."""
+    return subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
 def _ensure_toolchain(toolchain: str) -> None:
     installed = {
         line.split()[0]
@@ -52,7 +63,7 @@ def _checkout(
         _run("git", "clone", "--filter=blob:none", "--no-checkout", url, str(destination))
     if not (destination / ".git").exists():
         raise RuntimeError(f"Refusing to reuse non-git directory: {destination}")
-    dirty = _output("git", "status", "--porcelain", cwd=destination)
+    dirty = _status_porcelain(destination)
     worktree_is_empty = not any(
         path.name != ".git" for path in destination.iterdir()
     )
