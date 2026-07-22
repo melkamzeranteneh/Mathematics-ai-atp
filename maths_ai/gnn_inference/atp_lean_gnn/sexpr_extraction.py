@@ -218,22 +218,37 @@ async def replay_theorem_rows(
     # declaration binders have become local hypotheses. Recreate precisely the
     # number and order shown in the first dataset state.
     first_names = _expanded_hypothesis_names(rows[0].state)
-    for name in first_names:
+    while goal_state.goals and len(goal_state.goals[0].variables) < len(first_names):
+        previous_count = len(goal_state.goals[0].variables)
+        name = first_names[previous_count]
         tactic = f"intro {name}" if name and not any(c.isspace() for c in name) else "intro"
         try:
             goal_state = await server.goal_tactic_async(goal_state, tactic)
-        except Exception:
+        except Exception as named_exc:
             try:
                 goal_state = await server.goal_tactic_async(goal_state, "intro")
             except Exception as exc:
                 raise TheoremReplayError(
                     "Could not recreate the theorem's initial local context: "
-                    f"failed while introducing '{name}'.",
+                    f"failed while introducing '{name}' "
+                    f"(named={named_exc}; unnamed={exc}).",
                     phase="initial_context",
                     theorem=theorem,
                     step_index=0,
                     row_index=rows[0].row_index,
                 ) from exc
+        if not goal_state.goals:
+            break
+        current_count = len(goal_state.goals[0].variables)
+        if current_count <= previous_count:
+            raise TheoremReplayError(
+                "Introducing the initial theorem context made no progress: "
+                f"still at {current_count}/{len(first_names)} hypotheses.",
+                phase="initial_context",
+                theorem=theorem,
+                step_index=0,
+                row_index=rows[0].row_index,
+            )
 
     records: list[dict[str, object]] = []
     for step_index, row in enumerate(rows):

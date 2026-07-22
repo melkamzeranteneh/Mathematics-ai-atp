@@ -85,6 +85,21 @@ class _FakeServer:
         self.shutdown_called = True
 
 
+class _AutoIntroServer(_FakeServer):
+    async def goal_tactic_async(self, goal_state: _GoalState, tactic: str):
+        if tactic.startswith("intro"):
+            self.calls.append(("tactic", tactic))
+            return _GoalState(
+                [
+                    _Goal(
+                        self.states[0].goals[0].target,
+                        [_Variable("p"), _Variable("q")],
+                    )
+                ]
+            )
+        return await super().goal_tactic_async(goal_state, tactic)
+
+
 class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.root = Path("maths_ai/gnn_inference/tests/_tmp_sexpr_extraction")
@@ -240,6 +255,31 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manifest["failure_phases"], {"tactic_replay": 1})
         self.assertIsNone(self.cache.load("train", 10))
         self.assertIsNone(self.cache.load("train", 11))
+
+    async def test_initialization_observes_automatically_introduced_locals(self):
+        row = DatasetRow(
+            state="p q : Prop\n⊢ First p",
+            theorem="Demo.theorem",
+            tactic="finish",
+            split="train",
+            row_index=10,
+            dataset_name="fake/dataset",
+        )
+        server = _AutoIntroServer(
+            [_GoalState([_Goal("((:c First) 1)", [_Variable("p"), _Variable("q")])])]
+        )
+
+        manifest = await extract_split_with_server(
+            server,
+            rows=[row],
+            cache=self.cache,
+            prepared_root=self.root,
+            split="train",
+        )
+
+        self.assertEqual(manifest["coverage"], 1.0)
+        intro_calls = [call for call in server.calls if call[1].startswith("intro")]
+        self.assertEqual(intro_calls, [("tactic", "intro p")])
 
     def test_legacy_unversioned_cache_is_rejected(self):
         path = self.root / "train" / "sexpr" / "000000010.json"
