@@ -91,6 +91,8 @@ class RLHybridReasoner(HybridReasoner):
         self._pending: Dict[tuple, EdgeAction] = {}
         self._pending_goal: Optional[Goal] = None
         self._result: Optional[RLSearchResult] = None
+        # Argmax proposals (evaluation) vs. i.i.d. sampling (training); set per prove().
+        self._greedy: bool = False
 
     def _build_gnn_engine(self, **_kwargs):
         """No checkpoint engine: tactics come from ``self.model.act`` (on-policy)."""
@@ -109,6 +111,9 @@ class RLHybridReasoner(HybridReasoner):
         (refinement 1). Every decoded candidate is stashed pending; ``_link`` claims
         the ones that produce edges and ``_expand``'s epilogue (via ``_flush_pending``)
         converts the rest into failure records.
+
+        If ``self._greedy`` is True (set by ``prove(greedy=True)``), draw k argmax
+        actions instead of sampling — used for evaluation.
         """
         self._flush_pending()  # anything left from the previous node is a failure
         self._pending_goal = sub_goal
@@ -120,7 +125,7 @@ class RLHybridReasoner(HybridReasoner):
         self.model.eval()
         with torch.no_grad():
             for _ in range(self.top_k_tactics):
-                sample = self.model.act(batch, id_to_tactic=self.id_to_tactic)
+                sample = self.model.act(batch, id_to_tactic=self.id_to_tactic, greedy=self._greedy)
                 candidate, action = self._decode(sample, dag)
                 if candidate is None:
                     continue
@@ -198,17 +203,31 @@ class RLHybridReasoner(HybridReasoner):
     # Per-search result (refinement 6)
     # ------------------------------------------------------------------
 
-    async def prove(self, goal: str, *, hypotheses: Optional[List[str]] = None) -> RLSearchResult:
+    async def prove(
+        self,
+        goal: str,
+        *,
+        hypotheses: Optional[List[str]] = None,
+        greedy: bool = False,
+    ) -> RLSearchResult:
         """Run the search and return ``RLSearchResult(graph, edge_actions, failure_actions)``.
 
         Stashes are reset per call, so one reasoner instance must run searches
         sequentially (cross-theorem concurrency needs per-search instances).
+
+        ``greedy=True`` makes ``predict_next_tactic`` propose argmax actions instead of
+        i.i.d. samples — used by evaluation to measure the deterministic policy. The
+        stash still fills, but the caller ignores it (no gradient step follows an eval).
         """
         self._pending = {}
         self._pending_goal = None
+        self._greedy = greedy
         self._result = RLSearchResult(graph=None)  # graph attached after the base search
-        graph = await super().prove(goal, hypotheses=hypotheses)
-        self._flush_pending()  # last expanded node's rejects
-        self._result.graph = graph
-        result, self._result = self._result, None
+        try:
+            graph = await super().prove(goal, hypotheses=hypotheses)
+            self._flush_pending()  # last expanded node's rejects
+            self._result.graph = graph
+            result, self._result = self._result, None
+        finally:
+            self._greedy = False
         return result

@@ -3,7 +3,10 @@ import argparse
 import random
 import re
 import json
-from graphviz import Digraph
+try:
+    from graphviz import Digraph
+except ImportError:
+    Digraph = None
 from pathlib import Path
 from typing import Dict, List, Optional
 from pantograph.server import Server, GoalState
@@ -15,6 +18,7 @@ from maths_ai.pln_inference.metta.translator.translator_modules.runner import Dy
 
 from maths_ai.hybrid_reasoner.hypergraph import ProofHypergraph, ProofNode, TacticExecutor, TacticOutcome
 from maths_ai.core.config import settings
+from maths_ai.gnn_inference.atp_lean_gnn.reporting import console_print
 
 _INACCESSIBLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*✝[⁰-⁹¹²³]*")
 
@@ -101,7 +105,7 @@ class PantographExecutor(TacticExecutor):
             On a Lean-side error (the tactic doesn't apply), returns
             ``TacticOutcome(success=False, error=...)``.
         """
-        arguments = " ".join(tactic.arguments)
+        arguments = " ".join(arg.rstrip(":") for arg in tactic.arguments)
         tactic_cmd = " ".join([tactic.tactic_name, arguments]).strip()
 
         try:
@@ -513,9 +517,22 @@ async def main(
     dts_state_output: Optional[Path] = None,
     dts_c: float = None,
     dts_random_seed: Optional[int] = None,
+    top_k_tactics: int = 3,
+    top_k_subgoals: int = 3,
 
 ) -> None:
-    server = await Server.create()
+    # Use Mathlib project if available
+    mathlib_project = settings.root_dir / "lean_mathlib"
+    server_kwargs = {}
+    if (mathlib_project / "lakefile.lean").exists():
+        server_kwargs["project_path"] = str(mathlib_project)
+        server_kwargs["imports"] = ["Init", "Mathlib"]
+        console_print(f"  Using Mathlib project: {mathlib_project}")
+    else:
+        console_print("  No Mathlib project found. Only core Lean theorems supported.")
+        console_print(f"  To enable Mathlib: cd {mathlib_project} && lake update && lake build")
+    
+    server = await Server.create(**server_kwargs)
     
     # Auto-load DTS state from default location if not specified
     if dts_state_input is None and settings.dts_state_file.exists():
@@ -544,8 +561,8 @@ async def main(
         index_path=index_path,
         corpus_path=corpus_path,
         executor=PantographExecutor(server=server),
-        top_k_tactics=3,
-        top_k_subgoals=3,
+        top_k_tactics=top_k_tactics,
+        top_k_subgoals=top_k_subgoals,
         max_depth=depth_limit,
         max_nodes=500,
         dts_sampler=dts_sampler,
@@ -560,13 +577,27 @@ async def main(
         print(repr(h))
     try:
         proof_graph = await hybrid_reasoner.prove(goal_statement, hypotheses=hypotheses)
-        print(proof_graph.summary())
         if proof_graph.is_solved():
-            print("Proof found!")
+            print("\n✅ Proof found!")
             print(proof_graph.proof_trace())
         else:
+            print("\n❌ Proof NOT found.")
+            # Print the deepest path tried
+            deepest = max(proof_graph.nodes.values(), key=lambda n: n.depth)
+            path = proof_graph.tactic_path(deepest.id)
+            print(f"\nDeepest node: {deepest.id} (depth {deepest.depth})")
+            print(f"Goal: {deepest.goal.expression}")
+            if path:
+                print(f"\nTactic path ({len(path)} steps):")
+                for i, step in enumerate(path):
+                    print(f"  {i+1}. {step}")
+            else:
+                print("  (root — no tactics applied)")
+            print(f"\nStatus: {deepest.status}")
+            if deepest.note:
+                print(f"Note: {deepest.note}")
+            print(proof_graph.summary())
             plot_hypergraph(proof_graph)
-            print("Proof not found within the given limits.")
     except Exception as e:
         print(f"An error occurred during proof search: {e}")
     finally:
@@ -575,8 +606,8 @@ async def main(
             hybrid_reasoner.dts_sampler.save_to(str(dts_state_output))
         server._close()
 if __name__ == "__main__":
-    _argument_selection_run = settings.models_dir / "argument_selection_run_20260606_160115"
-    _premise_selection_run = settings.models_dir / "premise_selection_run_20260607_142722"
+    _argument_selection_run = settings.root_dir / "gnn_inference" / "runs" / "pointer_gnn" / "best_run"
+    _premise_selection_run = settings.root_dir / "gnn_inference" / "runs" / "premise_gnn" / "best_run"
     _depth_limit = settings.proof_depth
     args_parser = argparse.ArgumentParser()
     args_parser.add_argument("--goal_statement", type=str, default="forall (p q: Prop), Or p q -> Or q p")
@@ -606,6 +637,18 @@ if __name__ == "__main__":
         default=None,
         help="Optional RNG seed for DTS sampling.",
     )
+    args_parser.add_argument(
+        "--top-k-tactics",
+        type=int,
+        default=3,
+        help="Number of top tactic candidates to try per node (default: 3).",
+    )
+    args_parser.add_argument(
+        "--top-k-subgoals",
+        type=int,
+        default=3,
+        help="Number of subgoal nodes to expand per tactic application (default: 3).",
+    )
     args = args_parser.parse_args()
 
     asyncio.run(main(
@@ -621,4 +664,6 @@ if __name__ == "__main__":
         dts_state_output=args.dts_state_output,
         dts_c=args.dts_c,
         dts_random_seed=args.dts_random_seed,
+        top_k_tactics=args.top_k_tactics,
+        top_k_subgoals=args.top_k_subgoals,
     ))

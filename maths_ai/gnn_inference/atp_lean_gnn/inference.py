@@ -7,12 +7,13 @@ tactic string.
 
 from __future__ import annotations
 
+import re
 import torch
 from torch_geometric.data import Batch
 
 from .argument_selector import TacticWithArgsClassifier
 from .actor_critic import ActorCriticWithArgsClassifier
-from .graph import DAGBuilder, GraphNode, proof_state_to_dag
+from .graph import DAGBuilder, GraphNode, proof_state_to_dag, goal_state_to_proof_state
 from .labels import get_tactic_arity
 from .lemma_corpus import LemmaRecord
 from .lemma_index import LemmaIndex
@@ -20,6 +21,16 @@ from .premise_pool import build_unified_pools
 from .premise_scoring import PremiseScorer
 from .pyg import build_premise_mask, dag_to_pyg
 from .state import ProofState, parse_state
+from .training import transform_edge_index
+
+# ── Tactic-aware argument filtering rules ──────────────────────────────────
+# Fresh name only: generate a new identifier, reject all candidates
+_FRESH_NAME_TACTICS = frozenset({"intro", "rintro", "introV2"})
+# Local only: accept only local context nodes, reject library lemmas
+_LOCAL_ONLY_TACTICS = frozenset({"cases", "rcases", "rcases_pattern", "obtain"})
+# No arguments needed
+_NO_ARGS_TACTICS = frozenset({"constructor", "assumption", "trivial", "omega", "decide", "rfl", "sorry"})
+# Everything else (exact, apply, refine, rw, simp, ...): accept unified pool
 
 
 def _resolve_local_node_name(node: GraphNode, dag: DAGBuilder) -> str:
@@ -28,6 +39,21 @@ def _resolve_local_node_name(node: GraphNode, dag: DAGBuilder) -> str:
         name_node = dag.nodes[node.children[0]]
         return name_node.label
     return node.label
+
+
+def _extract_fresh_names_from_dag(dag: DAGBuilder) -> list[str]:
+    """Walk the DAG and collect fresh variable names from ∀-bound leaf nodes.
+
+    Only returns variables at binder_depth == 1 (the outermost forall),
+    excluding variables nested inside type annotations like ``Set α``.
+    """
+    from .graph import BINDER_KIND_FORALL
+    return [
+        node.label for node in dag.nodes
+        if node.is_bound == 1 and node.binder_kind == BINDER_KIND_FORALL
+        and node.binder_depth == 1
+        and not node.children
+    ]
 
 
 def _top_tactic_candidates(
@@ -140,6 +166,24 @@ class InferencePipeline:
         
         # 1. Graph construction
         dag = proof_state_to_dag(state)
+        return self._predict_from_dag(dag, top_k=top_k)
+
+    @torch.no_grad()
+    def predict_from_goal_state(self, goal_state, *, top_k: int = 1) -> InferenceResult:
+        """Predict tactics from a Pantograph GoalState with S-expressions.
+
+        This method extracts S-expressions from the GoalState (requires
+        patch_pantograph_for_sexp() to have been called) and builds the DAG
+        directly from S-expressions for both goal and hypothesis types.
+        """
+        from .graph import goal_state_to_proof_state, proof_state_to_dag
+        
+        text_state, hyp_sexps, goal_sexp = goal_state_to_proof_state(goal_state)
+        dag = proof_state_to_dag(text_state, goal_sexp=goal_sexp, hyp_sexps=hyp_sexps)
+        return self._predict_from_dag(dag, top_k=top_k)
+
+    def _predict_from_dag(self, dag: DAGBuilder, *, top_k: int = 1) -> InferenceResult:
+        """Core prediction logic from a pre-built DAG."""
         data = dag_to_pyg(dag, self.node_vocab)
         
         try:
@@ -152,6 +196,10 @@ class InferencePipeline:
         data.premise_mask = torch.tensor(premise_mask, dtype=torch.bool)
         
         data = data.to(self.device)
+        data.state_node_index = data.state_node_index.to(self.device)
+        data.premise_mask = data.premise_mask.to(self.device)
+        # Apply bidirectional edges to match training edge_mode
+        data.edge_index = transform_edge_index(data.edge_index, edge_mode="bidirectional")
         batch = Batch.from_data_list([data])
 
         node_embeddings = self.model.backbone.encode_nodes(batch)
@@ -185,7 +233,7 @@ class InferencePipeline:
             tactic_name = str(candidate["tactic_name"])
             arity = get_tactic_arity(tactic_name)
 
-            if arity == 0:
+            if arity == 0 or tactic_name in _NO_ARGS_TACTICS:
                 top_tactic_predictions.append(
                     {
                         "tactic_id": tactic_id,
@@ -212,12 +260,73 @@ class InferencePipeline:
                 )
                 continue
 
+            # ── Tactic-aware argument filtering ──────────────────────────
+            if tactic_name in _FRESH_NAME_TACTICS:
+                fresh_names = _extract_fresh_names_from_dag(dag)
+                top_tactic_predictions.append(
+                    {
+                        "tactic_id": tactic_id,
+                        "tactic_name": tactic_name,
+                        "probability": float(candidate["probability"]),
+                        "selected_arguments": fresh_names,
+                        "selected_argument_details": [
+                            ArgumentPrediction(source="fresh", candidate_id=0, label=name, score=0.0)
+                            for name in fresh_names
+                        ],
+                    }
+                )
+                continue
+
+            if tactic_name in _LOCAL_ONLY_TACTICS:
+                local_mask = torch.tensor(
+                    [src == "local" for src in pool.candidate_sources], device=self.device
+                )
+                if local_mask.any():
+                    local_vectors = pool.candidate_vectors[local_mask]
+                    local_scores = self.scorer.score(
+                        state_emb.squeeze(0), tactic_emb.squeeze(0), local_vectors
+                    )
+                    local_sorted = local_scores.argsort(descending=True)[:arity]
+                    local_indices = torch.where(local_mask)[0][local_sorted]
+                else:
+                    local_indices = torch.tensor([], dtype=torch.long, device=self.device)
+
+                arguments: list[str] = []
+                selected_argument_details: list[ArgumentPrediction] = []
+                for rank, idx in enumerate(local_indices.tolist()):
+                    idx = int(idx)
+                    cid = pool.candidate_ids[idx]
+                    node = dag.nodes[cid]
+                    arg_str = _resolve_local_node_name(node, dag)
+                    arguments.append(arg_str)
+                    score_val = float(local_scores[local_sorted[rank]].item()) if len(local_indices) > 0 else 0.0
+                    selected_argument_details.append(
+                        ArgumentPrediction(
+                            source="local",
+                            candidate_id=cid,
+                            label=arg_str,
+                            score=score_val,
+                        )
+                    )
+
+                top_tactic_predictions.append(
+                    {
+                        "tactic_id": tactic_id,
+                        "tactic_name": tactic_name,
+                        "probability": float(candidate["probability"]),
+                        "selected_arguments": arguments,
+                        "selected_argument_details": selected_argument_details,
+                    }
+                )
+                continue
+
+            # ── Default: unified pool scoring (exact, apply, rw, simp, ...) ──
             scores = self.scorer.score(state_emb.squeeze(0), tactic_emb.squeeze(0), pool.candidate_vectors)
             sorted_indices = scores.argsort(descending=True)
             top_indices = sorted_indices[:arity].tolist()
 
-            arguments: list[str] = []
-            selected_argument_details: list[ArgumentPrediction] = []
+            arguments = []
+            selected_argument_details = []
             for idx in top_indices:
                 source = pool.candidate_sources[idx]
                 cid = pool.candidate_ids[idx]

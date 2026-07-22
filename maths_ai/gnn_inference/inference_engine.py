@@ -135,7 +135,7 @@ class GNNModelEngine:
         """
         predictions = self.gnn_inference.predict_tactics_with_arguments(goal_expression, top_k=top_k)
         print(*predictions, "\n")
-        return [
+        result =  [
             TacticCandidate(
                 tactic_name=str(prediction["tactic_name"]),
                 arguments=[str(argument) for argument in cast(list, prediction["selected_arguments"])],
@@ -143,3 +143,9 @@ class GNNModelEngine:
             )
             for prediction in predictions
         ]
+
+        for res in result:
+            if res.tactic_name == "rw":
+                res.arguments = "[" + ",".join(res.arguments) + "]"
+
+        return result

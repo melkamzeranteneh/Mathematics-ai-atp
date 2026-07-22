@@ -45,7 +45,11 @@ def compute_argument_rl_loss(
         return torch.tensor(0.0, device=success_mask.device)
 
     if not success_mask.any():
-        return sum(logits.sum() * 0.0 for logits in arg_logits_list)
+        # No successful samples → no argument gradient.
+        # Return a zero tensor attached to the computation graph (for autograd),
+        # but avoid the `-inf * 0.0 = nan` trap from masked logits.
+        device = arg_logits_list[0].device if arg_logits_list else success_mask.device
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
     losses = []
     success_indices = success_mask.nonzero(as_tuple=False).view(-1)
@@ -75,7 +79,9 @@ def compute_argument_rl_loss(
     if losses:
         return torch.stack(losses).mean()
     else:
-        return sum(logits.sum() * 0.0 for logits in arg_logits_list)
+        # All success samples had invalid/masked indices → no valid argument gradient.
+        device = arg_logits_list[0].device if arg_logits_list else success_mask.device
+        return torch.tensor(0.0, device=device, requires_grad=True)
 
 
 def compute_bc_anchor_loss(

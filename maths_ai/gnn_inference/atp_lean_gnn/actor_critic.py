@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .argument_selector import ArgumentSelector
+from .argument_selector import ArgumentSelector, resolve_premise_mask
 from .labels import get_tactic_arity
 from .model import GraphSAGEStateClassifier
 from .pyg import NODE_TYPE_TO_ID
@@ -160,11 +160,10 @@ class ActorCriticWithArgsClassifier(nn.Module):
         if n_steps == 0:
             return []
 
-        # Autoregressive argument selection
-        # Overwrite the cache's premise_mask if it's too restrictive (e.g. missing 'app' or 'operator' nodes)
-        # Type IDs: var=0, type=1, predicate=2, operator=3, app=4, meta=5
-        node_types = data.node_type.to(device=node_embeddings.device)
-        premise_mask = (node_types >= 0) & (node_types <= 5)
+        # Autoregressive argument selection using the shared candidate mask —
+        # identical to the supervised pointer's so warm-started argument
+        # behavior transfers and RL-sampled indices stay valid at recompute.
+        premise_mask = resolve_premise_mask(data, node_embeddings.device)
         batch_index = data.batch.to(device=node_embeddings.device)
 
         arg_logits_list: list[Tensor] = []
@@ -221,8 +220,7 @@ class ActorCriticWithArgsClassifier(nn.Module):
 
         if n_steps > 0:
             tactic_emb = self.tactic_embedding(tactic_action)  # [B, H]
-            node_types = data.node_type.to(device=node_embeddings.device)
-            premise_mask = (node_types >= 0) & (node_types <= 5)
+            premise_mask = resolve_premise_mask(data, node_embeddings.device)
             batch_index = data.batch.to(device=node_embeddings.device)
 
             prev_arg_emb: Tensor | None = None
@@ -277,8 +275,7 @@ class ActorCriticWithArgsClassifier(nn.Module):
         arg_logp = torch.zeros_like(tactic_logp)
         if arg_indices is not None and arg_indices.numel() > 0 and arg_indices.size(1) > 0:
             tactic_emb = self.tactic_embedding(tactic_ids)  # [B, H]
-            node_types = data.node_type.to(device=node_embeddings.device)
-            premise_mask = (node_types >= 0) & (node_types <= 5)
+            premise_mask = resolve_premise_mask(data, node_embeddings.device)
             batch_index = data.batch.to(device=node_embeddings.device)
 
             prev_arg_emb: Tensor | None = None

@@ -23,6 +23,22 @@ from .pyg import NODE_TYPE_TO_ID
 # ---------------------------------------------------------------------------
 
 
+def resolve_premise_mask(data, device) -> Tensor:
+    """Per-node bool mask of valid argument candidates for the pointer head.
+
+    Prefers the cached ``data.premise_mask`` (built by ``pyg.build_premise_mask``
+    from the DAG: Hyp nodes plus var/type/predicate leaves). Falls back to a
+    node-type heuristic (var=0, type=1, predicate=2) when no cache exists.
+    Shared by the supervised pointer model and every actor-critic path
+    (``select_arguments``/``act``/``evaluate_actions``) so the sampled indices
+    the RL collect phase stores stay valid under the train-phase recompute.
+    """
+    if getattr(data, "premise_mask", None) is not None:
+        return data.premise_mask.to(device=device)
+    node_types = data.node_type.to(device=device)
+    return (node_types >= 0) & (node_types <= 2)
+
+
 class ArgumentSelector(nn.Module):
     """Score every node in the DAG as a candidate tactic argument.
 
@@ -325,12 +341,8 @@ class TacticWithArgsClassifier(nn.Module):
         if n_steps == 0:
             return tactic_logits, []
 
-        # Autoregressive argument selection
-        # Overwrite the cache's premise_mask if it's too restrictive (e.g. missing 'app' or 'operator' nodes)
-        # Type IDs: var=0, type=1, predicate=2, operator=3, app=4, meta=5
-        # We allow selecting any of these common types as arguments.
-        node_types = data.node_type.to(device=node_embeddings.device)
-        premise_mask = (node_types >= 0) & (node_types <= 5)
+        # Autoregressive argument selection using the cached premise mask
+        premise_mask = resolve_premise_mask(data, node_embeddings.device)
         batch_index = data.batch.to(device=node_embeddings.device)
 
         arg_logits_list: list[Tensor] = []
