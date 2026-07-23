@@ -1,0 +1,13 @@
+diff --git a/Pantograph/Frontend/Elab.lean b/Pantograph/Frontend/Elab.lean
+index c15e20b..cc334a1 100644
+--- a/Pantograph/Frontend/Elab.lean
++++ b/Pantograph/Frontend/Elab.lean
+@@ -145,7 +145,7 @@ private def collectTacticNodes (t : Elab.InfoTree) : List TacticInvocation :=
+     | _ => none
+ 
+ def collectTactics (t : Elab.InfoTree) : List TacticInvocation :=
+-  collectTacticNodes t |>.filter fun i => i.info.isSubstantive
++  collectTacticNodes t
+ 
+ @[export pantograph_frontend_collect_tactics_from_compilation_step_m]
+ def collectTacticsFromCompilationStep (step : CompilationStep)

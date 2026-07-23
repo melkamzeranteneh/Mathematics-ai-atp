@@ -120,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     patches = (
         patch_root / "pantograph_v410_invocation_sexprs.patch",
         patch_root / "pantograph_v410_source_trace_v2.patch",
+        patch_root / "pantograph_v410_combinator_invocations_v3.patch",
     )
 
     _ensure_toolchain(LEAN_TOOLCHAIN)
