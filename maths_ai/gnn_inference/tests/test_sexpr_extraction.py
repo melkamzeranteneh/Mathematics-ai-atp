@@ -186,6 +186,34 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(manifest["coverage"], 1.0)
 
+    async def test_source_comments_do_not_change_tactic_identity(self):
+        units = self._units()
+        units[0]["invocations"][0]["tactic"] = (
+            "advance -- Porting note: retained for compatibility\n"
+        )
+
+        manifest = await self._extract(_FakeClient(units), [self.rows[0]])
+
+        self.assertEqual(manifest["coverage"], 1.0)
+        self.assertEqual(self.cache.load("train", 10)["alignment_kind"], "exact")
+
+    async def test_blank_lines_between_goals_are_formatting_only(self):
+        row = DatasetRow(
+            **{
+                **self.rows[0].__dict__,
+                "target_state": "⊢ Second p\n\n⊢ Third p",
+            }
+        )
+        units = self._units()
+        units[0]["invocations"][0]["goalAfter"] = "⊢ Second p\n⊢ Third p"
+
+        manifest = await self._extract(_FakeClient(units), [row])
+
+        self.assertEqual(manifest["coverage"], 1.0)
+        self.assertTrue(
+            self.cache.load("train", 10)["target_state_matches_invocation"]
+        )
+
     async def test_semantically_identical_duplicate_invocations_are_collapsed(self):
         units = self._units()
         units[0]["invocations"].insert(

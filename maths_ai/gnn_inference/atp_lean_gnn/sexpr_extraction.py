@@ -220,16 +220,66 @@ def _normalized_text(text: str) -> str:
     normalized = "\n".join(
         line.rstrip()
         for line in text.replace("\r\n", "\n").strip().splitlines()
+        if line.strip()
     )
     if normalized.lower() in {"no goals", "no goals to be solved"}:
         return ""
     return normalized
 
 
+def _strip_lean_comments(text: str) -> str:
+    """Remove Lean comments without treating comment markers in strings as syntax."""
+    output: list[str] = []
+    index = 0
+    block_depth = 0
+    in_string = False
+    escaped = False
+    while index < len(text):
+        if block_depth:
+            if text.startswith("/-", index):
+                block_depth += 1
+                index += 2
+            elif text.startswith("-/", index):
+                block_depth -= 1
+                index += 2
+            else:
+                if text[index] == "\n":
+                    output.append("\n")
+                index += 1
+            continue
+
+        character = text[index]
+        if in_string:
+            output.append(character)
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            index += 1
+        elif text.startswith("--", index):
+            newline = text.find("\n", index + 2)
+            if newline < 0:
+                break
+            output.append("\n")
+            index = newline + 1
+        elif text.startswith("/-", index):
+            block_depth = 1
+            index += 2
+        else:
+            output.append(character)
+            if character == '"':
+                in_string = True
+            index += 1
+    return "".join(output)
+
+
 def _undecorated_tactic(text: str) -> str:
     # LeanDojo adds HTML-like links around referenced declarations, and the
     # link text may be fully qualified even when Lean's tactic pretty-printer
     # chooses the short name. These decorations are not part of Lean syntax.
+    text = _strip_lean_comments(text)
     text = re.sub(r"</?a(?:\s[^>]*)?>", "", text)
     return re.sub(
         r"(?<![\w'])(?:[\w'][\w'!?]*\.)+([\w'][\w'!?]*)",
