@@ -63,6 +63,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Seconds allowed to compile one original Mathlib source file.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of independent Pantograph REPL workers. Each worker compiles "
+            "one source file at a time; start conservatively with 3."
+        ),
+    )
+    parser.add_argument(
         "--no-resume",
         action="store_true",
         help="Re-extract rows even when their validated versioned cache exists.",
@@ -82,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         resume=not args.no_resume,
         server_startup_timeout=args.server_timeout,
         file_timeout=args.file_timeout,
+        workers=args.workers,
     )
     try:
         summary = asyncio.run(extract_sexpressions(config))

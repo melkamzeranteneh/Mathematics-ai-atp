@@ -36,6 +36,7 @@ class SExprExtractionConfig:
     server_startup_timeout: int = 120
     file_timeout: int = 600
     buffer_limit: int = 256 * 1024 * 1024
+    workers: int = 1
     verify_source_commit: bool = True
 
 
@@ -604,6 +605,89 @@ def _write_summary_markdown(path: Path, summary: dict[str, object]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+async def _extract_file_with_client(
+    client,
+    *,
+    file_path: str,
+    theorem_groups: dict[str, list[DatasetRow]],
+    cache: SExprCache,
+    source_root: Path,
+    expected_commit: str,
+    resume: bool,
+) -> dict[str, object]:
+    file_rows = [
+        row for theorem_rows in theorem_groups.values() for row in theorem_rows
+    ]
+    bad_commits = sorted(
+        {row.repo_commit for row in file_rows if row.repo_commit != expected_commit}
+    )
+    if bad_commits:
+        exc = SourceExtractionError(
+            f"Dataset row commit does not match extractor checkout: {bad_commits}",
+            phase="commit_mismatch",
+        )
+        units = None
+        compiled = False
+    else:
+        try:
+            units = await client.process_file(file_path)
+            source_bytes = (Path(source_root) / file_path).read_bytes()
+            compiled = True
+        except Exception as caught:
+            exc = SourceExtractionError(str(caught), phase="file_compile")
+            units = None
+            compiled = False
+
+    extracted_rows = failed_rows = 0
+    failures: list[dict[str, object]] = []
+    failure_phases: Counter[str] = Counter()
+    for theorem, theorem_rows in theorem_groups.items():
+        uncached_rows = [
+            row
+            for row in theorem_rows
+            if not (resume and _row_is_cached(cache, row))
+        ]
+        if not uncached_rows:
+            continue
+        try:
+            if units is None:
+                raise exc
+            candidates = _candidate_invocations(
+                source_bytes=source_bytes, units=units, theorem=theorem
+            )
+            if not candidates:
+                raise SourceExtractionError(
+                    "Could not identify the theorem's compilation unit.",
+                    phase="theorem_identity",
+                    theorem=theorem,
+                )
+            aligned = _align_rows(theorem_rows, candidates)
+            records = [
+                _make_record(row, candidate)
+                for row, candidate in zip(theorem_rows, aligned)
+            ]
+            # Validate every row in the theorem before committing any of them,
+            # so a capture error cannot leave a partial group.
+            uncached_indices = {row.row_index for row in uncached_rows}
+            for row, record in zip(theorem_rows, records):
+                if row.row_index in uncached_indices:
+                    cache.save(row.split, row.row_index, record)
+                    extracted_rows += 1
+        except Exception as caught:
+            failure = _failure_record(caught, file_path, theorem, uncached_rows)
+            failures.append(failure)
+            failed_rows += len(uncached_rows)
+            failure_phases[str(failure["phase"])] += len(uncached_rows)
+
+    return {
+        "compiled": compiled,
+        "extracted_rows": extracted_rows,
+        "failed_rows": failed_rows,
+        "failures": failures,
+        "failure_phases": failure_phases,
+    }
+
+
 async def extract_split_with_client(
     client,
     *,
@@ -615,6 +699,9 @@ async def extract_split_with_client(
     expected_commit: str = DATASET_MATHLIB_COMMIT,
     resume: bool = True,
 ) -> dict[str, object]:
+    clients = list(client) if isinstance(client, (list, tuple)) else [client]
+    if not clients:
+        raise ValueError("At least one Pantograph client is required.")
     report_root = Path(prepared_root) / "sexpr_extraction"
     failure_path = report_root / "failures" / f"{split}.jsonl"
     failure_path.parent.mkdir(parents=True, exist_ok=True)
@@ -635,67 +722,95 @@ async def extract_split_with_client(
         failure_phases: Counter[str] = Counter()
         console_print(f"  [{split}] source extraction: {len(file_groups)} files, {len(rows)} rows")
 
+        pending_jobs = []
         for file_index, (file_path, theorem_groups) in enumerate(file_groups.items(), 1):
             file_rows = [row for theorem_rows in theorem_groups.values() for row in theorem_rows]
             uncached_file_rows = [row for row in file_rows if not (resume and _row_is_cached(cache, row))]
             if not uncached_file_rows:
                 continue
-            bad_commits = sorted({row.repo_commit for row in file_rows if row.repo_commit != expected_commit})
-            if bad_commits:
-                exc = SourceExtractionError(
-                    f"Dataset row commit does not match extractor checkout: {bad_commits}",
-                    phase="commit_mismatch",
-                )
-                units = None
-            else:
-                try:
-                    units = await client.process_file(file_path)
-                    compiled_files += 1
-                    source_bytes = (Path(source_root) / file_path).read_bytes()
-                except Exception as caught:
-                    exc = SourceExtractionError(str(caught), phase="file_compile")
-                    units = None
+            pending_jobs.append((file_index, file_path, theorem_groups))
 
-            for theorem, theorem_rows in theorem_groups.items():
-                uncached_rows = [row for row in theorem_rows if not (resume and _row_is_cached(cache, row))]
-                if not uncached_rows:
-                    continue
+        console_print(
+            f"  [{split}] workers={len(clients)} | pending files={len(pending_jobs)}"
+        )
+        job_queue: asyncio.Queue[tuple[int, str, dict[str, list[DatasetRow]]]] = (
+            asyncio.Queue()
+        )
+        result_queue: asyncio.Queue[tuple[int, str, dict[str, object]]] = (
+            asyncio.Queue()
+        )
+        for job in pending_jobs:
+            job_queue.put_nowait(job)
+
+        async def worker(worker_client) -> None:
+            while True:
                 try:
-                    if units is None:
-                        raise exc
-                    candidates = _candidate_invocations(
-                        source_bytes=source_bytes, units=units, theorem=theorem
-                    )
-                    if not candidates:
-                        raise SourceExtractionError(
-                            "Could not identify the theorem's compilation unit.",
-                            phase="theorem_identity",
-                            theorem=theorem,
+                    file_index, file_path, theorem_groups = job_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    try:
+                        result = await _extract_file_with_client(
+                            worker_client,
+                            file_path=file_path,
+                            theorem_groups=theorem_groups,
+                            cache=cache,
+                            source_root=source_root,
+                            expected_commit=expected_commit,
+                            resume=resume,
                         )
-                    aligned = _align_rows(theorem_rows, candidates)
-                    records = [
-                        _make_record(row, candidate)
-                        for row, candidate in zip(theorem_rows, aligned)
-                    ]
-                    # Validate every row in the theorem before committing any
-                    # of them, so a capture error cannot leave a partial group.
-                    for row, record in zip(theorem_rows, records):
-                        if row in uncached_rows:
-                            cache.save(row.split, row.row_index, record)
-                            extracted_rows += 1
-                except Exception as caught:
-                    failure = _failure_record(caught, file_path, theorem, uncached_rows)
+                    except Exception as caught:
+                        file_rows = [
+                            row
+                            for theorem_rows in theorem_groups.values()
+                            for row in theorem_rows
+                            if not (resume and _row_is_cached(cache, row))
+                        ]
+                        failure = _failure_record(
+                            caught, file_path, "", file_rows
+                        )
+                        result = {
+                            "compiled": False,
+                            "extracted_rows": 0,
+                            "failed_rows": len(file_rows),
+                            "failures": [failure],
+                            "failure_phases": Counter(
+                                {str(failure["phase"]): len(file_rows)}
+                            ),
+                        }
+                    await result_queue.put((file_index, file_path, result))
+                finally:
+                    job_queue.task_done()
+
+        worker_tasks = [
+            asyncio.create_task(worker(worker_client)) for worker_client in clients
+        ]
+        try:
+            for completed in range(1, len(pending_jobs) + 1):
+                _file_index, _file_path, result = await result_queue.get()
+                compiled_files += int(bool(result["compiled"]))
+                extracted_rows += int(result["extracted_rows"])
+                failed_rows += int(result["failed_rows"])
+                failure_phases.update(result["failure_phases"])
+                for failure in result["failures"]:
                     with failure_path.open("a", encoding="utf-8") as handle:
                         handle.write(json.dumps(failure, ensure_ascii=False, sort_keys=True) + "\n")
-                    failed_rows += len(uncached_rows)
-                    failure_phases[str(failure["phase"])] += len(uncached_rows)
-                    console_print(f"  [{split}] failed {theorem}: {failure['phase']}: {failure['error']}")
+                    console_print(
+                        f"  [{split}] failed {failure['theorem']}: "
+                        f"{failure['phase']}: {failure['error']}"
+                    )
 
-            if file_index == 1 or file_index % 25 == 0 or file_index == len(file_groups):
-                console_print(
-                    f"  [{split}] {file_index}/{len(file_groups)} files | cached={cached_rows} "
-                    f"extracted={extracted_rows} failed={failed_rows}"
-                )
+                if completed == 1 or completed % 25 == 0 or completed == len(pending_jobs):
+                    console_print(
+                        f"  [{split}] completed {completed}/{len(pending_jobs)} pending files "
+                        f"| cached={cached_rows} extracted={extracted_rows} "
+                        f"failed={failed_rows}"
+                    )
+        finally:
+            for task in worker_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
 
     attempted_rows = len(rows)
     covered_rows = cached_rows + extracted_rows
@@ -705,6 +820,7 @@ async def extract_split_with_client(
         "dataset": rows[0].dataset_name if rows else None,
         "source_commit": expected_commit,
         "split": split,
+        "workers": len(clients),
         "attempted_files": len(file_groups),
         "compiled_files": compiled_files,
         "attempted_theorems": sum(len(groups) for groups in file_groups.values()),
@@ -732,6 +848,8 @@ def _git_head(source_root: Path) -> str:
 
 
 async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=None) -> dict[str, object]:
+    if config.workers < 1:
+        raise ValueError("workers must be at least 1.")
     source_root = Path(config.source_root).resolve()
     repl = Path(config.pantograph_repl).resolve()
     if not source_root.is_dir():
@@ -759,18 +877,21 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
                 f"{config.expected_pantograph_commit}."
             )
 
-    if client_factory is None:
-        client = PantographInvocationClient(
-            source_root=source_root,
-            pantograph_repl=repl,
-            startup_timeout=config.server_startup_timeout,
-            file_timeout=config.file_timeout,
-            buffer_limit=config.buffer_limit,
-        )
-    else:
-        client = client_factory(config)
-        if asyncio.iscoroutine(client):
-            client = await client
+    clients = []
+    for _worker_index in range(config.workers):
+        if client_factory is None:
+            client = PantographInvocationClient(
+                source_root=source_root,
+                pantograph_repl=repl,
+                startup_timeout=config.server_startup_timeout,
+                file_timeout=config.file_timeout,
+                buffer_limit=config.buffer_limit,
+            )
+        else:
+            client = client_factory(config)
+            if asyncio.iscoroutine(client):
+                client = await client
+        clients.append(client)
     cache = SExprCache(config.prepared_root, str(source_root), enabled=True)
     manifests: dict[str, dict[str, object]] = {}
     started = False
@@ -785,10 +906,10 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
                 )
             )
             if not started:
-                await client.start()
+                await asyncio.gather(*(client.start() for client in clients))
                 started = True
             manifests[split] = await extract_split_with_client(
-                client,
+                clients,
                 rows=rows,
                 cache=cache,
                 prepared_root=config.prepared_root,
@@ -799,7 +920,9 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
             )
     finally:
         if started:
-            await client.close()
+            await asyncio.gather(
+                *(client.close() for client in clients), return_exceptions=True
+            )
 
     attempted_rows = sum(int(item["attempted_rows"]) for item in manifests.values())
     covered_rows = sum(int(item["covered_rows"]) for item in manifests.values())
@@ -811,6 +934,7 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
         "source_commit": config.expected_commit,
         "pantograph_commit": config.expected_pantograph_commit,
         "pantograph_repl": str(repl),
+        "workers": config.workers,
         "prepared_root": str(config.prepared_root),
         "splits": list(manifests),
         "manifests": manifests,

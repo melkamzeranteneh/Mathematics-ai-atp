@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import shutil
@@ -334,6 +335,45 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
             "100.0000%",
             (self.root / "prepared" / "sexpr_extraction" / "summary.md").read_text(encoding="utf-8"),
         )
+
+    async def test_top_level_runs_multiple_file_workers(self):
+        second_path = "Mathlib/Demo2.lean"
+        (self.source_root / second_path).write_text(self.source, encoding="utf-8")
+        second_row = DatasetRow(
+            **{
+                **self.rows[0].__dict__,
+                "file_path": second_path,
+                "row_index": 12,
+            }
+        )
+
+        class YieldingClient(_FakeClient):
+            async def process_file(self, file_path: str):
+                await asyncio.sleep(0)
+                return await super().process_file(file_path)
+
+        clients = [YieldingClient(self._units()), YieldingClient(self._units())]
+        available = iter(clients)
+        with patch(
+            "maths_ai.gnn_inference.atp_lean_gnn.sexpr_extraction.iter_dataset_rows",
+            return_value=iter([self.rows[0], second_row]),
+        ):
+            summary = await extract_sexpressions(
+                SExprExtractionConfig(
+                    prepared_root=self.root / "prepared",
+                    source_root=self.source_root,
+                    pantograph_repl=self.root / "fake-repl",
+                    dataset_name="fake/dataset",
+                    splits=("train",),
+                    workers=2,
+                    verify_source_commit=False,
+                ),
+                client_factory=lambda _config: next(available),
+            )
+
+        self.assertEqual(summary["coverage"], 1.0)
+        self.assertEqual(sorted(len(client.files) for client in clients), [1, 1])
+        self.assertTrue(all(client.started and client.closed for client in clients))
 
 
 if __name__ == "__main__":
