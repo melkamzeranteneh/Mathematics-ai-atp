@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import unittest
@@ -145,6 +146,8 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first["goal_sexp"], "((:c First) 0)")
         self.assertEqual(first["hyp_sexps"], [{"name": "p", "sexp": "(:sort 0)"}])
         self.assertEqual(first["invocation_index"], 0)
+        self.assertEqual(first["alignment_kind"], "exact")
+        self.assertTrue(first["target_state_matches_invocation"])
 
     async def test_resume_skips_source_compilation_when_all_rows_are_valid(self):
         await self._extract(_FakeClient(self._units()))
@@ -183,14 +186,56 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(manifest["coverage"], 1.0)
 
-    async def test_ambiguous_source_match_is_rejected_instead_of_guessed(self):
+    async def test_semantically_identical_duplicate_invocations_are_collapsed(self):
         units = self._units()
-        units[0]["invocations"].insert(1, units[0]["invocations"][0].copy())
+        units[0]["invocations"].insert(
+            1, copy.deepcopy(units[0]["invocations"][0])
+        )
+        manifest = await self._extract(_FakeClient(units), [self.rows[0]])
+
+        self.assertEqual(manifest["coverage"], 1.0)
+        self.assertIsNotNone(self.cache.load("train", 10))
+
+    async def test_different_serialized_inputs_are_rejected_instead_of_guessed(self):
+        units = self._units()
+        duplicate = copy.deepcopy(units[0]["invocations"][0])
+        duplicate["goalsBefore"][0]["target"]["sexp"] = "(:c Different)"
+        units[0]["invocations"].insert(1, duplicate)
         manifest = await self._extract(_FakeClient(units), [self.rows[0]])
 
         self.assertEqual(manifest["failed_rows"], 1)
         self.assertEqual(manifest["failure_phases"], {"ambiguous_invocation": 1})
         self.assertIsNone(self.cache.load("train", 10))
+
+    async def test_branch_opener_uses_authentic_input_goal(self):
+        branch_row = DatasetRow(
+            **{
+                **self.rows[0].__dict__,
+                "tactic": "by_cases h",
+            }
+        )
+        units = self._units()
+        invocation = units[0]["invocations"][0]
+        invocation["tactic"] = "by_cases h\n· finish\n· finish\n"
+        invocation["goalAfter"] = ""
+
+        manifest = await self._extract(_FakeClient(units), [branch_row])
+
+        self.assertEqual(manifest["coverage"], 1.0)
+        record = self.cache.load("train", 10)
+        self.assertEqual(record["goal_sexp"], "((:c First) 0)")
+        self.assertEqual(record["alignment_kind"], "branch_opener")
+        self.assertFalse(record["target_state_matches_invocation"])
+
+    async def test_goal_stack_order_need_not_equal_source_tree_order(self):
+        units = self._units()
+        units[0]["invocations"].reverse()
+
+        manifest = await self._extract(_FakeClient(units))
+
+        self.assertEqual(manifest["coverage"], 1.0)
+        self.assertIsNotNone(self.cache.load("train", 10))
+        self.assertIsNotNone(self.cache.load("train", 11))
 
     async def test_capture_failure_commits_no_partial_theorem(self):
         units = self._units()

@@ -226,17 +226,41 @@ def _normalized_text(text: str) -> str:
     return normalized
 
 
-def _normalized_tactic(text: str) -> str:
+def _undecorated_tactic(text: str) -> str:
     # LeanDojo adds HTML-like links around referenced declarations, and the
     # link text may be fully qualified even when Lean's tactic pretty-printer
     # chooses the short name. These decorations are not part of Lean syntax.
     text = re.sub(r"</?a(?:\s[^>]*)?>", "", text)
-    text = re.sub(
+    return re.sub(
         r"(?<![\w'])(?:[\w'][\w'!?]*\.)+([\w'][\w'!?]*)",
         r"\1",
         text,
     )
+
+
+def _normalized_tactic(text: str) -> str:
+    text = _undecorated_tactic(text)
     return " ".join(text.split())
+
+
+def _branch_opener_tactic(text: str) -> str | None:
+    """Return the source line before an attached branch body, if present.
+
+    Lean's info tree can associate a tactic such as ``by_cases h`` with all
+    following ``·`` branches. LeanDojo records the opener as its own action.
+    The opener's input goal is still authentic, but its info-tree after-state
+    is the state after the attached branches rather than immediately after the
+    opener.
+    """
+    lines = _undecorated_tactic(text).strip().splitlines()
+    if len(lines) < 2:
+        return None
+    for index, line in enumerate(lines[1:], 1):
+        stripped = line.lstrip()
+        if stripped.startswith("·") or re.match(r"(?:case|next)\b", stripped):
+            head = " ".join(part.strip() for part in lines[:index] if part.strip())
+            return " ".join(head.split()) or None
+    return None
 
 
 def _expanded_hypothesis_names(state: str) -> list[str]:
@@ -319,23 +343,48 @@ def _candidate_invocations(
     return candidates
 
 
-def _invocation_matches(row: DatasetRow, candidate: dict[str, object]) -> bool:
+def _invocation_match_kind(
+    row: DatasetRow, candidate: dict[str, object]
+) -> str | None:
     invocation = candidate["invocation"]
     assert isinstance(invocation, dict)
     if _normalized_text(str(invocation.get("goalBefore", ""))) != _normalized_text(row.state):
-        return False
-    if _normalized_tactic(str(invocation.get("tactic", ""))) != _normalized_tactic(row.tactic):
-        return False
-    if row.target_state and _normalized_text(str(invocation.get("goalAfter", ""))) != _normalized_text(row.target_state):
-        return False
-    return True
+        return None
+
+    invocation_tactic = str(invocation.get("tactic", ""))
+    row_tactic = _normalized_tactic(row.tactic)
+    target_matches = _normalized_text(
+        str(invocation.get("goalAfter", ""))
+    ) == _normalized_text(row.target_state)
+    if _normalized_tactic(invocation_tactic) == row_tactic and target_matches:
+        return "exact"
+    if _branch_opener_tactic(invocation_tactic) == row_tactic:
+        return "branch_opener"
+    return None
+
+
+def _capture_signature(candidate: dict[str, object]) -> str:
+    """Identify candidates that provide exactly the same model input."""
+    invocation = candidate["invocation"]
+    assert isinstance(invocation, dict)
+    payload = {
+        "capture_error": invocation.get("captureError"),
+        "goal_before": _normalized_text(str(invocation.get("goalBefore", ""))),
+        "goals_before": invocation.get("goalsBefore"),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _align_rows(
     rows: list[DatasetRow], candidates: list[dict[str, object]]
 ) -> list[dict[str, object]]:
-    choices = [[item for item in candidates if _invocation_matches(row, item)] for row in rows]
-    for row, matches in zip(rows, choices):
+    aligned: list[dict[str, object]] = []
+    for row in rows:
+        matches = [
+            (item, kind)
+            for item in candidates
+            if (kind := _invocation_match_kind(row, item)) is not None
+        ]
         if not matches:
             raise SourceExtractionError(
                 "No original tactic invocation matches state + tactic + target_state.",
@@ -343,36 +392,34 @@ def _align_rows(
                 theorem=row.theorem,
                 row_index=row.row_index,
             )
+        exact = [(item, kind) for item, kind in matches if kind == "exact"]
+        preferred = exact or matches
+        usable = [
+            (item, kind)
+            for item, kind in preferred
+            if not (
+                isinstance(item["invocation"], dict)
+                and item["invocation"].get("captureError")
+            )
+        ]
+        preferred = usable or preferred
 
-    solutions: list[list[dict[str, object]]] = []
-
-    def search(index: int, previous: int, selected: list[dict[str, object]]) -> None:
-        if len(solutions) >= 2:
-            return
-        if index == len(rows):
-            solutions.append(selected.copy())
-            return
-        for candidate in choices[index]:
-            ordinal = int(candidate["ordinal"])
-            if ordinal > previous:
-                selected.append(candidate)
-                search(index + 1, ordinal, selected)
-                selected.pop()
-
-    search(0, -1, [])
-    if not solutions:
-        raise SourceExtractionError(
-            "Matching invocations exist but cannot be aligned in dataset order.",
-            phase="invocation_order",
-            theorem=rows[0].theorem,
+        signatures = {_capture_signature(item) for item, _kind in preferred}
+        if len(signatures) > 1:
+            raise SourceExtractionError(
+                "More than one invocation with a different serialized input goal "
+                "matches this dataset row; refusing a guessed cache.",
+                phase="ambiguous_invocation",
+                theorem=row.theorem,
+                row_index=row.row_index,
+            )
+        selected, match_kind = min(
+            preferred, key=lambda pair: int(pair[0]["ordinal"])
         )
-    if len(solutions) > 1:
-        raise SourceExtractionError(
-            "More than one source invocation sequence matches these rows; refusing a guessed cache.",
-            phase="ambiguous_invocation",
-            theorem=rows[0].theorem,
-        )
-    return solutions[0]
+        selected = dict(selected)
+        selected["alignment_kind"] = match_kind
+        aligned.append(selected)
+    return aligned
 
 
 def _make_record(row: DatasetRow, candidate: dict[str, object]) -> dict[str, object]:
@@ -431,6 +478,11 @@ def _make_record(row: DatasetRow, candidate: dict[str, object]) -> dict[str, obj
         "unit_index": candidate["unit_index"],
         "unit_boundary": candidate["unit_boundary"],
         "invocation_index": candidate["invocation_index"],
+        "alignment_kind": candidate.get("alignment_kind", "exact"),
+        "target_state_matches_invocation": _normalized_text(
+            str(invocation.get("goalAfter", ""))
+        )
+        == _normalized_text(row.target_state),
         "state_sha256": SExprCache.row_state_sha256(row),
         "tactic_sha256": SExprCache.row_tactic_sha256(row),
         "target_state_sha256": SExprCache.row_target_state_sha256(row),
