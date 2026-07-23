@@ -78,6 +78,17 @@ def _checkout(
             raise RuntimeError(
                 f"Checkout has local modifications; refusing to overwrite: {destination}"
             )
+        print("Restoring the known Pantograph patch set before reapplying it.")
+        _run(
+            "git",
+            "restore",
+            "--source",
+            commit,
+            "--worktree",
+            "--",
+            *sorted(PANTOGRAPH_PATCHED_FILES),
+            cwd=destination,
+        )
         return
     _run("git", "fetch", "--depth=1", "origin", commit, cwd=destination)
     _run("git", "checkout", "--detach", commit, cwd=destination)
