@@ -72,6 +72,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--recycle-worker-files",
+        type=int,
+        default=10,
+        help=(
+            "Restart each Pantograph REPL after this many files to release Lean "
+            "frontend memory. Use 0 to disable recycling."
+        ),
+    )
+    parser.add_argument(
         "--no-resume",
         action="store_true",
         help="Re-extract rows even when their validated versioned cache exists.",
@@ -92,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         server_startup_timeout=args.server_timeout,
         file_timeout=args.file_timeout,
         workers=args.workers,
+        recycle_worker_files=args.recycle_worker_files,
     )
     try:
         summary = asyncio.run(extract_sexpressions(config))

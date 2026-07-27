@@ -52,6 +52,7 @@ class _FakeClient:
         self.files: list[str] = []
         self.started = False
         self.closed = False
+        self.close_calls = 0
 
     async def start(self):
         self.started = True
@@ -63,6 +64,7 @@ class _FakeClient:
 
     async def close(self):
         self.closed = True
+        self.close_calls += 1
 
 
 class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
@@ -374,6 +376,39 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["coverage"], 1.0)
         self.assertEqual(sorted(len(client.files) for client in clients), [1, 1])
         self.assertTrue(all(client.started and client.closed for client in clients))
+
+    async def test_top_level_recycles_worker_clients_after_bounded_file_count(self):
+        second_path = "Mathlib/Demo2.lean"
+        (self.source_root / second_path).write_text(self.source, encoding="utf-8")
+        second_row = DatasetRow(
+            **{
+                **self.rows[0].__dict__,
+                "file_path": second_path,
+                "row_index": 12,
+            }
+        )
+        client = _FakeClient(self._units())
+        with patch(
+            "maths_ai.gnn_inference.atp_lean_gnn.sexpr_extraction.iter_dataset_rows",
+            return_value=iter([self.rows[0], second_row]),
+        ):
+            summary = await extract_sexpressions(
+                SExprExtractionConfig(
+                    prepared_root=self.root / "prepared",
+                    source_root=self.source_root,
+                    pantograph_repl=self.root / "fake-repl",
+                    dataset_name="fake/dataset",
+                    splits=("train",),
+                    workers=1,
+                    recycle_worker_files=1,
+                    verify_source_commit=False,
+                ),
+                client_factory=lambda _config: client,
+            )
+
+        self.assertEqual(summary["coverage"], 1.0)
+        # Once after each file, then once more during top-level cleanup.
+        self.assertEqual(client.close_calls, 3)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ class SExprExtractionConfig:
     file_timeout: int = 600
     buffer_limit: int = 256 * 1024 * 1024
     workers: int = 1
+    recycle_worker_files: int = 10
     verify_source_commit: bool = True
 
 
@@ -698,6 +699,7 @@ async def extract_split_with_client(
     split: str,
     expected_commit: str = DATASET_MATHLIB_COMMIT,
     resume: bool = True,
+    recycle_worker_files: int = 0,
 ) -> dict[str, object]:
     clients = list(client) if isinstance(client, (list, tuple)) else [client]
     if not clients:
@@ -743,6 +745,7 @@ async def extract_split_with_client(
             job_queue.put_nowait(job)
 
         async def worker(worker_client) -> None:
+            processed_files = 0
             while True:
                 try:
                     file_index, file_path, theorem_groups = job_queue.get_nowait()
@@ -781,6 +784,15 @@ async def extract_split_with_client(
                     await result_queue.put((file_index, file_path, result))
                 finally:
                     job_queue.task_done()
+                    processed_files += 1
+                    if (
+                        recycle_worker_files > 0
+                        and processed_files % recycle_worker_files == 0
+                    ):
+                        # Lean frontend environments retain substantial memory
+                        # across files. Recycling bounds each REPL's lifetime;
+                        # process_file() starts it again for the next queued job.
+                        await worker_client.close()
 
         worker_tasks = [
             asyncio.create_task(worker(worker_client)) for worker_client in clients
@@ -821,6 +833,7 @@ async def extract_split_with_client(
         "source_commit": expected_commit,
         "split": split,
         "workers": len(clients),
+        "recycle_worker_files": recycle_worker_files,
         "attempted_files": len(file_groups),
         "compiled_files": compiled_files,
         "attempted_theorems": sum(len(groups) for groups in file_groups.values()),
@@ -850,6 +863,8 @@ def _git_head(source_root: Path) -> str:
 async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=None) -> dict[str, object]:
     if config.workers < 1:
         raise ValueError("workers must be at least 1.")
+    if config.recycle_worker_files < 0:
+        raise ValueError("recycle_worker_files cannot be negative.")
     source_root = Path(config.source_root).resolve()
     repl = Path(config.pantograph_repl).resolve()
     if not source_root.is_dir():
@@ -917,6 +932,7 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
                 split=split,
                 expected_commit=config.expected_commit,
                 resume=config.resume,
+                recycle_worker_files=config.recycle_worker_files,
             )
     finally:
         if started:
@@ -935,6 +951,7 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
         "pantograph_commit": config.expected_pantograph_commit,
         "pantograph_repl": str(repl),
         "workers": config.workers,
+        "recycle_worker_files": config.recycle_worker_files,
         "prepared_root": str(config.prepared_root),
         "splits": list(manifests),
         "manifests": manifests,
