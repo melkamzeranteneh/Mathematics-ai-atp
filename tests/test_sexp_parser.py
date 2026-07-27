@@ -263,6 +263,64 @@ def test_unknown_tagged_form_is_not_misparsed_as_application():
     assert [dag.nodes[node_id].label for node_id in root.children] == ["Nat", "x"]
 
 
+def test_model_application_preserves_argument_roles_and_positions():
+    dag = sexp_to_dag(
+        "(:app (:c Eq) "
+        "(:arg :implicit-type 0 (:c Nat)) "
+        "(:arg :explicit 1 (:fv FV0)) "
+        "(:arg :proof 2 (:proof-of (:c True))))"
+    )
+    root = dag.nodes[dag.expression_root_id]
+    arguments = [dag.nodes[node_id] for node_id in root.children[1:]]
+
+    assert root.label == ":app"
+    assert root.node_type == "sapp"
+    assert [node.label for node in arguments] == [":arg", ":arg", ":arg"]
+    assert [
+        [dag.nodes[child].label for child in argument.children[:2]]
+        for argument in arguments
+    ] == [
+        ["ArgRole::implicit-type", "ArgPosition:0"],
+        ["ArgRole::explicit", "ArgPosition:1"],
+        ["ArgRole::proof", "ArgPosition:2"],
+    ]
+
+
+def test_model_binder_preserves_role_and_debruijn_scope():
+    dag = sexp_to_dag(
+        "(:forall p :implicit (:sort Prop) "
+        "(:app (:c Eq) (:arg :explicit 0 0)))"
+    )
+    root = dag.nodes[dag.expression_root_id]
+    binder = dag.nodes[root.children[0]]
+    body = dag.nodes[root.children[2]]
+
+    assert dag.nodes[root.children[3]].label == "BinderRole::implicit"
+    assert dag.nodes[dag.nodes[body.children[1]].children[2]].id == binder.id
+
+
+def test_pantograph_raw_binder_role_is_accepted():
+    dag = sexp_to_dag("(:lambda x (:c Nat) 0 :strictImplicit)")
+    root = dag.nodes[dag.expression_root_id]
+    assert dag.nodes[root.children[3]].label == "BinderRole::strictImplicit"
+
+
+def test_pantograph_hypotheses_do_not_zip_with_text_branch_labels():
+    dag = proof_state_to_dag(
+        "case a.mk.mk\nx : Nat\nh : P x\n⊢ Q x",
+        goal_sexp="(:c GoalType)",
+        hyp_sexps=[("x", "(:c Nat)"), ("h", "(:c HypothesisType)")],
+    )
+    hypotheses = [node for node in dag.nodes if node.label == "Hyp"]
+
+    assert len(hypotheses) == 2
+    assert [
+        [dag.nodes[child].label for child in hypothesis.children]
+        for hypothesis in hypotheses
+    ] == [["x", "Nat"], ["h", "HypothesisType"]]
+    assert "case" not in get_node_labels(dag)
+
+
 @pytest.mark.parametrize(
     "sexp, expected_tag",
     [

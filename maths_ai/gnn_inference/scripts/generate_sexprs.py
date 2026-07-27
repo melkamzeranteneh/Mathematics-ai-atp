@@ -17,6 +17,8 @@ if __package__ in {None, ""}:
 
 from maths_ai.gnn_inference.atp_lean_gnn.dataset import DATASET_NAME
 from maths_ai.gnn_inference.atp_lean_gnn.sexpr_extraction import (
+    MODEL_PANTOGRAPH_COMMIT,
+    PANTOGRAPH_COMMIT,
     SExprExtractionConfig,
     extract_sexpressions,
 )
@@ -38,6 +40,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-name", default=DATASET_NAME)
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"])
     parser.add_argument("--max-items", type=int, default=None)
+    parser.add_argument(
+        "--theorem",
+        default=None,
+        help="Extract only rows belonging to this exact theorem name.",
+    )
     parser.add_argument(
         "--source-root",
         type=Path,
@@ -85,6 +92,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Re-extract rows even when their validated versioned cache exists.",
     )
+    parser.add_argument(
+        "--model-sexprs",
+        action="store_true",
+        help=(
+            "Compile with the fork's Lean-native normalizer and write versioned "
+            "model_sexpr_v1 sidecars. Existing validated raw caches are required "
+            "and are never overwritten."
+        ),
+    )
     return parser
 
 
@@ -102,6 +118,11 @@ def main(argv: list[str] | None = None) -> int:
         file_timeout=args.file_timeout,
         workers=args.workers,
         recycle_worker_files=args.recycle_worker_files,
+        model_sexprs=args.model_sexprs,
+        expected_pantograph_commit=(
+            MODEL_PANTOGRAPH_COMMIT if args.model_sexprs else PANTOGRAPH_COMMIT
+        ),
+        theorem=args.theorem,
     )
     try:
         summary = asyncio.run(extract_sexpressions(config))

@@ -2,9 +2,11 @@
 
 The LeanDojo dataset was traced from Mathlib commit
 `29dcec074de168ac2bf835a77ef68bbe069194c5` with Lean
-`v4.10.0-rc1`. The extractor also pins Pantograph commit
-`22ddfaaf2124d323dec59220f567273f01623458`. A newer checkout is not
-replay-compatible.
+`v4.10.0-rc1`. The extractor pins commit
+`44c7c49dcff50b834d1dd6eb768e252e0329cca2` from the persistent
+[`jajos12/Pantograph`](https://github.com/jajos12/Pantograph/tree/gnn-sexpr-v410)
+fork. That commit contains both source-invocation tracing and the Lean-native
+model S-expression serializer; no uncommitted patching is required.
 
 Create the pinned environment once:
 
@@ -29,3 +31,20 @@ tactic, after-state, source file, and repository commit.  It never constructs
 a replacement goal and never executes the dataset tactics.  Ambiguous matches
 are failures rather than guessed cache entries.  Row caches are atomic and the
 command is resumable.
+
+After raw extraction, generate normalized sidecars without changing any raw
+record:
+
+```bash
+python -m maths_ai.gnn_inference.scripts.generate_sexprs \
+  --prepared-root maths_ai/_support_files/artifacts/prepared/v1 \
+  --source-root maths_ai/_support_files/sexpr_environment/mathlib4 \
+  --pantograph-repl maths_ai/_support_files/sexpr_environment/Pantograph/.lake/build/bin/repl \
+  --splits train val test \
+  --model-sexprs
+```
+
+Sidecars are stored under
+`{prepared_root}/{split}/model_sexpr_v1/{row_index}.json`. Each contains the
+SHA-256 digest of its corresponding raw record, so stale normalization is
+rejected automatically while the costly raw extraction remains reusable.

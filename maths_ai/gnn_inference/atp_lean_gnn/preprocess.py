@@ -29,6 +29,7 @@ from .cache import (
 )
 from .dataset import DATASET_NAME, DatasetRow, canonicalize_split_name, iter_dataset_rows
 from .preparation import (
+    ModelSExprCache,
     prepare_example,
     SExprCache,
 )
@@ -51,6 +52,7 @@ class PreprocessConfig:
     force: bool = False
     use_sexpr: bool = False
     sexpr_cache_root: Path | None = None
+    sexpr_variant: str = "raw"
     project_path: str = "maths_ai/lean_mathlib"
 
 
@@ -94,6 +96,7 @@ def _build_sexpr_map(
     use_sexpr: bool,
     sexpr_cache: Optional[SExprCache] = None,
     split_label: str = "",
+    sexpr_variant: str = "raw",
 ) -> dict[int, dict]:
     """Load validated Phase 2 records without silently generating or falling back."""
     if not use_sexpr:
@@ -103,23 +106,32 @@ def _build_sexpr_map(
 
     if sexpr_cache is None:
         raise ValueError("S-expression mode requires a Phase 2 cache root.")
+    if sexpr_variant not in {"raw", "model"}:
+        raise ValueError("sexpr_variant must be either 'raw' or 'model'.")
+    model_cache = (
+        ModelSExprCache(sexpr_cache.output_root)
+        if sexpr_variant == "model"
+        else None
+    )
     theorem_rows: dict[str, list[DatasetRow]] = {}
     for row in rows:
         theorem_rows.setdefault(row.theorem, []).append(row)
     for grouped_rows in theorem_rows.values():
-        for step_index, row in enumerate(
-            sorted(grouped_rows, key=lambda item: item.row_index)
-        ):
-            cached = sexpr_cache.load_for_row(
-                row,
-                step_index=step_index,
-                extractor_version=SExprCache.EXTRACTOR_VERSION,
+        for row in sorted(grouped_rows, key=lambda item: item.row_index):
+            raw = sexpr_cache.load_for_row(
+                row, extractor_version=SExprCache.EXTRACTOR_VERSION
+            )
+            cached = (
+                model_cache.load_for_raw_record(row.split, row.row_index, raw)
+                if model_cache is not None and raw is not None
+                else raw
             )
             if cached is not None:
                 sexpr_map[row.row_index] = cached
 
     console_print(
-        f"    Validated S-expression cache: {len(sexpr_map)}/{len(rows)} rows"
+        f"    Validated {sexpr_variant} S-expression cache: "
+        f"{len(sexpr_map)}/{len(rows)} rows"
     )
 
     return sexpr_map
@@ -133,13 +145,16 @@ def scan_train_split(
     sexpr_cache: Optional[SExprCache],
     project_path: str = "maths_ai/lean_mathlib",
     use_sexpr: bool = False,
+    sexpr_variant: str = "raw",
 ) -> tuple[dict[str, int], dict[str, int], SplitReport]:
     node_labels: set[str] = set()
     tactic_names: list[str] = []
     report = SplitReport(split="train")
 
     rows = _load_rows(dataset_name, "train", sample_per_split)
-    sexpr_map = _build_sexpr_map(rows, project_path, use_sexpr, sexpr_cache, "train")
+    sexpr_map = _build_sexpr_map(
+        rows, project_path, use_sexpr, sexpr_cache, "train", sexpr_variant
+    )
 
     for row in rows:
         try:
@@ -208,6 +223,7 @@ def process_split(
     sexpr_cache: Optional[SExprCache],
     project_path: str = "maths_ai/lean_mathlib",
     use_sexpr: bool = False,
+    sexpr_variant: str = "raw",
 ) -> tuple[SplitReport, dict[str, object]]:
     import torch
 
@@ -217,7 +233,9 @@ def process_split(
     report = SplitReport(split=split)
 
     rows = _load_rows(dataset_name, split, sample_per_split)
-    sexpr_map = _build_sexpr_map(rows, project_path, use_sexpr, sexpr_cache, split)
+    sexpr_map = _build_sexpr_map(
+        rows, project_path, use_sexpr, sexpr_cache, split, sexpr_variant
+    )
 
     for row in rows:
         try:
@@ -348,6 +366,7 @@ def run_preprocessing(config: PreprocessConfig) -> dict[str, object]:
         sexpr_cache=sexpr_cache,
         project_path=config.project_path,
         use_sexpr=config.use_sexpr,
+        sexpr_variant=config.sexpr_variant,
     )
     console_print(
         f"  Train scan complete: attempted={train_scan.attempted_count}, "
@@ -377,6 +396,7 @@ def run_preprocessing(config: PreprocessConfig) -> dict[str, object]:
             sexpr_cache=sexpr_cache,
             project_path=config.project_path,
             use_sexpr=config.use_sexpr,
+            sexpr_variant=config.sexpr_variant,
         )
         split_reports[split] = report
         manifests[split] = manifest
@@ -417,6 +437,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-sexpr", action="store_false", dest="use_sexpr", help="Disable S-expressions, use text parser only")
     parser.add_argument("--project-path", type=str, default="maths_ai/lean_mathlib", help="Path to Lean project for Pantograph")
     parser.add_argument("--sexpr-cache-root", type=str, default=None, help="Validated cache root produced by generate_sexprs")
+    parser.add_argument(
+        "--sexpr-variant",
+        choices=("raw", "model"),
+        default="raw",
+        help="Consume source-faithful raw S-expressions or normalized model sidecars.",
+    )
     return parser
 
 
@@ -435,6 +461,7 @@ def main(argv: list[str] | None = None) -> int:
             use_sexpr=args.use_sexpr,
             sexpr_cache_root=None if args.sexpr_cache_root is None else Path(args.sexpr_cache_root),
             project_path=args.project_path,
+            sexpr_variant=args.sexpr_variant,
         )
         run_preprocessing(config)
     except (FileExistsError, RuntimeError, ValueError) as exc:

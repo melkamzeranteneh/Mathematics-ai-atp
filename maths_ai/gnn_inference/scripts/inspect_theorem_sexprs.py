@@ -17,7 +17,10 @@ from maths_ai.gnn_inference.atp_lean_gnn.dataset import (
     canonicalize_split_name,
     iter_dataset_rows,
 )
-from maths_ai.gnn_inference.atp_lean_gnn.preparation import SExprCache
+from maths_ai.gnn_inference.atp_lean_gnn.preparation import (
+    ModelSExprCache,
+    SExprCache,
+)
 from maths_ai.gnn_inference.atp_lean_gnn.sexpr_inspection import (
     build_theorem_trace,
     write_theorem_trace,
@@ -36,6 +39,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--theorem", required=True, help="Exact dataset theorem name.")
     parser.add_argument("--split", default="train")
     parser.add_argument("--dataset-name", default=DATASET_NAME)
+    parser.add_argument(
+        "--include-model",
+        action="store_true",
+        help="Include digest-validated model_sexpr_v1 sidecars beside raw forms.",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -58,6 +66,9 @@ def main(argv: list[str] | None = None) -> int:
             theorem=args.theorem,
             split=split,
             cache=cache,
+            model_cache=(
+                ModelSExprCache(args.prepared_root) if args.include_model else None
+            ),
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"S-expression inspection failed: {exc}", file=sys.stderr)

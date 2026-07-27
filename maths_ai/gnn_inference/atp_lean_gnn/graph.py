@@ -308,14 +308,22 @@ def _sexp_walk(sexp, ctx: list[int], dag: DAGBuilder) -> int:
 
     head = sexp[0]
 
-    # Binder: (:forall name type body) or (:lambda name type body).
+    # Binder: raw Pantograph uses ``(:forall name type body [role])`` while
+    # model S-expressions use ``(:forall name role type body)``.
     # The binder is not in scope in its own type, but is index 0 in its body.
     if head in (":forall", ":lambda"):
-        if len(sexp) != 4:
-            raise ValueError(f"Malformed {head} S-expression: expected 4 fields, got {len(sexp)}")
+        if len(sexp) not in (4, 5):
+            raise ValueError(
+                f"Malformed {head} S-expression: expected 4 or 5 fields, got {len(sexp)}"
+            )
         name = sexp[1]
-        ty = sexp[2]
-        body = sexp[3]
+        role = None
+        if len(sexp) == 5 and str(sexp[2]).startswith(":"):
+            role, ty, body = sexp[2:]
+        else:
+            ty, body = sexp[2:4]
+            if len(sexp) == 5:
+                role = sexp[4]
         binder_kind = BINDER_KIND_FORALL if head == ":forall" else BINDER_KIND_LAMBDA
 
         var_id = dag.create_bound_variable(
@@ -326,8 +334,12 @@ def _sexp_walk(sexp, ctx: list[int], dag: DAGBuilder) -> int:
         ty_id = _sexp_walk(ty, ctx, dag)
         body_id = _sexp_walk(body, [var_id, *ctx], dag)
 
-        # (:forall name type body) — 3 children
-        return dag.get_or_create(head, (var_id, ty_id, body_id), node_type="sbinder")
+        children = [var_id, ty_id, body_id]
+        if role is not None:
+            children.append(
+                dag.get_or_create(f"BinderRole:{role}", (), node_type="sconst")
+            )
+        return dag.get_or_create(head, tuple(children), node_type="sbinder")
 
     # Let binder: (:let name type value body). The name is in scope only in
     # the body; neither its type nor defining value may refer to itself.
@@ -360,7 +372,13 @@ def _sexp_walk(sexp, ctx: list[int], dag: DAGBuilder) -> int:
         if len(sexp) != 2:
             raise ValueError(f"Malformed :sort S-expression: expected 2 fields, got {len(sexp)}")
         n = sexp[1]
-        label = "Prop" if n == "0" else "Type" if n == "1" else f"Sort-{n}"
+        label = (
+            "Prop"
+            if n in ("0", "Prop")
+            else "Type"
+            if n in ("1", "Type")
+            else f"Sort-{n}"
+        )
         return dag.get_or_create(label, (), node_type="type")
 
     # Free variable: (:fv Name)
@@ -405,6 +423,43 @@ def _sexp_walk(sexp, ctx: list[int], dag: DAGBuilder) -> int:
             (structure_id, index_id, expression_id),
             node_type="sapp",
         )
+
+    # Lean-native model application. Each argument wrapper records both its
+    # semantic role and original application position.
+    if head == ":app":
+        if len(sexp) < 2:
+            raise ValueError("Malformed :app S-expression: expected a function.")
+        children = tuple(_sexp_walk(item, ctx, dag) for item in sexp[1:])
+        return dag.get_or_create(":app", children, node_type="sapp")
+
+    if head == ":arg":
+        if len(sexp) not in (3, 4):
+            raise ValueError(
+                f"Malformed :arg S-expression: expected 3 or 4 fields, got {len(sexp)}"
+            )
+        role, position = sexp[1:3]
+        children = [
+            dag.get_or_create(f"ArgRole:{role}", (), node_type="sconst"),
+            dag.get_or_create(f"ArgPosition:{position}", (), node_type="sconst"),
+        ]
+        if len(sexp) == 4:
+            children.append(_sexp_walk(sexp[3], ctx, dag))
+        return dag.get_or_create(":arg", tuple(children), node_type="sapp")
+
+    if head in (":instance-of", ":proof-of"):
+        if len(sexp) != 2:
+            raise ValueError(
+                f"Malformed {head} S-expression: expected 2 fields, got {len(sexp)}"
+            )
+        child = _sexp_walk(sexp[1], ctx, dag)
+        return dag.get_or_create(head, (child,), node_type="meta")
+
+    if head == ":metavar":
+        if len(sexp) != 1:
+            raise ValueError(
+                f"Malformed :metavar S-expression: expected 1 field, got {len(sexp)}"
+            )
+        return dag.get_or_create(":metavar", (), node_type="meta")
 
     # Preserve unknown tagged Lean expression forms as tagged structural
     # nodes. This is safer than treating the tag itself as a callable term.
@@ -474,14 +529,13 @@ def proof_state_to_dag(
         goal_expr_id = dag.expression_root_id
 
         root_ids: list[int] = []
-        for hyp, (hyp_name, hyp_sexp) in zip(parsed.hypotheses, hyp_sexps):
-            name_node = dag.get_or_create(hyp_name or hyp.name, ())
+        # Pantograph's local context is authoritative here. Text states may
+        # contain branch labels such as ``case a.mk`` which are not hypotheses;
+        # zipping the two sources shifted every following type.
+        for hyp_name, hyp_sexp in hyp_sexps:
+            name_node = dag.get_or_create(hyp_name or "_", (), node_type="var")
             if hyp_sexp:
                 type_node = _sexp_walk(parse_sexp_string(hyp_sexp), [], dag)
-            elif hyp.type_expr:
-                from .parser import ExprParser
-                _hyp_parser = ExprParser(dag)
-                type_node = _hyp_parser.parse(hyp.type_expr)
             else:
                 type_node = dag.get_or_create("?", ())
             hyp_node = dag.get_or_create("Hyp", (name_node, type_node))

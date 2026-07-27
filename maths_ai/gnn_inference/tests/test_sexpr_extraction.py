@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from maths_ai.gnn_inference.atp_lean_gnn.dataset import DatasetRow
 from maths_ai.gnn_inference.atp_lean_gnn.preparation import (
+    ModelSExprCache,
     SExprCache,
     SExprUnavailableError,
     prepare_example,
@@ -24,12 +25,22 @@ from maths_ai.gnn_inference.atp_lean_gnn.sexpr_extraction import (
 
 def _goal(target: str, *names: str) -> dict[str, object]:
     return {
-        "target": {"pp": target, "sexp": f"((:c {target}) 0)"},
+        "target": {
+            "pp": target,
+            "sexp": f"((:c {target}) 0)",
+            "modelSexp": f"(:app (:c {target}) (:arg :explicit 0 (:fv FV0)))",
+            "modelSexpVersion": 1,
+        },
         "vars": [
             {
                 "name": f"internal_{name}",
                 "userName": name,
-                "type": {"pp": "Prop", "sexp": "(:sort 0)"},
+                "type": {
+                    "pp": "Prop",
+                    "sexp": "(:sort 0)",
+                    "modelSexp": "(:sort Prop)",
+                    "modelSexpVersion": 1,
+                },
             }
             for name in names
         ],
@@ -160,6 +171,46 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manifest["cached_rows"], 2)
         self.assertEqual(manifest["compiled_files"], 0)
         self.assertEqual(resumed.files, [])
+
+    async def test_model_enrichment_writes_digest_bound_sidecars_without_rewriting_raw(self):
+        await self._extract(_FakeClient(self._units()))
+        raw_before = self.cache.load("train", 10)
+        model_cache = ModelSExprCache(self.root / "prepared")
+
+        manifest = await extract_split_with_client(
+            _FakeClient(self._units()),
+            rows=self.rows,
+            cache=self.cache,
+            model_cache=model_cache,
+            prepared_root=self.root / "prepared",
+            source_root=self.source_root,
+            split="train",
+        )
+
+        sidecar = model_cache.load_for_raw_record("train", 10, raw_before)
+        self.assertEqual(manifest["extractor_version"], "lean-model-sexp-v1")
+        self.assertEqual(manifest["extracted_rows"], 2)
+        self.assertEqual(
+            sidecar["goal_sexp"],
+            "(:app (:c First) (:arg :explicit 0 (:fv FV0)))",
+        )
+        self.assertEqual(
+            sidecar["hyp_sexps"],
+            [
+                {
+                    "name": "p",
+                    "internal_name": "internal_p",
+                    "sexp": "(:sort Prop)",
+                }
+            ],
+        )
+        self.assertEqual(self.cache.load("train", 10), raw_before)
+
+        changed_raw = dict(raw_before)
+        changed_raw["goal_sexp"] = "(:c Changed)"
+        self.assertIsNone(
+            model_cache.load_for_raw_record("train", 10, changed_raw)
+        )
 
     async def test_target_state_change_invalidates_cache_and_alignment(self):
         await self._extract(_FakeClient(self._units()))

@@ -120,6 +120,73 @@ class SExprCache:
         return payload
 
 
+class ModelSExprCache:
+    """Versioned normalized S-expressions derived from a validated raw record.
+
+    These sidecars deliberately live beside, rather than replace, the expensive
+    source-faithful cache.  A sidecar is accepted only while its raw-record
+    digest still matches, so normalization can evolve without invalidating raw
+    extraction.
+    """
+
+    SCHEMA_VERSION = 1
+    NORMALIZATION = "lean-model-sexp-v1"
+
+    def __init__(self, output_root: Path, enabled: bool = True):
+        self.output_root = Path(output_root)
+        self.enabled = enabled
+
+    @staticmethod
+    def raw_record_sha256(raw_record: dict) -> str:
+        encoded = json.dumps(
+            raw_record,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _sidecar_dir(self, split: str) -> Path:
+        directory = self.output_root / split / "model_sexpr_v1"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def load(self, split: str, row_index: int) -> Optional[dict]:
+        path = self._sidecar_dir(split) / f"{row_index:09d}.json"
+        if not path.exists():
+            return None
+        try:
+            with path.open(encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception:
+            return None
+        if (
+            payload.get("schema_version") != self.SCHEMA_VERSION
+            or payload.get("normalization") != self.NORMALIZATION
+        ):
+            return None
+        return payload
+
+    def load_for_raw_record(
+        self, split: str, row_index: int, raw_record: dict
+    ) -> Optional[dict]:
+        payload = self.load(split, row_index)
+        if payload is None:
+            return None
+        if payload.get("raw_record_sha256") != self.raw_record_sha256(raw_record):
+            return None
+        return payload
+
+    def save(self, split: str, row_index: int, data: dict) -> None:
+        path = self._sidecar_dir(split) / f"{row_index:09d}.json"
+        temporary = path.with_suffix(".json.tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+
+
 class SExprUnavailableError(RuntimeError):
     """Raised when strict S-expression mode has no validated cache record."""
 

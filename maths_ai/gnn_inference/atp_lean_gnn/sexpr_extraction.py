@@ -12,14 +12,15 @@ from pathlib import Path
 from typing import Iterable
 
 from .dataset import DATASET_NAME, DatasetRow, canonicalize_split_name, iter_dataset_rows
-from .preparation import SExprCache
+from .preparation import ModelSExprCache, SExprCache
 from .reporting import console_print
 from .state import parse_state
 
 
 EXTRACTION_VERSION = SExprCache.EXTRACTOR_VERSION
 DATASET_MATHLIB_COMMIT = "29dcec074de168ac2bf835a77ef68bbe069194c5"
-PANTOGRAPH_COMMIT = "22ddfaaf2124d323dec59220f567273f01623458"
+MODEL_PANTOGRAPH_COMMIT = "44c7c49dcff50b834d1dd6eb768e252e0329cca2"
+PANTOGRAPH_COMMIT = MODEL_PANTOGRAPH_COMMIT
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,8 @@ class SExprExtractionConfig:
     workers: int = 1
     recycle_worker_files: int = 10
     verify_source_commit: bool = True
+    model_sexprs: bool = False
+    theorem: str | None = None
 
 
 class SourceExtractionError(RuntimeError):
@@ -72,12 +75,14 @@ class PantographInvocationClient:
         startup_timeout: int = 120,
         file_timeout: int = 600,
         buffer_limit: int = 256 * 1024 * 1024,
+        capture_model_sexprs: bool = False,
     ) -> None:
         self.source_root = Path(source_root).resolve()
         self.pantograph_repl = Path(pantograph_repl).resolve()
         self.startup_timeout = startup_timeout
         self.file_timeout = file_timeout
         self.buffer_limit = buffer_limit
+        self.capture_model_sexprs = capture_model_sexprs
         self.proc: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self.stderr_tail: list[str] = []
@@ -110,7 +115,10 @@ class PantographInvocationClient:
             await self.close()
             raise RuntimeError(f"Pantograph emitted an invalid ready signal: {ready!r}")
         self._stderr_task = asyncio.create_task(self._drain_stderr())
-        await self.call("options.set", {"printExprAST": True}, timeout=self.startup_timeout)
+        options = {"printExprAST": True}
+        if self.capture_model_sexprs:
+            options["printExprModelAST"] = True
+        await self.call("options.set", options, timeout=self.startup_timeout)
         return self
 
     async def _drain_stderr(self) -> None:
@@ -549,8 +557,106 @@ def _make_record(row: DatasetRow, candidate: dict[str, object]) -> dict[str, obj
     }
 
 
+def _make_model_record(
+    row: DatasetRow,
+    candidate: dict[str, object],
+    raw_record: dict[str, object],
+) -> dict[str, object]:
+    invocation = candidate["invocation"]
+    assert isinstance(invocation, dict)
+    goals = invocation.get("goalsBefore")
+    if not isinstance(goals, list) or len(goals) != 1:
+        raise SourceExtractionError(
+            "Normalized capture requires exactly one active goal.",
+            phase="model_goal_cardinality",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        )
+    goal = goals[0]
+    if not isinstance(goal, dict):
+        raise SourceExtractionError(
+            "Normalized goal is invalid.",
+            phase="model_sexpr_capture",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        )
+    target = goal.get("target")
+    variables = goal.get("vars")
+    if (
+        not isinstance(target, dict)
+        or not isinstance(target.get("modelSexp"), str)
+        or target.get("modelSexpVersion") != ModelSExprCache.SCHEMA_VERSION
+    ):
+        raise SourceExtractionError(
+            "Goal model S-expression is missing or has an unsupported version.",
+            phase="model_sexpr_capture",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        )
+    if not isinstance(variables, list):
+        raise SourceExtractionError(
+            "Normalized goal variables are missing.",
+            phase="model_sexpr_capture",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        )
+
+    hypotheses: list[dict[str, str]] = []
+    for variable in variables:
+        variable_type = variable.get("type") if isinstance(variable, dict) else None
+        if (
+            not isinstance(variable, dict)
+            or not isinstance(variable_type, dict)
+            or not isinstance(variable_type.get("modelSexp"), str)
+            or variable_type.get("modelSexpVersion")
+            != ModelSExprCache.SCHEMA_VERSION
+        ):
+            raise SourceExtractionError(
+                "Hypothesis model S-expression is missing or unsupported.",
+                phase="model_sexpr_capture",
+                theorem=row.theorem,
+                row_index=row.row_index,
+            )
+        hypotheses.append(
+            {
+                "name": str(variable.get("userName", "_")),
+                "internal_name": str(variable.get("name", "")),
+                "sexp": variable_type["modelSexp"],
+            }
+        )
+
+    return {
+        "schema_version": ModelSExprCache.SCHEMA_VERSION,
+        "normalization": ModelSExprCache.NORMALIZATION,
+        "dataset": row.dataset_name,
+        "split": row.split,
+        "row_index": row.row_index,
+        "theorem": row.theorem,
+        "repo_commit": row.repo_commit,
+        "file_path": row.file_path,
+        "pantograph_commit": MODEL_PANTOGRAPH_COMMIT,
+        "raw_record_sha256": ModelSExprCache.raw_record_sha256(raw_record),
+        "goal_sexp": target["modelSexp"],
+        "hyp_sexps": hypotheses,
+    }
+
+
 def _row_is_cached(cache: SExprCache, row: DatasetRow) -> bool:
     record = cache.load_for_row(row, extractor_version=EXTRACTION_VERSION)
+    return (
+        record is not None
+        and isinstance(record.get("goal_sexp"), str)
+        and isinstance(record.get("hyp_sexps"), list)
+    )
+
+
+def _row_is_model_cached(
+    raw_cache: SExprCache, model_cache: ModelSExprCache, row: DatasetRow
+) -> bool:
+    raw_record = raw_cache.load_for_row(row, extractor_version=EXTRACTION_VERSION)
+    if raw_record is None:
+        return False
+    record = model_cache.load_for_raw_record(row.split, row.row_index, raw_record)
     return (
         record is not None
         and isinstance(record.get("goal_sexp"), str)
@@ -615,7 +721,13 @@ async def _extract_file_with_client(
     source_root: Path,
     expected_commit: str,
     resume: bool,
+    model_cache: ModelSExprCache | None = None,
 ) -> dict[str, object]:
+    def row_is_cached(row: DatasetRow) -> bool:
+        if model_cache is not None:
+            return _row_is_model_cached(cache, model_cache, row)
+        return _row_is_cached(cache, row)
+
     file_rows = [
         row for theorem_rows in theorem_groups.values() for row in theorem_rows
     ]
@@ -646,7 +758,7 @@ async def _extract_file_with_client(
         uncached_rows = [
             row
             for row in theorem_rows
-            if not (resume and _row_is_cached(cache, row))
+            if not (resume and row_is_cached(row))
         ]
         if not uncached_rows:
             continue
@@ -663,16 +775,44 @@ async def _extract_file_with_client(
                     theorem=theorem,
                 )
             aligned = _align_rows(theorem_rows, candidates)
-            records = [
-                _make_record(row, candidate)
-                for row, candidate in zip(theorem_rows, aligned)
-            ]
+            if model_cache is None:
+                records = [
+                    _make_record(row, candidate)
+                    for row, candidate in zip(theorem_rows, aligned)
+                ]
+            else:
+                raw_records = [
+                    cache.load_for_row(row, extractor_version=EXTRACTION_VERSION)
+                    for row in theorem_rows
+                ]
+                missing_raw = [
+                    row.row_index
+                    for row, raw_record in zip(theorem_rows, raw_records)
+                    if raw_record is None
+                ]
+                if missing_raw:
+                    raise SourceExtractionError(
+                        "Normalized enrichment requires validated raw records; "
+                        f"missing rows: {missing_raw}",
+                        phase="raw_cache_missing",
+                        theorem=theorem,
+                    )
+                records = [
+                    _make_model_record(row, candidate, raw_record)
+                    for row, candidate, raw_record in zip(
+                        theorem_rows, aligned, raw_records
+                    )
+                    if raw_record is not None
+                ]
             # Validate every row in the theorem before committing any of them,
             # so a capture error cannot leave a partial group.
             uncached_indices = {row.row_index for row in uncached_rows}
             for row, record in zip(theorem_rows, records):
                 if row.row_index in uncached_indices:
-                    cache.save(row.split, row.row_index, record)
+                    if model_cache is None:
+                        cache.save(row.split, row.row_index, record)
+                    else:
+                        model_cache.save(row.split, row.row_index, record)
                     extracted_rows += 1
         except Exception as caught:
             failure = _failure_record(caught, file_path, theorem, uncached_rows)
@@ -700,11 +840,14 @@ async def extract_split_with_client(
     expected_commit: str = DATASET_MATHLIB_COMMIT,
     resume: bool = True,
     recycle_worker_files: int = 0,
+    model_cache: ModelSExprCache | None = None,
 ) -> dict[str, object]:
     clients = list(client) if isinstance(client, (list, tuple)) else [client]
     if not clients:
         raise ValueError("At least one Pantograph client is required.")
-    report_root = Path(prepared_root) / "sexpr_extraction"
+    report_root = Path(prepared_root) / (
+        "model_sexpr_extraction_v1" if model_cache is not None else "sexpr_extraction"
+    )
     failure_path = report_root / "failures" / f"{split}.jsonl"
     failure_path.parent.mkdir(parents=True, exist_ok=True)
     failure_path.write_text("", encoding="utf-8")
@@ -719,7 +862,12 @@ async def extract_split_with_client(
         cached_rows = extracted_rows = compiled_files = 0
         failed_rows = len(rows)
     else:
-        cached_rows = sum(1 for row in rows if resume and _row_is_cached(cache, row))
+        def row_is_cached(row: DatasetRow) -> bool:
+            if model_cache is not None:
+                return _row_is_model_cached(cache, model_cache, row)
+            return _row_is_cached(cache, row)
+
+        cached_rows = sum(1 for row in rows if resume and row_is_cached(row))
         extracted_rows = failed_rows = compiled_files = 0
         failure_phases: Counter[str] = Counter()
         console_print(f"  [{split}] source extraction: {len(file_groups)} files, {len(rows)} rows")
@@ -727,7 +875,9 @@ async def extract_split_with_client(
         pending_jobs = []
         for file_index, (file_path, theorem_groups) in enumerate(file_groups.items(), 1):
             file_rows = [row for theorem_rows in theorem_groups.values() for row in theorem_rows]
-            uncached_file_rows = [row for row in file_rows if not (resume and _row_is_cached(cache, row))]
+            uncached_file_rows = [
+                row for row in file_rows if not (resume and row_is_cached(row))
+            ]
             if not uncached_file_rows:
                 continue
             pending_jobs.append((file_index, file_path, theorem_groups))
@@ -761,13 +911,14 @@ async def extract_split_with_client(
                             source_root=source_root,
                             expected_commit=expected_commit,
                             resume=resume,
+                            model_cache=model_cache,
                         )
                     except Exception as caught:
                         file_rows = [
                             row
                             for theorem_rows in theorem_groups.values()
                             for row in theorem_rows
-                            if not (resume and _row_is_cached(cache, row))
+                            if not (resume and row_is_cached(row))
                         ]
                         failure = _failure_record(
                             caught, file_path, "", file_rows
@@ -827,8 +978,14 @@ async def extract_split_with_client(
     attempted_rows = len(rows)
     covered_rows = cached_rows + extracted_rows
     manifest: dict[str, object] = {
-        "schema_version": SExprCache.SCHEMA_VERSION,
-        "extractor_version": EXTRACTION_VERSION,
+        "schema_version": (
+            ModelSExprCache.SCHEMA_VERSION
+            if model_cache is not None
+            else SExprCache.SCHEMA_VERSION
+        ),
+        "extractor_version": (
+            ModelSExprCache.NORMALIZATION if model_cache is not None else EXTRACTION_VERSION
+        ),
         "dataset": rows[0].dataset_name if rows else None,
         "source_commit": expected_commit,
         "split": split,
@@ -901,6 +1058,7 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
                 startup_timeout=config.server_startup_timeout,
                 file_timeout=config.file_timeout,
                 buffer_limit=config.buffer_limit,
+                capture_model_sexprs=config.model_sexprs,
             )
         else:
             client = client_factory(config)
@@ -908,6 +1066,11 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
                 client = await client
         clients.append(client)
     cache = SExprCache(config.prepared_root, str(source_root), enabled=True)
+    model_cache = (
+        ModelSExprCache(config.prepared_root, enabled=True)
+        if config.model_sexprs
+        else None
+    )
     manifests: dict[str, dict[str, object]] = {}
     started = False
     try:
@@ -920,6 +1083,12 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
                     sample_limit=config.sample_per_split,
                 )
             )
+            if config.theorem is not None:
+                rows = [row for row in rows if row.theorem == config.theorem]
+                if not rows:
+                    raise RuntimeError(
+                        f"Theorem '{config.theorem}' was not found in split '{split}'."
+                    )
             if not started:
                 await asyncio.gather(*(client.start() for client in clients))
                 started = True
@@ -933,6 +1102,7 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
                 expected_commit=config.expected_commit,
                 resume=config.resume,
                 recycle_worker_files=config.recycle_worker_files,
+                model_cache=model_cache,
             )
     finally:
         if started:
@@ -943,8 +1113,14 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
     attempted_rows = sum(int(item["attempted_rows"]) for item in manifests.values())
     covered_rows = sum(int(item["covered_rows"]) for item in manifests.values())
     summary: dict[str, object] = {
-        "schema_version": SExprCache.SCHEMA_VERSION,
-        "extractor_version": EXTRACTION_VERSION,
+        "schema_version": (
+            ModelSExprCache.SCHEMA_VERSION
+            if model_cache is not None
+            else SExprCache.SCHEMA_VERSION
+        ),
+        "extractor_version": (
+            ModelSExprCache.NORMALIZATION if model_cache is not None else EXTRACTION_VERSION
+        ),
         "dataset": config.dataset_name,
         "source_root": str(source_root),
         "source_commit": config.expected_commit,
@@ -960,7 +1136,11 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
         "failed_rows": attempted_rows - covered_rows,
         "coverage": covered_rows / attempted_rows if attempted_rows else 0.0,
     }
-    report_root = Path(config.prepared_root) / "sexpr_extraction"
+    report_root = Path(config.prepared_root) / (
+        "model_sexpr_extraction_v1"
+        if model_cache is not None
+        else "sexpr_extraction"
+    )
     _write_json(report_root / "summary.json", summary)
     _write_summary_markdown(report_root / "summary.md", summary)
     return summary

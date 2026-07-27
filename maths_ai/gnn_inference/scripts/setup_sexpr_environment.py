@@ -10,8 +10,9 @@ from pathlib import Path
 
 MATHLIB_URL = "https://github.com/leanprover-community/mathlib4.git"
 MATHLIB_COMMIT = "29dcec074de168ac2bf835a77ef68bbe069194c5"
-PANTOGRAPH_URL = "https://github.com/leanprover/Pantograph.git"
-PANTOGRAPH_COMMIT = "22ddfaaf2124d323dec59220f567273f01623458"
+PANTOGRAPH_URL = "https://github.com/jajos12/Pantograph.git"
+PANTOGRAPH_COMMIT = "44c7c49dcff50b834d1dd6eb768e252e0329cca2"
+PANTOGRAPH_UPSTREAM_COMMIT = "22ddfaaf2124d323dec59220f567273f01623458"
 LEAN_TOOLCHAIN = "leanprover/lean4:v4.10.0-rc1"
 PANTOGRAPH_PATCHED_FILES = {
     "Pantograph/Frontend/Basic.lean",
@@ -63,6 +64,10 @@ def _checkout(
         _run("git", "clone", "--filter=blob:none", "--no-checkout", url, str(destination))
     if not (destination / ".git").exists():
         raise RuntimeError(f"Refusing to reuse non-git directory: {destination}")
+    current_origin = _output("git", "remote", "get-url", "origin", cwd=destination)
+    if current_origin != url:
+        print(f"Updating checkout origin: {current_origin} -> {url}")
+        _run("git", "remote", "set-url", "origin", url, cwd=destination)
     dirty = _status_porcelain(destination)
     worktree_is_empty = not any(
         path.name != ".git" for path in destination.iterdir()
@@ -71,7 +76,8 @@ def _checkout(
         changed_paths = {line[3:] for line in dirty.splitlines() if len(line) > 3}
         is_expected_patch = (
             allow_existing_patch
-            and _output("git", "rev-parse", "HEAD", cwd=destination) == commit
+            and _output("git", "rev-parse", "HEAD", cwd=destination)
+            in {commit, PANTOGRAPH_UPSTREAM_COMMIT}
             and changed_paths == PANTOGRAPH_PATCHED_FILES
         )
         if not is_expected_patch:
@@ -79,17 +85,7 @@ def _checkout(
                 f"Checkout has local modifications; refusing to overwrite: {destination}"
             )
         print("Restoring the known Pantograph patch set before reapplying it.")
-        _run(
-            "git",
-            "restore",
-            "--source",
-            commit,
-            "--worktree",
-            "--",
-            *sorted(PANTOGRAPH_PATCHED_FILES),
-            cwd=destination,
-        )
-        return
+        _run("git", "restore", "--worktree", "--", *sorted(PANTOGRAPH_PATCHED_FILES), cwd=destination)
     _run("git", "fetch", "--depth=1", "origin", commit, cwd=destination)
     _run("git", "checkout", "--detach", commit, cwd=destination)
 
@@ -127,20 +123,11 @@ def main(argv: list[str] | None = None) -> int:
     output_root = args.output_root.resolve()
     mathlib = output_root / "mathlib4"
     pantograph = output_root / "Pantograph"
-    patch_root = repo_root / "maths_ai" / "gnn_inference" / "lean_extractor"
-    patches = (
-        patch_root / "pantograph_v410_invocation_sexprs.patch",
-        patch_root / "pantograph_v410_source_trace_v2.patch",
-        patch_root / "pantograph_v410_combinator_invocations_v3.patch",
-    )
-
     _ensure_toolchain(LEAN_TOOLCHAIN)
     _checkout(MATHLIB_URL, MATHLIB_COMMIT, mathlib)
     if not args.skip_mathlib_cache:
         _run("lake", "exe", "cache", "get", cwd=mathlib)
     _checkout(PANTOGRAPH_URL, PANTOGRAPH_COMMIT, pantograph, allow_existing_patch=True)
-    for patch in patches:
-        _apply_patch(pantograph, patch)
     _run("lake", "build", cwd=pantograph)
 
     repl = pantograph / ".lake" / "build" / "bin" / "repl"

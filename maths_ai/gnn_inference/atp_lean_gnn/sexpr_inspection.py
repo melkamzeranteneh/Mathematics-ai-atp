@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Iterable
 
 from .dataset import DatasetRow
-from .preparation import SExprCache
+from .graph import sexp_to_dag
+from .preparation import ModelSExprCache, SExprCache
 
 
 def _normalized_state(text: str) -> str:
@@ -33,6 +34,7 @@ def build_theorem_trace(
     theorem: str,
     split: str,
     cache: SExprCache,
+    model_cache: ModelSExprCache | None = None,
 ) -> dict[str, object]:
     """Build a strictly validated trace for every dataset row of ``theorem``."""
     theorem_rows = sorted(
@@ -52,6 +54,17 @@ def build_theorem_trace(
         if record is None:
             missing_row_indices.append(row.row_index)
             continue
+        model_record = (
+            model_cache.load_for_raw_record(split, row.row_index, record)
+            if model_cache is not None
+            else None
+        )
+        raw_goal = str(record.get("goal_sexp", ""))
+        model_goal = (
+            str(model_record.get("goal_sexp", ""))
+            if model_record is not None
+            else ""
+        )
 
         next_row = theorem_rows[position + 1] if position + 1 < len(theorem_rows) else None
         transition_matches = (
@@ -70,6 +83,18 @@ def build_theorem_trace(
                 "captured_target_state": record.get("text_target_state", ""),
                 "goal_sexp": record.get("goal_sexp", ""),
                 "hyp_sexps": record.get("hyp_sexps", []),
+                "model_goal_sexp": model_goal,
+                "model_hyp_sexps": (
+                    model_record.get("hyp_sexps", [])
+                    if model_record is not None
+                    else []
+                ),
+                "raw_goal_characters": len(raw_goal),
+                "raw_goal_nodes": sexp_to_dag(raw_goal).num_nodes,
+                "model_goal_characters": len(model_goal) if model_goal else None,
+                "model_goal_nodes": (
+                    sexp_to_dag(model_goal).num_nodes if model_goal else None
+                ),
                 "alignment_kind": record.get("alignment_kind", ""),
                 "target_state_matches_invocation": bool(
                     record.get("target_state_matches_invocation", False)
@@ -95,6 +120,11 @@ def build_theorem_trace(
         "dataset_row_count": len(theorem_rows),
         "cached_row_count": len(steps),
         "complete": not missing_row_indices,
+        "model_complete": (
+            model_cache is not None
+            and len(steps) == len(theorem_rows)
+            and all(step["model_goal_sexp"] for step in steps)
+        ),
         "missing_row_indices": missing_row_indices,
         "steps": steps,
     }
@@ -132,6 +162,8 @@ def theorem_trace_markdown(trace: dict[str, object]) -> str:
                 f"`{'yes' if step['target_state_matches_invocation'] else 'no'}`",
                 "- hypothesis names match: "
                 f"`{'yes' if step['hypothesis_names_match'] else 'no'}`",
+                f"- raw goal size: `{step['raw_goal_characters']}` characters, "
+                f"`{step['raw_goal_nodes']}` DAG nodes",
             ]
         )
         transition = step["transition_matches_next_dataset_row"]
@@ -171,6 +203,33 @@ def theorem_trace_markdown(trace: dict[str, object]) -> str:
                 )
         else:
             lines.extend(["_No local hypotheses._", ""])
+
+        if step["model_goal_sexp"]:
+            lines.extend(
+                [
+                    "### Normalized model goal S-expression",
+                    "",
+                    f"- normalized goal size: `{step['model_goal_characters']}` "
+                    f"characters, `{step['model_goal_nodes']}` DAG nodes",
+                    "",
+                    _fence(str(step["model_goal_sexp"]), "lisp"),
+                    "",
+                    "### Normalized hypothesis S-expressions",
+                    "",
+                ]
+            )
+            model_hypotheses = step["model_hyp_sexps"]
+            assert isinstance(model_hypotheses, list)
+            for hypothesis in model_hypotheses:
+                assert isinstance(hypothesis, dict)
+                lines.extend(
+                    [
+                        f"#### `{hypothesis.get('name', '_')}`",
+                        "",
+                        _fence(str(hypothesis.get("sexp", "")), "lisp"),
+                        "",
+                    ]
+                )
 
         lines.extend(
             [

@@ -62,6 +62,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "sample_per_split": None,
         "force": False,
         "use_sexpr": False,
+        "sexpr_cache_root": None,
+        "sexpr_variant": "raw",
         "project_path": "maths_ai/lean_mathlib",
     },
 
@@ -206,6 +208,12 @@ def run_prepare(config: dict[str, Any]) -> dict[str, Any]:
         sample_per_split=prepare_cfg["sample_per_split"],
         force=prepare_cfg["force"],
         use_sexpr=prepare_cfg.get("use_sexpr", False),
+        sexpr_cache_root=(
+            Path(prepare_cfg["sexpr_cache_root"])
+            if prepare_cfg.get("sexpr_cache_root")
+            else None
+        ),
+        sexpr_variant=prepare_cfg.get("sexpr_variant", "raw"),
         project_path=prepare_cfg.get("project_path", "maths_ai/lean_mathlib"),
     )
 
