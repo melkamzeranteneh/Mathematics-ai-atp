@@ -115,6 +115,7 @@ def _build_sexpr_map(
     sexpr_cache: Optional[SExprCache] = None,
     split_label: str = "",
     sexpr_variant: str = "raw",
+    require_complete: bool = False,
 ) -> dict[int, dict]:
     """Load validated Phase 2 records without silently generating or falling back."""
     if not use_sexpr:
@@ -151,6 +152,12 @@ def _build_sexpr_map(
         f"    Validated {sexpr_variant} S-expression cache: "
         f"{len(sexpr_map)}/{len(rows)} rows"
     )
+    if require_complete and len(sexpr_map) != len(rows):
+        raise RuntimeError(
+            f"Selected {sexpr_variant} S-expression cache is incomplete for "
+            f"split '{split_label}': {len(rows) - len(sexpr_map)} missing rows. "
+            "Refusing to create a mixed-representation ablation."
+        )
 
     return sexpr_map
 
@@ -174,7 +181,13 @@ def scan_train_split(
         dataset_name, "train", sample_per_split, selection_manifest
     )
     sexpr_map = _build_sexpr_map(
-        rows, project_path, use_sexpr, sexpr_cache, "train", sexpr_variant
+        rows,
+        project_path,
+        use_sexpr,
+        sexpr_cache,
+        "train",
+        sexpr_variant,
+        require_complete=selection_manifest is not None,
     )
 
     for row in rows:
@@ -182,7 +195,7 @@ def scan_train_split(
             sd = sexpr_map.get(row.row_index)
             example = prepare_example(
                 row,
-                sexpr_cache=sexpr_cache,
+                sexpr_cache=None if use_sexpr else sexpr_cache,
                 sexpr_data=sd,
                 use_sexpr=use_sexpr,
             )
@@ -258,7 +271,13 @@ def process_split(
         dataset_name, split, sample_per_split, selection_manifest
     )
     sexpr_map = _build_sexpr_map(
-        rows, project_path, use_sexpr, sexpr_cache, split, sexpr_variant
+        rows,
+        project_path,
+        use_sexpr,
+        sexpr_cache,
+        split,
+        sexpr_variant,
+        require_complete=selection_manifest is not None,
     )
 
     for row in rows:
@@ -266,7 +285,7 @@ def process_split(
             sd = sexpr_map.get(row.row_index)
             example = prepare_example(
                 row,
-                sexpr_cache=sexpr_cache,
+                sexpr_cache=None if use_sexpr else sexpr_cache,
                 sexpr_data=sd,
                 use_sexpr=use_sexpr,
             )

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -11,7 +12,10 @@ from maths_ai.gnn_inference.atp_lean_gnn.pilot_sampling import (
     build_pilot_selection,
     selected_row_indices,
 )
-from maths_ai.gnn_inference.atp_lean_gnn.preprocess import _load_rows
+from maths_ai.gnn_inference.atp_lean_gnn.preprocess import (
+    _build_sexpr_map,
+    _load_rows,
+)
 
 
 def _row(split: str, index: int, theorem: str, tactic: str) -> DatasetRow:
@@ -151,3 +155,25 @@ def test_selection_manifest_rejects_sample_limit(tmp_path: Path):
             sample_limit=1,
             selection_manifest=manifest,
         )
+
+
+def test_controlled_ablation_rejects_missing_sidecars(tmp_path: Path):
+    rows = _rows()["train"][:2]
+    cache = SimpleNamespace(
+        output_root=tmp_path,
+        load_for_row=Mock(side_effect=lambda row, **_kwargs: _raw_record(row)),
+    )
+    with patch(
+        "maths_ai.gnn_inference.atp_lean_gnn.preprocess.ModelSExprCache.load_for_raw_record",
+        return_value=None,
+    ):
+        with pytest.raises(RuntimeError, match="mixed-representation"):
+            _build_sexpr_map(
+                rows,
+                project_path="",
+                use_sexpr=True,
+                sexpr_cache=cache,
+                split_label="train",
+                sexpr_variant="model",
+                require_complete=True,
+            )
