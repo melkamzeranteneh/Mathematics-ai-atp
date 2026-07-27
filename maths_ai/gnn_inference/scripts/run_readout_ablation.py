@@ -73,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _command(variant: str, gpu: str, prepared_root: Path) -> list[str]:
     return [
         sys.executable,
+        "-u",
         "-m",
         "maths_ai.gnn_inference.scripts.run_training",
         "--config",
