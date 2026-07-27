@@ -3,7 +3,7 @@
 The LeanDojo dataset was traced from Mathlib commit
 `29dcec074de168ac2bf835a77ef68bbe069194c5` with Lean
 `v4.10.0-rc1`. The extractor pins commit
-`44c7c49dcff50b834d1dd6eb768e252e0329cca2` from the persistent
+`30f45278170aa1941ccf0eb211e6f7966c61b5be` from the persistent
 [`jajos12/Pantograph`](https://github.com/jajos12/Pantograph/tree/gnn-sexpr-v410)
 fork. That commit contains both source-invocation tracing and the Lean-native
 model S-expression serializer; no uncommitted patching is required.
