@@ -13,13 +13,14 @@ from typing import Iterable
 
 from .dataset import DATASET_NAME, DatasetRow, canonicalize_split_name, iter_dataset_rows
 from .preparation import ModelSExprCache, SExprCache
+from .pilot_sampling import selected_row_indices
 from .reporting import console_print
 from .state import parse_state
 
 
 EXTRACTION_VERSION = SExprCache.EXTRACTOR_VERSION
 DATASET_MATHLIB_COMMIT = "29dcec074de168ac2bf835a77ef68bbe069194c5"
-MODEL_PANTOGRAPH_COMMIT = "30f45278170aa1941ccf0eb211e6f7966c61b5be"
+MODEL_PANTOGRAPH_COMMIT = "9fea43c8cb5d7199c40914fc9022716c612755fd"
 PANTOGRAPH_COMMIT = MODEL_PANTOGRAPH_COMMIT
 
 
@@ -42,6 +43,7 @@ class SExprExtractionConfig:
     verify_source_commit: bool = True
     model_sexprs: bool = False
     theorem: str | None = None
+    selection_manifest: Path | None = None
 
 
 class SourceExtractionError(RuntimeError):
@@ -585,7 +587,7 @@ def _make_model_record(
     if (
         not isinstance(target, dict)
         or not isinstance(target.get("modelSexp"), str)
-        or target.get("modelSexpVersion") != ModelSExprCache.SCHEMA_VERSION
+        or target.get("modelSexpVersion") != ModelSExprCache.EXPRESSION_VERSION
     ):
         raise SourceExtractionError(
             "Goal model S-expression is missing or has an unsupported version.",
@@ -609,7 +611,7 @@ def _make_model_record(
             or not isinstance(variable_type, dict)
             or not isinstance(variable_type.get("modelSexp"), str)
             or variable_type.get("modelSexpVersion")
-            != ModelSExprCache.SCHEMA_VERSION
+            != ModelSExprCache.EXPRESSION_VERSION
         ):
             raise SourceExtractionError(
                 "Hypothesis model S-expression is missing or unsupported.",
@@ -617,10 +619,23 @@ def _make_model_record(
                 theorem=row.theorem,
                 row_index=row.row_index,
             )
+        context_index = variable.get("contextIndex")
+        binder_role = variable.get("binderRole")
+        if not isinstance(context_index, int) or not isinstance(binder_role, str):
+            raise SourceExtractionError(
+                "Hypothesis context index or binder role is missing.",
+                phase="model_context_metadata",
+                theorem=row.theorem,
+                row_index=row.row_index,
+            )
         hypotheses.append(
             {
                 "name": str(variable.get("userName", "_")),
                 "internal_name": str(variable.get("name", "")),
+                "context_index": context_index,
+                "binder_role": binder_role,
+                "is_instance": bool(variable.get("isInstance", False)),
+                "is_let": bool(variable.get("isLet", False)),
                 "sexp": variable_type["modelSexp"],
             }
         )
@@ -846,7 +861,7 @@ async def extract_split_with_client(
     if not clients:
         raise ValueError("At least one Pantograph client is required.")
     report_root = Path(prepared_root) / (
-        "model_sexpr_extraction_v1" if model_cache is not None else "sexpr_extraction"
+        "model_sexpr_extraction_v2" if model_cache is not None else "sexpr_extraction"
     )
     failure_path = report_root / "failures" / f"{split}.jsonl"
     failure_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1018,6 +1033,11 @@ def _git_head(source_root: Path) -> str:
 
 
 async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=None) -> dict[str, object]:
+    if config.selection_manifest is not None and config.sample_per_split is not None:
+        raise ValueError(
+            "--selection-manifest and --max-items cannot be combined; "
+            "the manifest already defines the exact rows."
+        )
     if config.workers < 1:
         raise ValueError("workers must be at least 1.")
     if config.recycle_worker_files < 0:
@@ -1083,6 +1103,19 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
                     sample_limit=config.sample_per_split,
                 )
             )
+            if config.selection_manifest is not None:
+                selected = selected_row_indices(
+                    config.selection_manifest,
+                    split,
+                    dataset_name=config.dataset_name,
+                )
+                rows = [row for row in rows if row.row_index in selected]
+                missing = selected - {row.row_index for row in rows}
+                if missing:
+                    raise RuntimeError(
+                        f"Selection manifest contains {len(missing)} row indices "
+                        f"not present in split '{split}'."
+                    )
             if config.theorem is not None:
                 rows = [row for row in rows if row.theorem == config.theorem]
                 if not rows:
@@ -1135,9 +1168,14 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
         "covered_rows": covered_rows,
         "failed_rows": attempted_rows - covered_rows,
         "coverage": covered_rows / attempted_rows if attempted_rows else 0.0,
+        "selection_manifest": (
+            str(config.selection_manifest)
+            if config.selection_manifest is not None
+            else None
+        ),
     }
     report_root = Path(config.prepared_root) / (
-        "model_sexpr_extraction_v1"
+        "model_sexpr_extraction_v2"
         if model_cache is not None
         else "sexpr_extraction"
     )

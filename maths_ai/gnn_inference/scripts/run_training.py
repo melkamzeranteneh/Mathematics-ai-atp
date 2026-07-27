@@ -60,6 +60,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "dataset_name": "cat-searcher/leandojo-benchmark-4-random",
         "splits": "train,val,test",
         "sample_per_split": None,
+        "selection_manifest": None,
         "force": False,
         "use_sexpr": False,
         "sexpr_cache_root": None,
@@ -215,6 +216,11 @@ def run_prepare(config: dict[str, Any]) -> dict[str, Any]:
         ),
         sexpr_variant=prepare_cfg.get("sexpr_variant", "raw"),
         project_path=prepare_cfg.get("project_path", "maths_ai/lean_mathlib"),
+        selection_manifest=(
+            Path(prepare_cfg["selection_manifest"])
+            if prepare_cfg.get("selection_manifest")
+            else None
+        ),
     )
 
     summary = run_preprocessing(cfg)

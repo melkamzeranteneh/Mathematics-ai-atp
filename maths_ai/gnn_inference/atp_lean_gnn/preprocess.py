@@ -33,6 +33,7 @@ from .preparation import (
     prepare_example,
     SExprCache,
 )
+from .pilot_sampling import selected_row_indices
 from .labels import build_tactic_vocab, encode_tactic_name
 from .lemma_corpus import load_lemma_name_index
 from .pyg import build_vocab_from_labels, dag_to_pyg
@@ -54,6 +55,7 @@ class PreprocessConfig:
     sexpr_cache_root: Path | None = None
     sexpr_variant: str = "raw"
     project_path: str = "maths_ai/lean_mathlib"
+    selection_manifest: Path | None = None
 
 
 def _normalize_splits(raw_splits: str | list[str] | tuple[str, ...]) -> list[str]:
@@ -81,13 +83,29 @@ def _load_rows(
     dataset_name: str,
     split: str,
     sample_limit: int | None = None,
+    selection_manifest: Path | None = None,
 ) -> list[DatasetRow]:
     """Load all rows for a split into memory, grouped by order."""
-    return list(iter_dataset_rows(
+    if selection_manifest is not None and sample_limit is not None:
+        raise ValueError("selection_manifest and sample_limit cannot be combined.")
+    rows = list(iter_dataset_rows(
         dataset_name=dataset_name,
         split=split,
         sample_limit=sample_limit,
     ))
+    if selection_manifest is None:
+        return rows
+    selected = selected_row_indices(
+        selection_manifest, split, dataset_name=dataset_name
+    )
+    filtered = [row for row in rows if row.row_index in selected]
+    missing = selected - {row.row_index for row in filtered}
+    if missing:
+        raise RuntimeError(
+            f"Selection manifest contains {len(missing)} row indices "
+            f"not present in split '{split}'."
+        )
+    return filtered
 
 
 def _build_sexpr_map(
@@ -146,12 +164,15 @@ def scan_train_split(
     project_path: str = "maths_ai/lean_mathlib",
     use_sexpr: bool = False,
     sexpr_variant: str = "raw",
+    selection_manifest: Path | None = None,
 ) -> tuple[dict[str, int], dict[str, int], SplitReport]:
     node_labels: set[str] = set()
     tactic_names: list[str] = []
     report = SplitReport(split="train")
 
-    rows = _load_rows(dataset_name, "train", sample_per_split)
+    rows = _load_rows(
+        dataset_name, "train", sample_per_split, selection_manifest
+    )
     sexpr_map = _build_sexpr_map(
         rows, project_path, use_sexpr, sexpr_cache, "train", sexpr_variant
     )
@@ -224,6 +245,7 @@ def process_split(
     project_path: str = "maths_ai/lean_mathlib",
     use_sexpr: bool = False,
     sexpr_variant: str = "raw",
+    selection_manifest: Path | None = None,
 ) -> tuple[SplitReport, dict[str, object]]:
     import torch
 
@@ -232,7 +254,9 @@ def process_split(
 
     report = SplitReport(split=split)
 
-    rows = _load_rows(dataset_name, split, sample_per_split)
+    rows = _load_rows(
+        dataset_name, split, sample_per_split, selection_manifest
+    )
     sexpr_map = _build_sexpr_map(
         rows, project_path, use_sexpr, sexpr_cache, split, sexpr_variant
     )
@@ -326,6 +350,8 @@ def process_split(
         vocab_source="train",
         sample_limit=sample_per_split,
     )
+    if selection_manifest is not None:
+        manifest["selection_manifest"] = str(selection_manifest)
     write_manifest(output_root, split=split, manifest=manifest)
     return report, manifest
 
@@ -367,6 +393,7 @@ def run_preprocessing(config: PreprocessConfig) -> dict[str, object]:
         project_path=config.project_path,
         use_sexpr=config.use_sexpr,
         sexpr_variant=config.sexpr_variant,
+        selection_manifest=config.selection_manifest,
     )
     console_print(
         f"  Train scan complete: attempted={train_scan.attempted_count}, "
@@ -397,6 +424,7 @@ def run_preprocessing(config: PreprocessConfig) -> dict[str, object]:
             project_path=config.project_path,
             use_sexpr=config.use_sexpr,
             sexpr_variant=config.sexpr_variant,
+            selection_manifest=config.selection_manifest,
         )
         split_reports[split] = report
         manifests[split] = manifest
@@ -431,6 +459,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--splits", type=str, default="train,val,test", help="Comma-separated splits to preprocess (must include train)")
     parser.add_argument("--output-root", type=str, default=str(DEFAULT_OUTPUT_ROOT), help="Output directory for prepared artifacts")
     parser.add_argument("--sample-per-split", type=int, default=None, help="Optional limit of examples to process per split")
+    parser.add_argument(
+        "--selection-manifest",
+        type=str,
+        default=None,
+        help="Exact theorem-level pilot selection produced by build_sexpr_pilot",
+    )
     parser.add_argument("--lemma-corpus", type=str, default=None, help="Optional lemma corpus JSONL for library premise labels")
     parser.add_argument("--force", action="store_true", help="Overwrite the output root if it already exists")
     parser.add_argument("--use-sexpr", action="store_true", default=False, help="Use S-expressions from Pantograph (default: False, text parser only for training)")
@@ -462,6 +496,11 @@ def main(argv: list[str] | None = None) -> int:
             sexpr_cache_root=None if args.sexpr_cache_root is None else Path(args.sexpr_cache_root),
             project_path=args.project_path,
             sexpr_variant=args.sexpr_variant,
+            selection_manifest=(
+                None
+                if args.selection_manifest is None
+                else Path(args.selection_manifest)
+            ),
         )
         run_preprocessing(config)
     except (FileExistsError, RuntimeError, ValueError) as exc:

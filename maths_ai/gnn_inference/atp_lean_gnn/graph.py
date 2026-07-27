@@ -507,7 +507,7 @@ def proof_state_to_dag(
     *,
     sexp: str | None = None,
     goal_sexp: str | None = None,
-    hyp_sexps: list[tuple[str, str | None]] | None = None,
+    hyp_sexps: list[tuple[str, str | None] | dict[str, object]] | None = None,
 ) -> DAGBuilder:
     """Build a DAG from a proof state.
 
@@ -532,13 +532,47 @@ def proof_state_to_dag(
         # Pantograph's local context is authoritative here. Text states may
         # contain branch labels such as ``case a.mk`` which are not hypotheses;
         # zipping the two sources shifted every following type.
-        for hyp_name, hyp_sexp in hyp_sexps:
-            name_node = dag.get_or_create(hyp_name or "_", (), node_type="var")
+        for hypothesis in hyp_sexps:
+            if isinstance(hypothesis, dict):
+                hyp_name = str(hypothesis.get("name", "_"))
+                hyp_sexp = hypothesis.get("sexp")
+                context_index = hypothesis.get("context_index")
+                binder_role = str(hypothesis.get("binder_role", ":explicit"))
+                is_instance = bool(hypothesis.get("is_instance", False))
+                is_let = bool(hypothesis.get("is_let", False))
+            else:
+                hyp_name, hyp_sexp = hypothesis
+                context_index = None
+                binder_role = ":explicit"
+                is_instance = is_let = False
+
+            name_node = dag.get_or_create(
+                hyp_name or "_",
+                (),
+                node_type="sconst" if isinstance(context_index, int) else "var",
+            )
             if hyp_sexp:
-                type_node = _sexp_walk(parse_sexp_string(hyp_sexp), [], dag)
+                type_node = _sexp_walk(parse_sexp_string(str(hyp_sexp)), [], dag)
             else:
                 type_node = dag.get_or_create("?", ())
-            hyp_node = dag.get_or_create("Hyp", (name_node, type_node))
+            if isinstance(context_index, int):
+                context_node = dag.get_or_create(
+                    f"FV{context_index}", (), node_type="var"
+                )
+                role = (
+                    "instance"
+                    if is_instance
+                    else "let"
+                    if is_let
+                    else binder_role.removeprefix(":")
+                )
+                role_node = dag.get_or_create(
+                    f"HypRole:{role}", (), node_type="sconst"
+                )
+                hyp_children = (context_node, name_node, role_node, type_node)
+            else:
+                hyp_children = (name_node, type_node)
+            hyp_node = dag.get_or_create("Hyp", hyp_children)
             root_ids.append(hyp_node)
 
         goal_node = dag.get_or_create("Goal", (goal_expr_id,))

@@ -129,8 +129,9 @@ class ModelSExprCache:
     extraction.
     """
 
-    SCHEMA_VERSION = 1
-    NORMALIZATION = "lean-model-sexp-v1"
+    SCHEMA_VERSION = 2
+    EXPRESSION_VERSION = 1
+    NORMALIZATION = "lean-model-sexp-v2"
 
     def __init__(self, output_root: Path, enabled: bool = True):
         self.output_root = Path(output_root)
@@ -147,7 +148,7 @@ class ModelSExprCache:
         return hashlib.sha256(encoded).hexdigest()
 
     def _sidecar_dir(self, split: str) -> Path:
-        directory = self.output_root / split / "model_sexpr_v1"
+        directory = self.output_root / split / "model_sexpr_v2"
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
@@ -257,16 +258,12 @@ def prepare_example(
 
     if use_sexpr and sexpr_data is not None:
         goal_sexp = sexpr_data.get("goal_sexp")
-        hyp_sexps = [
-            (item["name"], item["sexp"]) for item in sexpr_data.get("hyp_sexps", [])
-        ]
+        hyp_sexps = sexpr_data.get("hyp_sexps", [])
     elif use_sexpr and sexpr_cache is not None and sexpr_cache.enabled:
         cached = sexpr_cache.load_for_row(row)
         if cached is not None:
             goal_sexp = cached.get("goal_sexp")
-            hyp_sexps = [
-                (item["name"], item["sexp"]) for item in cached.get("hyp_sexps", [])
-            ]
+            hyp_sexps = cached.get("hyp_sexps", [])
 
     if use_sexpr and (goal_sexp is None or hyp_sexps is None):
         raise SExprUnavailableError(

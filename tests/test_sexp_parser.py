@@ -321,6 +321,71 @@ def test_pantograph_hypotheses_do_not_zip_with_text_branch_labels():
     assert "case" not in get_node_labels(dag)
 
 
+def test_model_hypothesis_shares_context_reference_with_goal():
+    dag = proof_state_to_dag(
+        "α : Type\ninst : Fintype α\nx : α\n⊢ P x",
+        goal_sexp=(
+            "(:app (:c P) (:arg :explicit 0 (:fv FV2)) "
+            "(:arg :instance 1 (:instance-of "
+            "(:app (:c Fintype) (:arg :explicit 0 (:fv FV0))))))"
+        ),
+        hyp_sexps=[
+            {
+                "name": "α",
+                "sexp": "(:sort Type)",
+                "context_index": 0,
+                "binder_role": ":explicit",
+                "is_instance": False,
+                "is_let": False,
+            },
+            {
+                "name": "inst",
+                "sexp": (
+                    "(:app (:c Fintype) "
+                    "(:arg :explicit 0 (:fv FV0)))"
+                ),
+                "context_index": 1,
+                "binder_role": ":instance-implicit",
+                "is_instance": True,
+                "is_let": False,
+            },
+            {
+                "name": "x",
+                "sexp": "(:fv FV0)",
+                "context_index": 2,
+                "binder_role": ":explicit",
+                "is_instance": False,
+                "is_let": False,
+            },
+        ],
+    )
+    fv2_nodes = [node for node in dag.nodes if node.label == "FV2"]
+    x_hypothesis = next(
+        node
+        for node in dag.nodes
+        if node.label == "Hyp"
+        and any(dag.nodes[child].label == "x" for child in node.children)
+    )
+    instance_hypothesis = next(
+        node
+        for node in dag.nodes
+        if node.label == "Hyp"
+        and any(dag.nodes[child].label == "inst" for child in node.children)
+    )
+
+    assert len(fv2_nodes) == 1
+    assert x_hypothesis.children[0] == fv2_nodes[0].id
+    assert [dag.nodes[child].label for child in x_hypothesis.children] == [
+        "FV2",
+        "x",
+        "HypRole:explicit",
+        "FV0",
+    ]
+    assert [dag.nodes[child].label for child in instance_hypothesis.children][
+        :3
+    ] == ["FV1", "inst", "HypRole:instance"]
+
+
 @pytest.mark.parametrize(
     "sexp, expected_tag",
     [

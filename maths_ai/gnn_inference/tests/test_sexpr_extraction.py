@@ -35,6 +35,10 @@ def _goal(target: str, *names: str) -> dict[str, object]:
             {
                 "name": f"internal_{name}",
                 "userName": name,
+                "contextIndex": index,
+                "binderRole": ":explicit",
+                "isInstance": False,
+                "isLet": False,
                 "type": {
                     "pp": "Prop",
                     "sexp": "(:sort 0)",
@@ -42,7 +46,7 @@ def _goal(target: str, *names: str) -> dict[str, object]:
                     "modelSexpVersion": 1,
                 },
             }
-            for name in names
+            for index, name in enumerate(names)
         ],
     }
 
@@ -188,7 +192,7 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         sidecar = model_cache.load_for_raw_record("train", 10, raw_before)
-        self.assertEqual(manifest["extractor_version"], "lean-model-sexp-v1")
+        self.assertEqual(manifest["extractor_version"], "lean-model-sexp-v2")
         self.assertEqual(manifest["extracted_rows"], 2)
         self.assertEqual(
             sidecar["goal_sexp"],
@@ -200,6 +204,10 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "name": "p",
                     "internal_name": "internal_p",
+                    "context_index": 0,
+                    "binder_role": ":explicit",
+                    "is_instance": False,
+                    "is_let": False,
                     "sexp": "(:sort Prop)",
                 }
             ],

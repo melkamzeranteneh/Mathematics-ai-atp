@@ -41,6 +41,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--splits", nargs="+", default=["train", "val", "test"])
     parser.add_argument("--max-items", type=int, default=None)
     parser.add_argument(
+        "--selection-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Exact theorem-level pilot selection produced by build_sexpr_pilot. "
+            "Cannot be combined with --max-items."
+        ),
+    )
+    parser.add_argument(
         "--theorem",
         default=None,
         help="Extract only rows belonging to this exact theorem name.",
@@ -97,7 +106,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Compile with the fork's Lean-native normalizer and write versioned "
-            "model_sexpr_v1 sidecars. Existing validated raw caches are required "
+            "model_sexpr_v2 sidecars. Existing validated raw caches are required "
             "and are never overwritten."
         ),
     )
@@ -123,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
             MODEL_PANTOGRAPH_COMMIT if args.model_sexprs else PANTOGRAPH_COMMIT
         ),
         theorem=args.theorem,
+        selection_manifest=args.selection_manifest,
     )
     try:
         summary = asyncio.run(extract_sexpressions(config))

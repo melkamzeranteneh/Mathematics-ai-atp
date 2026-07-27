@@ -42,7 +42,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--include-model",
         action="store_true",
-        help="Include digest-validated model_sexpr_v1 sidecars beside raw forms.",
+        help="Include digest-validated model_sexpr_v2 sidecars beside raw forms.",
     )
     parser.add_argument(
         "--output-dir",

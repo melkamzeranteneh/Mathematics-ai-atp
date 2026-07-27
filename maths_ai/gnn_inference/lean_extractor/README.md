@@ -3,7 +3,7 @@
 The LeanDojo dataset was traced from Mathlib commit
 `29dcec074de168ac2bf835a77ef68bbe069194c5` with Lean
 `v4.10.0-rc1`. The extractor pins commit
-`30f45278170aa1941ccf0eb211e6f7966c61b5be` from the persistent
+`9fea43c8cb5d7199c40914fc9022716c612755fd` from the persistent
 [`jajos12/Pantograph`](https://github.com/jajos12/Pantograph/tree/gnn-sexpr-v410)
 fork. That commit contains both source-invocation tracing and the Lean-native
 model S-expression serializer; no uncommitted patching is required.
@@ -45,6 +45,23 @@ python -m maths_ai.gnn_inference.scripts.generate_sexprs \
 ```
 
 Sidecars are stored under
-`{prepared_root}/{split}/model_sexpr_v1/{row_index}.json`. Each contains the
+`{prepared_root}/{split}/model_sexpr_v2/{row_index}.json`. Each contains the
 SHA-256 digest of its corresponding raw record, so stale normalization is
 rejected automatically while the costly raw extraction remains reusable.
+
+For a controlled pilot, first create one deterministic theorem-level
+selection. It keeps validation and test complete and stratifies the training
+sample by tactic frequency, goal size, proof length, and context shape:
+
+```bash
+python -m maths_ai.gnn_inference.scripts.build_sexpr_pilot \
+  --prepared-root maths_ai/_support_files/artifacts/prepared/v1 \
+  --output maths_ai/_support_files/artifacts/sexpr_pilot_30k.json \
+  --train-rows 30000 \
+  --seed 42
+```
+
+Pass that same file to normalized extraction and to both raw and normalized
+preprocessing runs with `--selection-manifest`. This ensures the ablation uses
+identical theorem traces and row indices. Do not combine it with first-N
+sampling (`--max-items` or `--sample-per-split`).
