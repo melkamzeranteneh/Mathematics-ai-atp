@@ -88,6 +88,12 @@ def _length_bucket(length: int) -> str:
     return "short" if length <= 2 else "medium" if length <= 8 else "long"
 
 
+def _context_bucket(mean_hypotheses: float) -> str:
+    if mean_hypotheses == 0:
+        return "empty"
+    return "light" if mean_hypotheses <= 4 else "heavy"
+
+
 def _distribution(rows: Iterable[DatasetRow]) -> dict[str, int]:
     return dict(sorted(Counter(_tactic_name(row) for row in rows).items()))
 
@@ -122,8 +128,10 @@ def build_pilot_selection(
     """Select complete train theorems proportionally within structural strata.
 
     Validation and test remain complete. Train strata combine tactic-frequency,
-    graph-size proxy, proof-length, and typeclass-context presence. Selection
-    occurs at theorem granularity, preventing partial proof traces.
+    graph-size proxy, proof length, and local-context size. Selection occurs at
+    theorem granularity, preventing partial proof traces. Exact instance-binder
+    roles are deliberately measured after model normalization because legacy
+    raw records do not contain Lean's ``BinderInfo``.
     """
     if target_train_rows < 1:
         raise ValueError("target_train_rows must be positive.")
@@ -153,6 +161,9 @@ def build_pilot_selection(
             continue
         records = [record for record in raw_records if record is not None]
         goal_characters = sum(len(str(record["goal_sexp"])) for record in records)
+        hypothesis_count = sum(
+            len(record.get("hyp_sexps", [])) for record in records
+        )
         theorem_tactics = Counter(_tactic_name(row) for row in theorem_rows)
         bucket_counts = Counter(
             {
@@ -168,22 +179,14 @@ def build_pilot_selection(
             ("head", "medium", "tail"),
             key=lambda bucket: (bucket_counts[bucket], {"head": 0, "medium": 1, "tail": 2}[bucket]),
         )
-        has_instances = any(
-            any(
-                str(hypothesis.get("name", "")).startswith("inst")
-                for hypothesis in record.get("hyp_sexps", [])
-                if isinstance(hypothesis, dict)
-            )
-            for record in records
-        )
         eligible_groups.append(
             {
                 "theorem": theorem,
                 "rows": theorem_rows,
                 "row_count": len(theorem_rows),
                 "mean_goal_characters": goal_characters / len(records),
+                "mean_hypothesis_count": hypothesis_count / len(records),
                 "tactic_bucket": tactic_bucket,
-                "has_instances": has_instances,
             }
         )
 
@@ -209,7 +212,7 @@ def build_pilot_selection(
             str(group["tactic_bucket"]),
             _size_bucket(float(group["mean_goal_characters"]), cutoffs),
             _length_bucket(int(group["row_count"])),
-            "instances" if group["has_instances"] else "no-instances",
+            _context_bucket(float(group["mean_hypothesis_count"])),
         )
         strata[key].append(group)
 
