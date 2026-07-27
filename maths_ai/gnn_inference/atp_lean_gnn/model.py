@@ -5,13 +5,24 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch_geometric.nn import GATv2Conv, SAGEConv, global_add_pool, global_mean_pool
+from torch_geometric.nn import (
+    GATv2Conv,
+    SAGEConv,
+    global_add_pool,
+    global_max_pool,
+    global_mean_pool,
+)
 from torch_geometric.utils import softmax as graph_softmax
 
 from .pyg import NODE_TYPE_TO_ID
 
 
-VALID_READOUTS = ("state", "state_mean_attention")
+VALID_READOUTS = (
+    "state",
+    "state_mean_attention",
+    "state_max_attention",
+    "state_mean_max_attention",
+)
 
 
 def _state_node_embeddings(node_embeddings: torch.Tensor, data) -> torch.Tensor:
@@ -34,14 +45,23 @@ def _state_node_embeddings(node_embeddings: torch.Tensor, data) -> torch.Tensor:
 
 
 class StateMeanAttentionReadout(nn.Module):
-    """Fuse state, global mean, and state-conditioned attention summaries."""
+    """Fuse state and attention summaries with optional mean/max pooling."""
 
-    def __init__(self, hidden_dim: int) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        *,
+        include_mean: bool = True,
+        include_max: bool = False,
+    ) -> None:
         super().__init__()
+        self.include_mean = include_mean
+        self.include_max = include_max
         self.node_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.state_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.attention_score = nn.Linear(hidden_dim, 1, bias=False)
-        self.fusion = nn.Linear(hidden_dim * 3, hidden_dim)
+        summary_count = 2 + int(include_mean) + int(include_max)
+        self.fusion = nn.Linear(hidden_dim * summary_count, hidden_dim)
         self.normalization = nn.LayerNorm(hidden_dim)
 
     def forward(
@@ -69,15 +89,25 @@ class StateMeanAttentionReadout(nn.Module):
             batch_index,
             size=graph_count,
         )
-        mean_embeddings = global_mean_pool(
-            node_embeddings,
-            batch_index,
-            size=graph_count,
-        )
-        combined = torch.cat(
-            [state_embeddings, mean_embeddings, weighted_embeddings],
-            dim=-1,
-        )
+        summaries = [state_embeddings]
+        if self.include_mean:
+            summaries.append(
+                global_mean_pool(
+                    node_embeddings,
+                    batch_index,
+                    size=graph_count,
+                )
+            )
+        if self.include_max:
+            summaries.append(
+                global_max_pool(
+                    node_embeddings,
+                    batch_index,
+                    size=graph_count,
+                )
+            )
+        summaries.append(weighted_embeddings)
+        combined = torch.cat(summaries, dim=-1)
         fused = self.fusion(combined)
         return F.gelu(self.normalization(fused)), attention_weights
 
@@ -267,11 +297,14 @@ class GATv2StateClassifier(nn.Module):
             for _ in range(num_layers)
         )
         self.dropout = nn.Dropout(dropout)
-        self.global_readout = (
-            StateMeanAttentionReadout(hidden_dim)
-            if self.readout_mode == "state_mean_attention"
-            else None
-        )
+        if self.readout_mode == "state":
+            self.global_readout = None
+        else:
+            self.global_readout = StateMeanAttentionReadout(
+                hidden_dim,
+                include_mean="mean" in self.readout_mode,
+                include_max="max" in self.readout_mode,
+            )
         self.classifier = nn.Linear(hidden_dim, num_tactics)
 
     def encode_nodes(self, data) -> torch.Tensor:

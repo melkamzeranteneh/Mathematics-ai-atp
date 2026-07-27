@@ -30,6 +30,7 @@ from .model import (
     GATv2StateClassifier,
     GraphSAGEClassifierConfig,
     GraphSAGEStateClassifier,
+    VALID_READOUTS,
 )
 from .pyg import NODE_TYPE_TO_ID
 from .reporting import console_print
@@ -159,10 +160,10 @@ class BaselineConfig:
         normalized_model = self.model
         if gnn_type == "gat":
             readout = self.model.readout.lower().strip()
-            if readout not in {"state", "state_mean_attention"}:
+            if readout not in VALID_READOUTS:
                 raise ValueError(
-                    "Training config field 'model.readout' must be either "
-                    "'state' or 'state_mean_attention'."
+                    "Training config field 'model.readout' must be one of: "
+                    f"{', '.join(VALID_READOUTS)}."
                 )
             normalized_model = GATv2ClassifierConfig(
                 hidden_dim=self.model.hidden_dim,
