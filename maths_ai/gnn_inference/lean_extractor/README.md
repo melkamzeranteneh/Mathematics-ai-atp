@@ -50,18 +50,22 @@ SHA-256 digest of its corresponding raw record, so stale normalization is
 rejected automatically while the costly raw extraction remains reusable.
 
 For a controlled pilot, first create one deterministic theorem-level
-selection. It keeps validation and test complete and stratifies the training
-sample by tactic frequency, goal size, proof length, and context shape:
+selection before S-expression extraction. It needs no raw cache. It stratifies
+by tactic frequency, proof-state size, proof length, and context shape, while
+using a shared randomized source-file priority so Pantograph compiles far fewer
+Mathlib files:
 
 ```bash
 python -m maths_ai.gnn_inference.scripts.build_sexpr_pilot \
   --prepared-root maths_ai/_support_files/artifacts/prepared/v1 \
   --output maths_ai/_support_files/artifacts/sexpr_pilot_30k.json \
   --train-rows 30000 \
+  --val-rows 2000 \
+  --test-rows 2000 \
   --seed 42
 ```
 
-Pass that same file to normalized extraction and to both raw and normalized
-preprocessing runs with `--selection-manifest`. This ensures the ablation uses
-identical theorem traces and row indices. Do not combine it with first-N
-sampling (`--max-items` or `--sample-per-split`).
+Pass that same file first to raw extraction, then normalized extraction, and
+finally to both preprocessing runs with `--selection-manifest`. This ensures
+the ablation uses identical theorem traces and row indices. Do not combine it
+with first-N sampling (`--max-items` or `--sample-per-split`).

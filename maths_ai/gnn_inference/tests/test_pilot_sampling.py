@@ -27,6 +27,7 @@ def _row(split: str, index: int, theorem: str, tactic: str) -> DatasetRow:
         split=split,
         row_index=index,
         dataset_name="fake/dataset",
+        file_path=f"Mathlib/{theorem}.lean",
     )
 
 
@@ -47,8 +48,14 @@ def _rows() -> dict[str, list[DatasetRow]]:
             index += 1
     return {
         "train": train,
-        "val": [_row("val", index, "Demo.val", "rw") for index in range(5)],
-        "test": [_row("test", index, "Demo.test", "simp") for index in range(4)],
+        "val": [
+            _row("val", index, f"Demo.val{index // 2}", "rw")
+            for index in range(5)
+        ],
+        "test": [
+            _row("test", index, f"Demo.test{index // 2}", "simp")
+            for index in range(4)
+        ],
     }
 
 
@@ -70,24 +77,17 @@ def test_pilot_is_deterministic_and_selects_whole_theorems(tmp_path: Path):
     def iter_rows(*, split: str, **_kwargs):
         return iter(rows[split])
 
-    def load_raw(_cache, row: DatasetRow, **_kwargs):
-        return _raw_record(row)
-
-    with (
-        patch(
+    with patch(
             "maths_ai.gnn_inference.atp_lean_gnn.pilot_sampling.iter_dataset_rows",
             side_effect=iter_rows,
-        ),
-        patch(
-            "maths_ai.gnn_inference.atp_lean_gnn.pilot_sampling.SExprCache.load_for_row",
-            new=load_raw,
-        ),
-    ):
+        ):
         first = build_pilot_selection(
             prepared_root=tmp_path,
             output_path=tmp_path / "first.json",
             dataset_name="fake/dataset",
             target_train_rows=18,
+            target_val_rows=3,
+            target_test_rows=2,
             seed=17,
         )
         second = build_pilot_selection(
@@ -95,6 +95,8 @@ def test_pilot_is_deterministic_and_selects_whole_theorems(tmp_path: Path):
             output_path=tmp_path / "second.json",
             dataset_name="fake/dataset",
             target_train_rows=18,
+            target_val_rows=3,
+            target_test_rows=2,
             seed=17,
         )
 
@@ -106,9 +108,10 @@ def test_pilot_is_deterministic_and_selects_whole_theorems(tmp_path: Path):
             row.row_index for row in rows["train"] if row.theorem == theorem
         }
         assert not (selected & theorem_indices) or theorem_indices <= selected
-    assert first["splits"]["val"]["row_count"] == len(rows["val"])
-    assert first["splits"]["test"]["row_count"] == len(rows["test"])
+    assert 3 <= first["splits"]["val"]["row_count"] < len(rows["val"])
+    assert 2 <= first["splits"]["test"]["row_count"] <= len(rows["test"])
     assert first["stratum_count"] > 1
+    assert first["selection_basis"] == "dataset-metadata-file-clustered-v1"
 
 
 def test_selection_manifest_filters_exact_rows(tmp_path: Path):

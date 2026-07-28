@@ -10,7 +10,7 @@ from typing import Iterable
 
 from .dataset import DATASET_NAME, DatasetRow, iter_dataset_rows
 from .labels import label_example
-from .preparation import SExprCache
+from .state import parse_state
 
 
 PILOT_SCHEMA_VERSION = 1
@@ -94,6 +94,106 @@ def _context_bucket(mean_hypotheses: float) -> str:
     return "light" if mean_hypotheses <= 4 else "heavy"
 
 
+def _dominant_tactic_bucket(
+    rows: list[DatasetRow], tactic_buckets: dict[str, str]
+) -> str:
+    theorem_tactics = Counter(_tactic_name(row) for row in rows)
+    bucket_counts = {
+        bucket: sum(
+            count
+            for tactic, count in theorem_tactics.items()
+            if tactic_buckets.get(tactic) == bucket
+        )
+        for bucket in ("head", "medium", "tail")
+    }
+    return max(
+        ("head", "medium", "tail"),
+        key=lambda bucket: (
+            bucket_counts[bucket],
+            {"head": 0, "medium": 1, "tail": 2}[bucket],
+        ),
+    )
+
+
+def _select_clustered_evaluation_rows(
+    rows: list[DatasetRow],
+    *,
+    tactic_buckets: dict[str, str],
+    target_rows: int,
+    seed: int,
+) -> tuple[list[DatasetRow], set[str], set[str]]:
+    if target_rows >= len(rows):
+        return rows, {row.theorem for row in rows}, {row.file_path for row in rows}
+
+    theorem_rows: dict[str, list[DatasetRow]] = defaultdict(list)
+    for row in rows:
+        theorem_rows[row.theorem].append(row)
+    groups: list[dict[str, object]] = []
+    for theorem, grouped_rows in theorem_rows.items():
+        grouped_rows.sort(key=lambda row: row.row_index)
+        file_paths = {row.file_path for row in grouped_rows}
+        if len(file_paths) != 1:
+            raise RuntimeError(f"Theorem '{theorem}' spans multiple source files.")
+        groups.append(
+            {
+                "theorem": theorem,
+                "rows": grouped_rows,
+                "row_count": len(grouped_rows),
+                "file_path": next(iter(file_paths)),
+                "stratum": (
+                    _dominant_tactic_bucket(grouped_rows, tactic_buckets),
+                    _length_bucket(len(grouped_rows)),
+                ),
+            }
+        )
+
+    source_files = sorted({str(group["file_path"]) for group in groups})
+    random.Random(seed).shuffle(source_files)
+    file_priority = {file_path: rank for rank, file_path in enumerate(source_files)}
+    strata: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
+    for group in groups:
+        strata[group["stratum"]].append(group)
+
+    selected: list[dict[str, object]] = []
+    selected_theorems: set[str] = set()
+    for key, stratum_groups in sorted(strata.items()):
+        stratum_rows = sum(int(group["row_count"]) for group in stratum_groups)
+        quota = max(1, round(target_rows * stratum_rows / len(rows)))
+        candidates = list(stratum_groups)
+        random.Random(f"{seed}:{key}").shuffle(candidates)
+        candidates.sort(key=lambda group: file_priority[str(group["file_path"])])
+        accumulated = 0
+        for group in candidates:
+            if accumulated >= quota:
+                break
+            selected.append(group)
+            selected_theorems.add(str(group["theorem"]))
+            accumulated += int(group["row_count"])
+
+    selected_count = sum(int(group["row_count"]) for group in selected)
+    if selected_count < target_rows:
+        remaining = [
+            group
+            for group in groups
+            if str(group["theorem"]) not in selected_theorems
+        ]
+        random.Random(seed).shuffle(remaining)
+        remaining.sort(key=lambda group: file_priority[str(group["file_path"])])
+        for group in remaining:
+            if selected_count >= target_rows:
+                break
+            selected.append(group)
+            selected_theorems.add(str(group["theorem"]))
+            selected_count += int(group["row_count"])
+
+    selected_rows = sorted(
+        (row for group in selected for row in group["rows"]),
+        key=lambda row: row.row_index,
+    )
+    selected_files = {str(group["file_path"]) for group in selected}
+    return selected_rows, selected_theorems, selected_files
+
+
 def _distribution(rows: Iterable[DatasetRow]) -> dict[str, int]:
     return dict(sorted(Counter(_tactic_name(row) for row in rows).items()))
 
@@ -121,22 +221,27 @@ def build_pilot_selection(
     output_path: Path,
     dataset_name: str = DATASET_NAME,
     target_train_rows: int = 30_000,
+    target_val_rows: int = 2_000,
+    target_test_rows: int = 2_000,
     seed: int = 42,
-    minimum_train_raw_coverage: float = 0.8,
-    require_complete_eval: bool = True,
 ) -> dict[str, object]:
-    """Select complete train theorems proportionally within structural strata.
+    """Select complete train theorems before any S-expression extraction.
 
     Validation and test remain complete. Train strata combine tactic-frequency,
-    graph-size proxy, proof length, and local-context size. Selection occurs at
-    theorem granularity, preventing partial proof traces. Exact instance-binder
-    roles are deliberately measured after model normalization because legacy
-    raw records do not contain Lean's ``BinderInfo``.
+    proof-state size, proof length, and local-context size. A shared randomized
+    source-file priority preserves proportional strata while clustering work
+    into fewer Mathlib compilations. Selection occurs at theorem granularity,
+    preventing partial proof traces. Exact graph and instance-binder statistics
+    are measured after extraction.
     """
     if target_train_rows < 1:
         raise ValueError("target_train_rows must be positive.")
+    if target_val_rows < 1 or target_test_rows < 1:
+        raise ValueError("target_val_rows and target_test_rows must be positive.")
 
-    cache = SExprCache(prepared_root, project_path="", enabled=True)
+    # Kept in the API because the resulting manifest belongs beside this
+    # prepared/cache root; selection itself intentionally needs no raw cache.
+    _ = prepared_root
     split_rows = {
         split: list(iter_dataset_rows(dataset_name=dataset_name, split=split))
         for split in ("train", "val", "test")
@@ -149,53 +254,30 @@ def build_pilot_selection(
         rows_by_theorem[row.theorem].append(row)
 
     eligible_groups: list[dict[str, object]] = []
-    covered_train_rows = 0
     for theorem, theorem_rows in rows_by_theorem.items():
         theorem_rows.sort(key=lambda row: row.row_index)
-        raw_records = [
-            cache.load_for_row(row, extractor_version=SExprCache.EXTRACTOR_VERSION)
-            for row in theorem_rows
-        ]
-        covered_train_rows += sum(record is not None for record in raw_records)
-        if any(record is None for record in raw_records):
-            continue
-        records = [record for record in raw_records if record is not None]
-        goal_characters = sum(len(str(record["goal_sexp"])) for record in records)
-        hypothesis_count = sum(
-            len(record.get("hyp_sexps", [])) for record in records
-        )
-        theorem_tactics = Counter(_tactic_name(row) for row in theorem_rows)
-        bucket_counts = Counter(
-            {
-                bucket: sum(
-                    count
-                    for tactic, count in theorem_tactics.items()
-                    if tactic_buckets.get(tactic) == bucket
-                )
-                for bucket in ("head", "medium", "tail")
-            }
-        )
-        tactic_bucket = max(
-            ("head", "medium", "tail"),
-            key=lambda bucket: (bucket_counts[bucket], {"head": 0, "medium": 1, "tail": 2}[bucket]),
-        )
+        states = [parse_state(row.state) for row in theorem_rows]
+        state_characters = sum(len(row.state) for row in theorem_rows)
+        hypothesis_count = sum(len(state.hypotheses) for state in states)
+        file_paths = {row.file_path for row in theorem_rows}
+        if len(file_paths) != 1:
+            raise RuntimeError(
+                f"Theorem '{theorem}' spans multiple source files."
+            )
         eligible_groups.append(
             {
                 "theorem": theorem,
                 "rows": theorem_rows,
                 "row_count": len(theorem_rows),
-                "mean_goal_characters": goal_characters / len(records),
-                "mean_hypothesis_count": hypothesis_count / len(records),
-                "tactic_bucket": tactic_bucket,
+                "file_path": next(iter(file_paths)),
+                "mean_state_characters": state_characters / len(theorem_rows),
+                "mean_hypothesis_count": hypothesis_count / len(theorem_rows),
+                "tactic_bucket": _dominant_tactic_bucket(
+                    theorem_rows, tactic_buckets
+                ),
             }
         )
 
-    raw_coverage = covered_train_rows / len(train_rows) if train_rows else 0.0
-    if raw_coverage < minimum_train_raw_coverage:
-        raise RuntimeError(
-            "Raw train coverage is too low for a representative pilot: "
-            f"{raw_coverage:.2%} < {minimum_train_raw_coverage:.2%}."
-        )
     eligible_rows = sum(int(group["row_count"]) for group in eligible_groups)
     if eligible_rows < target_train_rows:
         raise RuntimeError(
@@ -204,13 +286,16 @@ def build_pilot_selection(
         )
 
     cutoffs = _quantile_cutoffs(
-        [float(group["mean_goal_characters"]) for group in eligible_groups]
+        [float(group["mean_state_characters"]) for group in eligible_groups]
     )
+    source_files = sorted({str(group["file_path"]) for group in eligible_groups})
+    random.Random(seed).shuffle(source_files)
+    file_priority = {file_path: rank for rank, file_path in enumerate(source_files)}
     strata: dict[tuple[str, str, str, str], list[dict[str, object]]] = defaultdict(list)
     for group in eligible_groups:
         key = (
             str(group["tactic_bucket"]),
-            _size_bucket(float(group["mean_goal_characters"]), cutoffs),
+            _size_bucket(float(group["mean_state_characters"]), cutoffs),
             _length_bucket(int(group["row_count"])),
             _context_bucket(float(group["mean_hypothesis_count"])),
         )
@@ -223,6 +308,7 @@ def build_pilot_selection(
         quota = max(1, round(target_train_rows * stratum_rows / eligible_rows))
         shuffled = list(groups)
         random.Random(f"{seed}:{key}").shuffle(shuffled)
+        shuffled.sort(key=lambda group: file_priority[str(group["file_path"])])
         accumulated = 0
         for group in shuffled:
             if accumulated >= quota:
@@ -239,6 +325,7 @@ def build_pilot_selection(
             if str(group["theorem"]) not in selected_theorems
         ]
         random.Random(seed).shuffle(remaining)
+        remaining.sort(key=lambda group: file_priority[str(group["file_path"])])
         for group in remaining:
             if selected_count >= target_train_rows:
                 break
@@ -272,37 +359,44 @@ def build_pilot_selection(
     }
     for split in ("val", "test"):
         rows = split_rows[split]
-        missing = [
-            row.row_index
-            for row in rows
-            if cache.load_for_row(
-                row, extractor_version=SExprCache.EXTRACTOR_VERSION
+        target_rows = target_val_rows if split == "val" else target_test_rows
+        selected_rows, selected_theorems, selected_files = (
+            _select_clustered_evaluation_rows(
+                rows,
+                tactic_buckets=tactic_buckets,
+                target_rows=target_rows,
+                seed=seed + (1 if split == "val" else 2),
             )
-            is None
-        ]
-        if missing and require_complete_eval:
-            raise RuntimeError(
-                f"Raw {split} cache is incomplete: {len(missing)} missing rows."
-            )
-        missing_set = set(missing)
-        covered = [row for row in rows if row.row_index not in missing_set]
+        )
         splits[split] = {
-            "row_indices": [row.row_index for row in covered],
-            "theorems": sorted({row.theorem for row in covered}),
-            "row_count": len(covered),
-            "theorem_count": len({row.theorem for row in covered}),
-            "missing_raw_rows": missing,
+            "row_indices": [row.row_index for row in selected_rows],
+            "theorems": sorted(selected_theorems),
+            "row_count": len(selected_rows),
+            "theorem_count": len(selected_theorems),
+            "source_file_count": len(selected_files),
+            "full_split_row_count": len(rows),
+            "tactic_distribution": _distribution(selected_rows),
+            "full_tactic_distribution": _distribution(rows),
+            "tactic_total_variation": _total_variation(
+                _distribution(rows), _distribution(selected_rows)
+            ),
         }
 
+    selected_source_files = {
+        str(group["file_path"]) for group in selected
+    }
     manifest: dict[str, object] = {
         "schema_version": PILOT_SCHEMA_VERSION,
+        "selection_basis": "dataset-metadata-file-clustered-v1",
         "dataset": dataset_name,
         "seed": seed,
         "target_train_rows": target_train_rows,
+        "target_val_rows": target_val_rows,
+        "target_test_rows": target_test_rows,
         "selected_train_rows": len(selected_train_rows),
-        "train_raw_coverage": raw_coverage,
-        "fully_cached_train_theorem_rows": eligible_rows,
-        "goal_character_cutoffs": {
+        "selected_train_source_files": len(selected_source_files),
+        "total_train_source_files": len(source_files),
+        "state_character_cutoffs": {
             "small_medium": cutoffs[0],
             "medium_large": cutoffs[1],
         },

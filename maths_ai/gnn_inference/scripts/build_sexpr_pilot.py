@@ -25,13 +25,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dataset-name", default=DATASET_NAME)
     parser.add_argument("--train-rows", type=int, default=30_000)
+    parser.add_argument("--val-rows", type=int, default=2_000)
+    parser.add_argument("--test-rows", type=int, default=2_000)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--minimum-train-raw-coverage", type=float, default=0.8)
-    parser.add_argument(
-        "--allow-incomplete-eval",
-        action="store_true",
-        help="Select only raw-covered validation/test rows instead of failing.",
-    )
     return parser
 
 
@@ -43,9 +39,9 @@ def main(argv: list[str] | None = None) -> int:
             output_path=args.output,
             dataset_name=args.dataset_name,
             target_train_rows=args.train_rows,
+            target_val_rows=args.val_rows,
+            target_test_rows=args.test_rows,
             seed=args.seed,
-            minimum_train_raw_coverage=args.minimum_train_raw_coverage,
-            require_complete_eval=not args.allow_incomplete_eval,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"Pilot selection failed: {exc}", file=sys.stderr)
@@ -54,7 +50,9 @@ def main(argv: list[str] | None = None) -> int:
     summary = {
         "output": str(args.output),
         "selected_train_rows": manifest["selected_train_rows"],
-        "train_raw_coverage": manifest["train_raw_coverage"],
+        "selection_basis": manifest["selection_basis"],
+        "selected_train_source_files": manifest["selected_train_source_files"],
+        "total_train_source_files": manifest["total_train_source_files"],
         "stratum_count": manifest["stratum_count"],
         "train_tactic_total_variation": manifest["splits"]["train"][
             "tactic_total_variation"
