@@ -18,7 +18,14 @@ from maths_ai.gnn_inference.atp_lean_gnn.preprocess import (
 )
 
 
-def _row(split: str, index: int, theorem: str, tactic: str) -> DatasetRow:
+def _row(
+    split: str,
+    index: int,
+    theorem: str,
+    tactic: str,
+    *,
+    file_path: str | None = None,
+) -> DatasetRow:
     return DatasetRow(
         state=f"state {index}",
         target_state=f"target {index}",
@@ -27,7 +34,7 @@ def _row(split: str, index: int, theorem: str, tactic: str) -> DatasetRow:
         split=split,
         row_index=index,
         dataset_name="fake/dataset",
-        file_path=f"Mathlib/{theorem}.lean",
+        file_path=file_path or f"Mathlib/{theorem}.lean",
     )
 
 
@@ -36,13 +43,15 @@ def _rows() -> dict[str, list[DatasetRow]]:
     index = 0
     tactics = ("rw", "simp", "exact", "intro")
     for theorem_index, length in enumerate((1, 2, 3, 4, 5, 6, 2, 3, 4, 5, 6, 7)):
+        theorem = "aux" if theorem_index < 2 else f"Demo.theorem{theorem_index}"
         for step in range(length):
             train.append(
                 _row(
                     "train",
                     index,
-                    f"Demo.theorem{theorem_index}",
+                    theorem,
                     tactics[(theorem_index + step) % len(tactics)],
+                    file_path=f"Mathlib/File{theorem_index}.lean",
                 )
             )
             index += 1
@@ -103,9 +112,11 @@ def test_pilot_is_deterministic_and_selects_whole_theorems(tmp_path: Path):
     selected = set(first["splits"]["train"]["row_indices"])
     assert selected == set(second["splits"]["train"]["row_indices"])
     assert len(selected) >= 18
-    for theorem in {row.theorem for row in rows["train"]}:
+    for theorem_key in {(row.file_path, row.theorem) for row in rows["train"]}:
         theorem_indices = {
-            row.row_index for row in rows["train"] if row.theorem == theorem
+            row.row_index
+            for row in rows["train"]
+            if (row.file_path, row.theorem) == theorem_key
         }
         assert not (selected & theorem_indices) or theorem_indices <= selected
     assert 3 <= first["splits"]["val"]["row_count"] < len(rows["val"])

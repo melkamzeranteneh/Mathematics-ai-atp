@@ -125,21 +125,20 @@ def _select_clustered_evaluation_rows(
     if target_rows >= len(rows):
         return rows, {row.theorem for row in rows}, {row.file_path for row in rows}
 
-    theorem_rows: dict[str, list[DatasetRow]] = defaultdict(list)
+    theorem_rows: dict[tuple[str, str], list[DatasetRow]] = defaultdict(list)
     for row in rows:
-        theorem_rows[row.theorem].append(row)
+        theorem_rows[(row.file_path, row.theorem)].append(row)
     groups: list[dict[str, object]] = []
-    for theorem, grouped_rows in theorem_rows.items():
+    for group_id, grouped_rows in theorem_rows.items():
+        file_path, theorem = group_id
         grouped_rows.sort(key=lambda row: row.row_index)
-        file_paths = {row.file_path for row in grouped_rows}
-        if len(file_paths) != 1:
-            raise RuntimeError(f"Theorem '{theorem}' spans multiple source files.")
         groups.append(
             {
+                "group_id": group_id,
                 "theorem": theorem,
                 "rows": grouped_rows,
                 "row_count": len(grouped_rows),
-                "file_path": next(iter(file_paths)),
+                "file_path": file_path,
                 "stratum": (
                     _dominant_tactic_bucket(grouped_rows, tactic_buckets),
                     _length_bucket(len(grouped_rows)),
@@ -155,7 +154,7 @@ def _select_clustered_evaluation_rows(
         strata[group["stratum"]].append(group)
 
     selected: list[dict[str, object]] = []
-    selected_theorems: set[str] = set()
+    selected_group_ids: set[tuple[str, str]] = set()
     for key, stratum_groups in sorted(strata.items()):
         stratum_rows = sum(int(group["row_count"]) for group in stratum_groups)
         quota = max(1, round(target_rows * stratum_rows / len(rows)))
@@ -167,7 +166,7 @@ def _select_clustered_evaluation_rows(
             if accumulated >= quota:
                 break
             selected.append(group)
-            selected_theorems.add(str(group["theorem"]))
+            selected_group_ids.add(group["group_id"])
             accumulated += int(group["row_count"])
 
     selected_count = sum(int(group["row_count"]) for group in selected)
@@ -175,7 +174,7 @@ def _select_clustered_evaluation_rows(
         remaining = [
             group
             for group in groups
-            if str(group["theorem"]) not in selected_theorems
+            if group["group_id"] not in selected_group_ids
         ]
         random.Random(seed).shuffle(remaining)
         remaining.sort(key=lambda group: file_priority[str(group["file_path"])])
@@ -183,7 +182,7 @@ def _select_clustered_evaluation_rows(
             if selected_count >= target_rows:
                 break
             selected.append(group)
-            selected_theorems.add(str(group["theorem"]))
+            selected_group_ids.add(group["group_id"])
             selected_count += int(group["row_count"])
 
     selected_rows = sorted(
@@ -191,6 +190,9 @@ def _select_clustered_evaluation_rows(
         key=lambda row: row.row_index,
     )
     selected_files = {str(group["file_path"]) for group in selected}
+    selected_theorems = {
+        f"{file_path}::{theorem}" for file_path, theorem in selected_group_ids
+    }
     return selected_rows, selected_theorems, selected_files
 
 
@@ -249,27 +251,24 @@ def build_pilot_selection(
     train_rows = split_rows["train"]
     tactic_buckets, tactic_counts = _frequency_buckets(train_rows)
 
-    rows_by_theorem: dict[str, list[DatasetRow]] = defaultdict(list)
+    rows_by_theorem: dict[tuple[str, str], list[DatasetRow]] = defaultdict(list)
     for row in train_rows:
-        rows_by_theorem[row.theorem].append(row)
+        rows_by_theorem[(row.file_path, row.theorem)].append(row)
 
     eligible_groups: list[dict[str, object]] = []
-    for theorem, theorem_rows in rows_by_theorem.items():
+    for group_id, theorem_rows in rows_by_theorem.items():
+        file_path, theorem = group_id
         theorem_rows.sort(key=lambda row: row.row_index)
         states = [parse_state(row.state) for row in theorem_rows]
         state_characters = sum(len(row.state) for row in theorem_rows)
         hypothesis_count = sum(len(state.hypotheses) for state in states)
-        file_paths = {row.file_path for row in theorem_rows}
-        if len(file_paths) != 1:
-            raise RuntimeError(
-                f"Theorem '{theorem}' spans multiple source files."
-            )
         eligible_groups.append(
             {
+                "group_id": group_id,
                 "theorem": theorem,
                 "rows": theorem_rows,
                 "row_count": len(theorem_rows),
-                "file_path": next(iter(file_paths)),
+                "file_path": file_path,
                 "mean_state_characters": state_characters / len(theorem_rows),
                 "mean_hypothesis_count": hypothesis_count / len(theorem_rows),
                 "tactic_bucket": _dominant_tactic_bucket(
@@ -302,7 +301,7 @@ def build_pilot_selection(
         strata[key].append(group)
 
     selected: list[dict[str, object]] = []
-    selected_theorems: set[str] = set()
+    selected_group_ids: set[tuple[str, str]] = set()
     for key, groups in sorted(strata.items()):
         stratum_rows = sum(int(group["row_count"]) for group in groups)
         quota = max(1, round(target_train_rows * stratum_rows / eligible_rows))
@@ -314,7 +313,7 @@ def build_pilot_selection(
             if accumulated >= quota:
                 break
             selected.append(group)
-            selected_theorems.add(str(group["theorem"]))
+            selected_group_ids.add(group["group_id"])
             accumulated += int(group["row_count"])
 
     selected_count = sum(int(group["row_count"]) for group in selected)
@@ -322,7 +321,7 @@ def build_pilot_selection(
         remaining = [
             group
             for group in eligible_groups
-            if str(group["theorem"]) not in selected_theorems
+            if group["group_id"] not in selected_group_ids
         ]
         random.Random(seed).shuffle(remaining)
         remaining.sort(key=lambda group: file_priority[str(group["file_path"])])
@@ -330,7 +329,7 @@ def build_pilot_selection(
             if selected_count >= target_train_rows:
                 break
             selected.append(group)
-            selected_theorems.add(str(group["theorem"]))
+            selected_group_ids.add(group["group_id"])
             selected_count += int(group["row_count"])
 
     selected_train_rows = sorted(
@@ -343,6 +342,9 @@ def build_pilot_selection(
         for row in group["rows"]
     )
     selected_distribution = _distribution(selected_train_rows)
+    selected_theorems = {
+        f"{file_path}::{theorem}" for file_path, theorem in selected_group_ids
+    }
 
     splits: dict[str, object] = {
         "train": {
