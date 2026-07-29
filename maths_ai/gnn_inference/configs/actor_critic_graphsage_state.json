@@ -1,5 +1,7 @@
 {
-  "prepared_root": "Nol/Mathematics-ai-atp/maths_ai/_support_files/artifacts/prepared/v1",
+  "prepared_root": "/home/jovyan/Nol/Mathematics-ai-atp/maths_ai/_support_files/artifacts/prepared/v1",
+
+
   "run_root": "runs/actor_critic_gnn",
   "seed": 42,
   "device": "auto",
@@ -10,7 +12,7 @@
   "critic_weight": 0.5,
   "entropy_weight": 0.01,
   "arg_lr_multiplier": 0.1,
-  "pretrained_pointer_checkpoint": "Nol/Mathematics-ai-atp/maths_ai/gnn_inference/runs/pointer_gnn/run_20260726_122913/best.pt",
+  "pretrained_pointer_checkpoint": "/home/jovyan/Nol/Mathematics-ai-atp/maths_ai/gnn_inference/runs/pointer_gnn/run_20260726_122913/best.pt",
   "model": {
     "hidden_dim": 512,
     "num_layers": 4,
