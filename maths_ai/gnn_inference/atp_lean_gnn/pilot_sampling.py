@@ -10,6 +10,7 @@ from typing import Iterable
 
 from .dataset import DATASET_NAME, DatasetRow, iter_dataset_rows
 from .labels import label_example
+from .preparation import SExprCache
 from .state import parse_state
 
 
@@ -226,6 +227,7 @@ def build_pilot_selection(
     target_val_rows: int = 2_000,
     target_test_rows: int = 2_000,
     seed: int = 42,
+    require_cached_train: bool = False,
 ) -> dict[str, object]:
     """Select complete train theorems before any S-expression extraction.
 
@@ -241,9 +243,11 @@ def build_pilot_selection(
     if target_val_rows < 1 or target_test_rows < 1:
         raise ValueError("target_val_rows and target_test_rows must be positive.")
 
-    # Kept in the API because the resulting manifest belongs beside this
-    # prepared/cache root; selection itself intentionally needs no raw cache.
-    _ = prepared_root
+    cache = (
+        SExprCache(prepared_root, project_path="", enabled=True)
+        if require_cached_train
+        else None
+    )
     split_rows = {
         split: list(iter_dataset_rows(dataset_name=dataset_name, split=split))
         for split in ("train", "val", "test")
@@ -259,6 +263,14 @@ def build_pilot_selection(
     for group_id, theorem_rows in rows_by_theorem.items():
         file_path, theorem = group_id
         theorem_rows.sort(key=lambda row: row.row_index)
+        if cache is not None and any(
+            cache.load_for_row(
+                row, extractor_version=SExprCache.EXTRACTOR_VERSION
+            )
+            is None
+            for row in theorem_rows
+        ):
+            continue
         states = [parse_state(row.state) for row in theorem_rows]
         state_characters = sum(len(row.state) for row in theorem_rows)
         hypothesis_count = sum(len(state.hypotheses) for state in states)
@@ -280,7 +292,7 @@ def build_pilot_selection(
     eligible_rows = sum(int(group["row_count"]) for group in eligible_groups)
     if eligible_rows < target_train_rows:
         raise RuntimeError(
-            f"Only {eligible_rows} rows belong to fully cached theorems; "
+            f"Only {eligible_rows} eligible theorem-complete rows are available; "
             f"cannot select {target_train_rows}."
         )
 
@@ -336,11 +348,12 @@ def build_pilot_selection(
         (row for group in selected for row in group["rows"]),
         key=lambda row: row.row_index,
     )
-    full_distribution = _distribution(
+    eligible_distribution = _distribution(
         row
         for group in eligible_groups
         for row in group["rows"]
     )
+    full_distribution = _distribution(train_rows)
     selected_distribution = _distribution(selected_train_rows)
     selected_theorems = {
         f"{file_path}::{theorem}" for file_path, theorem in selected_group_ids
@@ -353,7 +366,8 @@ def build_pilot_selection(
             "row_count": len(selected_train_rows),
             "theorem_count": len(selected_theorems),
             "tactic_distribution": selected_distribution,
-            "eligible_tactic_distribution": full_distribution,
+            "eligible_tactic_distribution": eligible_distribution,
+            "full_tactic_distribution": full_distribution,
             "tactic_total_variation": _total_variation(
                 full_distribution, selected_distribution
             ),
@@ -390,12 +404,17 @@ def build_pilot_selection(
     manifest: dict[str, object] = {
         "schema_version": PILOT_SCHEMA_VERSION,
         "selection_basis": "dataset-metadata-file-clustered-v1",
+        "train_cache_required": require_cached_train,
         "dataset": dataset_name,
         "seed": seed,
         "target_train_rows": target_train_rows,
         "target_val_rows": target_val_rows,
         "target_test_rows": target_test_rows,
         "selected_train_rows": len(selected_train_rows),
+        "eligible_train_rows": eligible_rows,
+        "eligible_train_fraction": (
+            eligible_rows / len(train_rows) if train_rows else 0.0
+        ),
         "selected_train_source_files": len(selected_source_files),
         "total_train_source_files": len(source_files),
         "state_character_cutoffs": {

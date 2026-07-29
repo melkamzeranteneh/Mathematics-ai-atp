@@ -28,6 +28,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val-rows", type=int, default=2_000)
     parser.add_argument("--test-rows", type=int, default=2_000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--require-cached-train",
+        action="store_true",
+        help=(
+            "Select train only from theorem groups whose raw S-expression rows "
+            "are already fully validated."
+        ),
+    )
     return parser
 
 
@@ -42,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
             target_val_rows=args.val_rows,
             target_test_rows=args.test_rows,
             seed=args.seed,
+            require_cached_train=args.require_cached_train,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"Pilot selection failed: {exc}", file=sys.stderr)
@@ -51,6 +60,9 @@ def main(argv: list[str] | None = None) -> int:
         "output": str(args.output),
         "selected_train_rows": manifest["selected_train_rows"],
         "selection_basis": manifest["selection_basis"],
+        "train_cache_required": manifest["train_cache_required"],
+        "eligible_train_rows": manifest["eligible_train_rows"],
+        "eligible_train_fraction": manifest["eligible_train_fraction"],
         "selected_train_source_files": manifest["selected_train_source_files"],
         "total_train_source_files": manifest["total_train_source_files"],
         "stratum_count": manifest["stratum_count"],

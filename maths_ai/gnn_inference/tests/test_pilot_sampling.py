@@ -125,6 +125,50 @@ def test_pilot_is_deterministic_and_selects_whole_theorems(tmp_path: Path):
     assert first["selection_basis"] == "dataset-metadata-file-clustered-v1"
 
 
+def test_cache_only_pilot_uses_fully_cached_theorem_groups(tmp_path: Path):
+    rows = _rows()
+
+    def iter_rows(*, split: str, **_kwargs):
+        return iter(rows[split])
+
+    def load_raw(_cache, row: DatasetRow, **_kwargs):
+        file_index = int(
+            row.file_path.removeprefix("Mathlib/File").removesuffix(".lean")
+        )
+        return _raw_record(row) if file_index % 2 == 0 else None
+
+    with (
+        patch(
+            "maths_ai.gnn_inference.atp_lean_gnn.pilot_sampling.iter_dataset_rows",
+            side_effect=iter_rows,
+        ),
+        patch(
+            "maths_ai.gnn_inference.atp_lean_gnn.pilot_sampling.SExprCache.load_for_row",
+            new=load_raw,
+        ),
+    ):
+        manifest = build_pilot_selection(
+            prepared_root=tmp_path,
+            output_path=tmp_path / "cached.json",
+            dataset_name="fake/dataset",
+            target_train_rows=10,
+            target_val_rows=3,
+            target_test_rows=2,
+            seed=17,
+            require_cached_train=True,
+        )
+
+    selected = set(manifest["splits"]["train"]["row_indices"])
+    assert manifest["train_cache_required"] is True
+    assert selected
+    assert all(
+        int(row.file_path.removeprefix("Mathlib/File").removesuffix(".lean")) % 2
+        == 0
+        for row in rows["train"]
+        if row.row_index in selected
+    )
+
+
 def test_selection_manifest_filters_exact_rows(tmp_path: Path):
     rows = _rows()
     manifest = tmp_path / "pilot.json"
