@@ -49,7 +49,7 @@ class PremiseScorer(nn.Module):
     Parameters
     ----------
     hidden_dim : int
-        Dimensionality of goal, tactic, and candidate embeddings.
+        Dimensionality of state, tactic, and candidate embeddings.
     mode : str
         Scoring mode — ``"dot"`` for scaled dot-product, ``"mlp"`` for a
         learned two-layer scorer.
@@ -64,8 +64,10 @@ class PremiseScorer(nn.Module):
         self.mode = mode
         self.hidden_dim = hidden_dim
 
-        # Project [goal_vec; tactic_emb] → hidden_dim
+        # Project [state_vec; tactic_emb] → hidden_dim  (first-step query)
         self.query_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        # Project [state_vec; tactic_emb; prev_arg] → hidden_dim  (autoregressive update)
+        self.query_proj_ar = nn.Linear(hidden_dim * 3, hidden_dim)
         self.key_proj = nn.Linear(hidden_dim, hidden_dim)
 
         if mode == "mlp":
@@ -81,16 +83,16 @@ class PremiseScorer(nn.Module):
 
     def score(
         self,
-        goal_vec: Tensor,
+        state_vec: Tensor,
         tactic_emb: Tensor,
         candidate_vectors: Tensor,
     ) -> Tensor:
-        """Score each candidate against the tactic-conditioned goal.
+        """Score each candidate against the tactic-conditioned proof state.
 
         Parameters
         ----------
-        goal_vec : Tensor
-            Goal embedding, shape ``[H]`` or ``[1, H]``.
+        state_vec : Tensor
+            Proof-state embedding, shape ``[H]`` or ``[1, H]``.
         tactic_emb : Tensor
             Tactic embedding, shape ``[H]`` or ``[1, H]``.
         candidate_vectors : Tensor
@@ -102,10 +104,10 @@ class PremiseScorer(nn.Module):
             Scores, shape ``[C]``.
         """
         # Flatten to [H]
-        goal = goal_vec.view(-1)
+        state = state_vec.view(-1)
         tactic = tactic_emb.view(-1)
 
-        query = self.query_proj(torch.cat([goal, tactic], dim=0))
+        query = self.query_proj(torch.cat([state, tactic], dim=0))
         candidate_vectors = self.key_proj(candidate_vectors)
 
         if self.mode == "dot":
@@ -122,7 +124,7 @@ class PremiseScorer(nn.Module):
 
     def forward(
         self,
-        goal_vecs: Tensor,
+        state_vecs: Tensor,
         tactic_embs: Tensor,
         pools: list[CandidatePool],
     ) -> list[Tensor]:
@@ -130,8 +132,8 @@ class PremiseScorer(nn.Module):
 
         Parameters
         ----------
-        goal_vecs : Tensor
-            Goal embeddings, shape ``[B, H]``.
+        state_vecs : Tensor
+            Proof-state embeddings, shape ``[B, H]``.
         tactic_embs : Tensor
             Tactic embeddings, shape ``[B, H]``.
         pools : list[CandidatePool]
@@ -142,7 +144,7 @@ class PremiseScorer(nn.Module):
         list[Tensor]
             Per-sample score tensors, each of shape ``[C_i]``.
         """
-        batch_size = goal_vecs.size(0)
+        batch_size = state_vecs.size(0)
         if len(pools) != batch_size:
             raise ValueError(
                 f"Number of pools ({len(pools)}) does not match "
@@ -152,13 +154,60 @@ class PremiseScorer(nn.Module):
         all_scores: list[Tensor] = []
         for b in range(batch_size):
             scores = self.score(
-                goal_vecs[b],
+                state_vecs[b],
                 tactic_embs[b],
                 pools[b].candidate_vectors,
             )
             all_scores.append(scores)
 
         return all_scores
+
+    def select_arguments(
+        self,
+        state_vec: Tensor,
+        tactic_emb: Tensor,
+        candidate_vectors: Tensor,
+        num_args: int,
+    ) -> tuple[list[int], list[float]]:
+        """Autoregressively select ``num_args`` candidates from the pool.
+
+        Step 0 uses ``query_proj([state; tactic])``.
+        Each subsequent step uses ``query_proj_ar([state; tactic; prev_arg])``
+        so the query shifts away from already-chosen candidates.
+        Already-selected positions are masked to ``-inf`` before each argmax.
+        """
+        num_args = min(num_args, candidate_vectors.size(0))
+        if num_args <= 0:
+            return [], []
+
+        state = state_vec.view(-1)
+        tactic = tactic_emb.view(-1)
+        keys = self.key_proj(candidate_vectors)  # [C, H]
+
+        selected_indices: list[int] = []
+        selected_scores: list[float] = []
+        mask = torch.zeros(candidate_vectors.size(0), dtype=torch.bool, device=state.device)
+
+        query = self.query_proj(torch.cat([state, tactic], dim=0))  # [H]
+
+        for _ in range(num_args):
+            if self.mode == "dot":
+                raw_scores = (keys @ query) * self._scale  # [C]
+            else:
+                num_c = keys.size(0)
+                q_exp = query.unsqueeze(0).expand(num_c, -1)
+                raw_scores = self.scorer(torch.cat([q_exp, keys], dim=1)).squeeze(-1)
+
+            raw_scores = raw_scores.masked_fill(mask, float("-inf"))
+            best = int(raw_scores.argmax().item())
+            selected_indices.append(best)
+            selected_scores.append(float(raw_scores[best].item()))
+            mask[best] = True
+
+            prev = candidate_vectors[best].view(-1)
+            query = self.query_proj_ar(torch.cat([state, tactic, prev], dim=0))
+
+        return selected_indices, selected_scores
 
 
 def _find_target_index_in_pool(

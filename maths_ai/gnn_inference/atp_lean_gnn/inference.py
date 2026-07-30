@@ -7,7 +7,6 @@ tactic string.
 
 from __future__ import annotations
 
-import re
 import torch
 from torch_geometric.data import Batch
 
@@ -16,10 +15,11 @@ from .graph import DAGBuilder, GraphNode, proof_state_to_dag
 from .labels import get_tactic_arity
 from .lemma_corpus import LemmaRecord
 from .lemma_index import LemmaIndex
+from .premise_gnn import PremiseGNN
 from .premise_pool import build_unified_pools
 from .premise_scoring import PremiseScorer
 from .pyg import build_premise_mask, dag_to_pyg
-from .state import ProofState, parse_state
+from .state import parse_state
 from .training import transform_edge_index
 
 # ── Tactic-aware argument filtering rules ──────────────────────────────────
@@ -132,6 +132,7 @@ class InferencePipeline:
         device: torch.device,
         k: int = 500,
         lemma_corpus: dict[int, LemmaRecord] | None = None,
+        premise_gnn: PremiseGNN | None = None,
     ) -> None:
         self.model = model
         self.scorer = scorer
@@ -141,12 +142,16 @@ class InferencePipeline:
         self.device = device
         self.k = k
         self.lemma_corpus = lemma_corpus
+        # When provided, PremiseGNN replaces the frozen backbone for embeddings
+        self.premise_gnn = premise_gnn
 
         # Invert tactic vocab for decoding
         self.id_to_tactic = {idx: name for name, idx in tactic_vocab.items()}
 
         self.model.eval()
         self.scorer.eval()
+        if self.premise_gnn is not None:
+            self.premise_gnn.eval()
 
     @torch.no_grad()
     def predict_tactic(self, state_str: str) -> str:
@@ -178,8 +183,12 @@ class InferencePipeline:
         data.edge_index = transform_edge_index(data.edge_index, edge_mode="bidirectional")
         batch = Batch.from_data_list([data])
 
-        node_embeddings = self.model.backbone.encode_nodes(batch)
-        state_emb = self.model.backbone.readout(node_embeddings, batch)
+        if self.premise_gnn is not None:
+            node_embeddings = self.premise_gnn.encode_nodes(batch)
+            state_emb = self.premise_gnn.readout(node_embeddings, batch)
+        else:
+            node_embeddings = self.model.backbone.encode_nodes(batch)
+            state_emb = self.model.backbone.readout(node_embeddings, batch)
         
         tactic_logits = self.model.backbone.classifier(state_emb)
         tactic_probs = torch.softmax(tactic_logits.squeeze(0), dim=-1)
@@ -294,16 +303,18 @@ class InferencePipeline:
                 continue
 
             # ── Default: unified pool scoring (exact, apply, rw, simp, ...) ──
-            scores = self.scorer.score(state_emb.squeeze(0), tactic_emb.squeeze(0), pool.candidate_vectors)
-            sorted_indices = scores.argsort(descending=True)
-            top_indices = sorted_indices[:arity].tolist()
+            top_indices, score_values = self.scorer.select_arguments(
+                state_emb.squeeze(0),
+                tactic_emb.squeeze(0),
+                pool.candidate_vectors,
+                arity,
+            )
 
             arguments = []
             selected_argument_details = []
-            for idx in top_indices:
+            for idx, score_value in zip(top_indices, score_values):
                 source = pool.candidate_sources[idx]
                 cid = pool.candidate_ids[idx]
-                score_value = float(scores[idx].item())
 
                 if source == "local":
                     node = dag.nodes[cid]
