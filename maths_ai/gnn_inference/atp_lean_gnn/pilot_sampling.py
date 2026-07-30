@@ -230,6 +230,76 @@ def _select_clustered_evaluation_rows(
     return selected_rows, selected_theorems, selected_files
 
 
+def _select_balanced_holdout_rows(
+    rows: list[DatasetRow],
+    *,
+    target_rows: int,
+    seed: int,
+) -> tuple[list[DatasetRow], set[str], set[str]]:
+    """Greedily match exact tactic frequencies using whole theorem groups."""
+    theorem_rows: dict[tuple[str, str], list[DatasetRow]] = defaultdict(list)
+    for row in rows:
+        theorem_rows[(row.file_path, row.theorem)].append(row)
+    groups: list[dict[str, object]] = []
+    for group_id, grouped_rows in theorem_rows.items():
+        grouped_rows.sort(key=lambda row: row.row_index)
+        groups.append(
+            {
+                "group_id": group_id,
+                "rows": grouped_rows,
+                "row_count": len(grouped_rows),
+                "tactics": Counter(_tactic_name(row) for row in grouped_rows),
+            }
+        )
+    if target_rows >= len(rows):
+        selected_ids = set(theorem_rows)
+        return rows, {
+            f"{file_path}::{theorem}" for file_path, theorem in selected_ids
+        }, {row.file_path for row in rows}
+
+    full_counts = Counter(_tactic_name(row) for row in rows)
+    desired = {
+        tactic: target_rows * count / len(rows)
+        for tactic, count in full_counts.items()
+    }
+    random.Random(seed).shuffle(groups)
+    selected: list[dict[str, object]] = []
+    selected_counts: Counter[str] = Counter()
+    selected_row_count = 0
+    while selected_row_count < target_rows and groups:
+        remaining_target = target_rows - selected_row_count
+
+        def score(group: dict[str, object]) -> tuple[float, float]:
+            group_tactics = group["tactics"]
+            group_size = int(group["row_count"])
+            balance = sum(
+                count
+                * max(desired.get(tactic, 0.0) - selected_counts[tactic], 0.0)
+                / max(desired.get(tactic, 0.0), 1.0)
+                for tactic, count in group_tactics.items()
+            ) / group_size
+            size_fit = -abs(remaining_target - group_size) / target_rows
+            return balance, size_fit
+
+        best_index = max(range(len(groups)), key=lambda index: score(groups[index]))
+        group = groups.pop(best_index)
+        selected.append(group)
+        selected_row_count += int(group["row_count"])
+        selected_counts.update(group["tactics"])
+
+    selected_rows = sorted(
+        (row for group in selected for row in group["rows"]),
+        key=lambda row: row.row_index,
+    )
+    selected_ids = {group["group_id"] for group in selected}
+    selected_theorems = {
+        f"{file_path}::{theorem}" for file_path, theorem in selected_ids
+    }
+    return selected_rows, selected_theorems, {
+        row.file_path for row in selected_rows
+    }
+
+
 def _distribution(rows: Iterable[DatasetRow]) -> dict[str, int]:
     return dict(sorted(Counter(_tactic_name(row) for row in rows).items()))
 
@@ -396,9 +466,8 @@ def build_pilot_selection(
     }
 
     if evaluation_from_train:
-        holdout_val, val_theorems, val_files = _select_clustered_evaluation_rows(
+        holdout_val, val_theorems, val_files = _select_balanced_holdout_rows(
             selected_train_rows,
-            tactic_buckets=tactic_buckets,
             target_rows=target_val_rows,
             seed=seed + 1,
         )
@@ -407,9 +476,8 @@ def build_pilot_selection(
             row for row in selected_train_rows if row.row_index not in val_indices
         ]
         holdout_test, test_theorems, test_files = (
-            _select_clustered_evaluation_rows(
+            _select_balanced_holdout_rows(
                 after_val,
-                tactic_buckets=tactic_buckets,
                 target_rows=target_test_rows,
                 seed=seed + 2,
             )
