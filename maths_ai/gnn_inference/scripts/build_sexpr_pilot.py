@@ -36,6 +36,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "are already fully validated."
         ),
     )
+    parser.add_argument(
+        "--evaluation-from-train",
+        action="store_true",
+        help=(
+            "Create theorem-disjoint logical validation/test holdouts from "
+            "selected cached train rows. Intended only for paired ablations."
+        ),
+    )
     return parser
 
 
@@ -51,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
             target_test_rows=args.test_rows,
             seed=args.seed,
             require_cached_train=args.require_cached_train,
+            evaluation_from_train=args.evaluation_from_train,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"Pilot selection failed: {exc}", file=sys.stderr)
@@ -59,8 +68,10 @@ def main(argv: list[str] | None = None) -> int:
     summary = {
         "output": str(args.output),
         "selected_train_rows": manifest["selected_train_rows"],
+        "selected_source_train_rows": manifest["selected_source_train_rows"],
         "selection_basis": manifest["selection_basis"],
         "train_cache_required": manifest["train_cache_required"],
+        "evaluation_from_train": manifest["evaluation_from_train"],
         "eligible_train_rows": manifest["eligible_train_rows"],
         "eligible_train_fraction": manifest["eligible_train_fraction"],
         "selected_train_source_files": manifest["selected_train_source_files"],

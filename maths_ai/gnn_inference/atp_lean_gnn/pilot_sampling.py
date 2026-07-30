@@ -50,6 +50,39 @@ def selected_row_indices(
     return set(row_indices)
 
 
+def selected_extraction_row_indices(
+    path: Path, source_split: str, *, dataset_name: str | None = None
+) -> set[int]:
+    """Return all logical partition rows backed by one dataset split."""
+    payload = load_selection_manifest(path)
+    if dataset_name is not None and payload.get("dataset") != dataset_name:
+        raise ValueError(
+            f"Pilot selection dataset {payload.get('dataset')!r} does not match "
+            f"{dataset_name!r}."
+        )
+    selected: set[int] = set()
+    for logical_split, split_payload in payload["splits"].items():
+        if not isinstance(split_payload, dict):
+            raise ValueError(f"Pilot selection for '{logical_split}' is invalid.")
+        if split_payload.get("source_split", logical_split) != source_split:
+            continue
+        row_indices = split_payload.get("row_indices")
+        if not isinstance(row_indices, list) or not all(
+            isinstance(value, int) for value in row_indices
+        ):
+            raise ValueError(
+                f"Pilot selection for '{logical_split}' has invalid row indices."
+            )
+        overlap = selected.intersection(row_indices)
+        if overlap:
+            raise ValueError(
+                "Logical pilot partitions overlap within source split "
+                f"'{source_split}'."
+            )
+        selected.update(row_indices)
+    return selected
+
+
 def _tactic_name(row: DatasetRow) -> str:
     try:
         return str(label_example(row.tactic)["tactic_name"])
@@ -228,6 +261,7 @@ def build_pilot_selection(
     target_test_rows: int = 2_000,
     seed: int = 42,
     require_cached_train: bool = False,
+    evaluation_from_train: bool = False,
 ) -> dict[str, object]:
     """Select complete train theorems before any S-expression extraction.
 
@@ -242,6 +276,8 @@ def build_pilot_selection(
         raise ValueError("target_train_rows must be positive.")
     if target_val_rows < 1 or target_test_rows < 1:
         raise ValueError("target_val_rows and target_test_rows must be positive.")
+    if evaluation_from_train and not require_cached_train:
+        raise ValueError("evaluation_from_train requires require_cached_train.")
 
     cache = (
         SExprCache(prepared_root, project_path="", enabled=True)
@@ -359,44 +395,102 @@ def build_pilot_selection(
         f"{file_path}::{theorem}" for file_path, theorem in selected_group_ids
     }
 
-    splits: dict[str, object] = {
-        "train": {
-            "row_indices": [row.row_index for row in selected_train_rows],
-            "theorems": sorted(selected_theorems),
-            "row_count": len(selected_train_rows),
-            "theorem_count": len(selected_theorems),
-            "tactic_distribution": selected_distribution,
-            "eligible_tactic_distribution": eligible_distribution,
-            "full_tactic_distribution": full_distribution,
-            "tactic_total_variation": _total_variation(
-                full_distribution, selected_distribution
-            ),
-        }
-    }
-    for split in ("val", "test"):
-        rows = split_rows[split]
-        target_rows = target_val_rows if split == "val" else target_test_rows
-        selected_rows, selected_theorems, selected_files = (
+    if evaluation_from_train:
+        holdout_val, val_theorems, val_files = _select_clustered_evaluation_rows(
+            selected_train_rows,
+            tactic_buckets=tactic_buckets,
+            target_rows=target_val_rows,
+            seed=seed + 1,
+        )
+        val_indices = {row.row_index for row in holdout_val}
+        after_val = [
+            row for row in selected_train_rows if row.row_index not in val_indices
+        ]
+        holdout_test, test_theorems, test_files = (
             _select_clustered_evaluation_rows(
-                rows,
+                after_val,
                 tactic_buckets=tactic_buckets,
-                target_rows=target_rows,
-                seed=seed + (1 if split == "val" else 2),
+                target_rows=target_test_rows,
+                seed=seed + 2,
             )
         )
-        splits[split] = {
-            "row_indices": [row.row_index for row in selected_rows],
-            "theorems": sorted(selected_theorems),
-            "row_count": len(selected_rows),
-            "theorem_count": len(selected_theorems),
-            "source_file_count": len(selected_files),
-            "full_split_row_count": len(rows),
-            "tactic_distribution": _distribution(selected_rows),
-            "full_tactic_distribution": _distribution(rows),
-            "tactic_total_variation": _total_variation(
-                _distribution(rows), _distribution(selected_rows)
-            ),
+        test_indices = {row.row_index for row in holdout_test}
+        logical_train = [
+            row for row in after_val if row.row_index not in test_indices
+        ]
+        train_theorems = {
+            f"{row.file_path}::{row.theorem}" for row in logical_train
         }
+        splits: dict[str, object] = {}
+        for logical_split, logical_rows, theorem_ids, files in (
+            (
+                "train",
+                logical_train,
+                train_theorems,
+                {row.file_path for row in logical_train},
+            ),
+            ("val", holdout_val, val_theorems, val_files),
+            ("test", holdout_test, test_theorems, test_files),
+        ):
+            distribution = _distribution(logical_rows)
+            splits[logical_split] = {
+                "source_split": "train",
+                "internal_holdout": logical_split != "train",
+                "row_indices": [row.row_index for row in logical_rows],
+                "theorems": sorted(theorem_ids),
+                "row_count": len(logical_rows),
+                "theorem_count": len(theorem_ids),
+                "source_file_count": len(files),
+                "tactic_distribution": distribution,
+                "full_tactic_distribution": full_distribution,
+                "tactic_total_variation": _total_variation(
+                    full_distribution, distribution
+                ),
+            }
+        selected_distribution = _distribution(logical_train)
+    else:
+        splits = {
+            "train": {
+                "source_split": "train",
+                "internal_holdout": False,
+                "row_indices": [row.row_index for row in selected_train_rows],
+                "theorems": sorted(selected_theorems),
+                "row_count": len(selected_train_rows),
+                "theorem_count": len(selected_theorems),
+                "tactic_distribution": selected_distribution,
+                "eligible_tactic_distribution": eligible_distribution,
+                "full_tactic_distribution": full_distribution,
+                "tactic_total_variation": _total_variation(
+                    full_distribution, selected_distribution
+                ),
+            }
+        }
+        for split in ("val", "test"):
+            rows = split_rows[split]
+            target_rows = target_val_rows if split == "val" else target_test_rows
+            selected_rows, selected_eval_theorems, selected_files = (
+                _select_clustered_evaluation_rows(
+                    rows,
+                    tactic_buckets=tactic_buckets,
+                    target_rows=target_rows,
+                    seed=seed + (1 if split == "val" else 2),
+                )
+            )
+            splits[split] = {
+                "source_split": split,
+                "internal_holdout": False,
+                "row_indices": [row.row_index for row in selected_rows],
+                "theorems": sorted(selected_eval_theorems),
+                "row_count": len(selected_rows),
+                "theorem_count": len(selected_eval_theorems),
+                "source_file_count": len(selected_files),
+                "full_split_row_count": len(rows),
+                "tactic_distribution": _distribution(selected_rows),
+                "full_tactic_distribution": _distribution(rows),
+                "tactic_total_variation": _total_variation(
+                    _distribution(rows), _distribution(selected_rows)
+                ),
+            }
 
     selected_source_files = {
         str(group["file_path"]) for group in selected
@@ -405,12 +499,14 @@ def build_pilot_selection(
         "schema_version": PILOT_SCHEMA_VERSION,
         "selection_basis": "dataset-metadata-file-clustered-v1",
         "train_cache_required": require_cached_train,
+        "evaluation_from_train": evaluation_from_train,
         "dataset": dataset_name,
         "seed": seed,
         "target_train_rows": target_train_rows,
         "target_val_rows": target_val_rows,
         "target_test_rows": target_test_rows,
-        "selected_train_rows": len(selected_train_rows),
+        "selected_source_train_rows": len(selected_train_rows),
+        "selected_train_rows": int(splits["train"]["row_count"]),
         "eligible_train_rows": eligible_rows,
         "eligible_train_fraction": (
             eligible_rows / len(train_rows) if train_rows else 0.0

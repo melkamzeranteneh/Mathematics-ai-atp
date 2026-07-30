@@ -13,7 +13,7 @@ from typing import Iterable
 
 from .dataset import DATASET_NAME, DatasetRow, canonicalize_split_name, iter_dataset_rows
 from .preparation import ModelSExprCache, SExprCache
-from .pilot_sampling import selected_row_indices
+from .pilot_sampling import selected_extraction_row_indices
 from .reporting import console_print
 from .state import parse_state
 
@@ -1104,7 +1104,7 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
                 )
             )
             if config.selection_manifest is not None:
-                selected = selected_row_indices(
+                selected = selected_extraction_row_indices(
                     config.selection_manifest,
                     split,
                     dataset_name=config.dataset_name,

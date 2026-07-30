@@ -69,3 +69,24 @@ Pass that same file first to raw extraction, then normalized extraction, and
 finally to both preprocessing runs with `--selection-manifest`. This ensures
 the ablation uses identical theorem traces and row indices. Do not combine it
 with first-N sampling (`--max-items` or `--sample-per-split`).
+
+When benchmark validation/test extraction is intentionally deferred, a paired
+representation ablation may instead use theorem-disjoint holdouts from the
+validated train cache:
+
+```bash
+python -m maths_ai.gnn_inference.scripts.build_sexpr_pilot \
+  --prepared-root maths_ai/_support_files/artifacts/prepared/v1 \
+  --output maths_ai/_support_files/artifacts/sexpr_pilot_internal.json \
+  --train-rows 30000 \
+  --val-rows 2000 \
+  --test-rows 2000 \
+  --seed 42 \
+  --require-cached-train \
+  --evaluation-from-train
+```
+
+The `--train-rows` target is the total source pool before holdout, so the
+logical training partition is approximately 26,000 rows. Such scores are
+internal ablation measurements and must not be reported as official benchmark
+validation/test accuracy.

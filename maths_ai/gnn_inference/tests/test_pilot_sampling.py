@@ -10,6 +10,7 @@ import pytest
 from maths_ai.gnn_inference.atp_lean_gnn.dataset import DatasetRow
 from maths_ai.gnn_inference.atp_lean_gnn.pilot_sampling import (
     build_pilot_selection,
+    selected_extraction_row_indices,
     selected_row_indices,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.preprocess import (
@@ -169,6 +170,65 @@ def test_cache_only_pilot_uses_fully_cached_theorem_groups(tmp_path: Path):
     )
 
 
+def test_cached_train_can_be_partitioned_into_theorem_disjoint_holdouts(
+    tmp_path: Path,
+):
+    rows = _rows()
+
+    def iter_rows(*, split: str, **_kwargs):
+        return iter(rows[split])
+
+    with (
+        patch(
+            "maths_ai.gnn_inference.atp_lean_gnn.pilot_sampling.iter_dataset_rows",
+            side_effect=iter_rows,
+        ),
+        patch(
+            "maths_ai.gnn_inference.atp_lean_gnn.pilot_sampling.SExprCache.load_for_row",
+            side_effect=lambda row, **_kwargs: _raw_record(row),
+        ),
+    ):
+        manifest = build_pilot_selection(
+            prepared_root=tmp_path,
+            output_path=tmp_path / "holdout.json",
+            dataset_name="fake/dataset",
+            target_train_rows=18,
+            target_val_rows=3,
+            target_test_rows=2,
+            seed=17,
+            require_cached_train=True,
+            evaluation_from_train=True,
+        )
+
+    partitions = {
+        split: set(manifest["splits"][split]["row_indices"])
+        for split in ("train", "val", "test")
+    }
+    assert manifest["evaluation_from_train"] is True
+    assert all(
+        manifest["splits"][split]["source_split"] == "train"
+        for split in partitions
+    )
+    assert not partitions["train"] & partitions["val"]
+    assert not partitions["train"] & partitions["test"]
+    assert not partitions["val"] & partitions["test"]
+    assert selected_extraction_row_indices(
+        tmp_path / "holdout.json", "train", dataset_name="fake/dataset"
+    ) == set().union(*partitions.values())
+
+    theorem_partitions = {
+        split: {
+            (row.file_path, row.theorem)
+            for row in rows["train"]
+            if row.row_index in indices
+        }
+        for split, indices in partitions.items()
+    }
+    assert not theorem_partitions["train"] & theorem_partitions["val"]
+    assert not theorem_partitions["train"] & theorem_partitions["test"]
+    assert not theorem_partitions["val"] & theorem_partitions["test"]
+
+
 def test_selection_manifest_filters_exact_rows(tmp_path: Path):
     rows = _rows()
     manifest = tmp_path / "pilot.json"
@@ -197,6 +257,40 @@ def test_selection_manifest_filters_exact_rows(tmp_path: Path):
     assert selected_row_indices(
         manifest, "train", dataset_name="fake/dataset"
     ) == {1, 3}
+
+
+def test_logical_holdout_loads_rows_from_manifest_source_split(tmp_path: Path):
+    rows = _rows()
+    manifest = tmp_path / "holdout.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "dataset": "fake/dataset",
+                "splits": {
+                    "val": {
+                        "source_split": "train",
+                        "row_indices": [1, 3],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def iter_rows(*, split: str, **_kwargs):
+        assert split == "train"
+        return iter(rows["train"])
+
+    with patch(
+        "maths_ai.gnn_inference.atp_lean_gnn.preprocess.iter_dataset_rows",
+        side_effect=iter_rows,
+    ):
+        filtered = _load_rows(
+            "fake/dataset", "val", selection_manifest=manifest
+        )
+    assert [row.row_index for row in filtered] == [1, 3]
+    assert all(row.split == "train" for row in filtered)
 
 
 def test_selection_manifest_rejects_sample_limit(tmp_path: Path):

@@ -33,7 +33,7 @@ from .preparation import (
     prepare_example,
     SExprCache,
 )
-from .pilot_sampling import selected_row_indices
+from .pilot_sampling import load_selection_manifest, selected_row_indices
 from .labels import build_tactic_vocab, encode_tactic_name
 from .lemma_corpus import load_lemma_name_index
 from .pyg import build_vocab_from_labels, dag_to_pyg
@@ -88,9 +88,18 @@ def _load_rows(
     """Load all rows for a split into memory, grouped by order."""
     if selection_manifest is not None and sample_limit is not None:
         raise ValueError("selection_manifest and sample_limit cannot be combined.")
+    source_split = split
+    if selection_manifest is not None:
+        payload = load_selection_manifest(selection_manifest)
+        split_payload = payload["splits"].get(split)
+        if not isinstance(split_payload, dict):
+            raise ValueError(
+                f"Pilot selection manifest has no '{split}' split."
+            )
+        source_split = str(split_payload.get("source_split", split))
     rows = list(iter_dataset_rows(
         dataset_name=dataset_name,
-        split=split,
+        split=source_split,
         sample_limit=sample_limit,
     ))
     if selection_manifest is None:
