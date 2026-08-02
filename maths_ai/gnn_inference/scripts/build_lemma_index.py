@@ -1,4 +1,4 @@
-from __future__ import annotations
+"""Build FAISS index for lemma embeddings using baseline or PremiseGNN encoder."""
 
 import argparse
 import json
@@ -96,15 +96,18 @@ def _load_premise_gnn(
     """Load a PremiseGNN from a checkpoint saved by the premise training loop."""
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt.get("premise_gnn_config", {})
+    
+    # FIX: Added num_tactics parameter (required by PremiseGNN)
     model = PremiseGNN(
         num_node_labels=len(metadata.node_vocab),
+        num_tactics=len(metadata.tactic_vocab),  # ← FIXED: Added missing parameter
         hidden_dim=cfg.get("hidden_dim", 128),
         num_layers=cfg.get("num_layers", 3),
         heads=cfg.get("heads", 4),
         dropout=cfg.get("dropout", 0.1),
         backbone=cfg.get("backbone", "gatv2"),
     ).to(device)
-    model.load_state_dict(ckpt["premise_gnn_state_dict"])
+    model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     return model
 
@@ -235,9 +238,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--corpus-path", type=str, required=True, help="Path to lemmas.jsonl")
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR), help="Output directory")
     parser.add_argument("--prepared-root", type=str, required=True, help="Prepared dataset root")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Baseline model checkpoint path")
+    
+    # FIX: Updated help text to clarify checkpoint requirement
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Baseline model checkpoint path (still required even when using --premise-gnn-checkpoint)"
+    )
     parser.add_argument("--config", type=str, default=None, help="Optional baseline config path")
-    parser.add_argument("--premise-gnn-checkpoint", type=str, default=None, help="PremiseGNN checkpoint (overrides baseline encoder)")
+    
+    # FIX: Updated help text to clarify PremiseGNN usage
+    parser.add_argument(
+        "--premise-gnn-checkpoint",
+        type=str,
+        default=None,
+        help="PremiseGNN checkpoint (overrides baseline encoder). Use this instead of the baseline encoder."
+    )
+    
     parser.add_argument("--device", type=str, default="auto", help="auto, cpu, or cuda")
     parser.add_argument("--edge-mode", type=str, default="bidirectional", help="forward or bidirectional")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for embedding")

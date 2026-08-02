@@ -29,6 +29,7 @@ from .reporting import console_print
 
 DEFAULT_BASELINE_CONFIG_PATH = Path("configs") / "baseline_graphsage_state.json"
 DEFAULT_POINTER_CONFIG_PATH = Path("configs") / "pointer_graphsage_state.json"
+DEFAULT_PREMISE_CONFIG_PATH = Path("configs") / "premise_gnn.json"
 REQUIRED_DATA_FIELDS = ("x", "node_type", "edge_index", "y", "split", "row_index", "tactic_name")
 REQUIRED_POINTER_DATA_FIELDS = REQUIRED_DATA_FIELDS + ("premise_mask", "arg_node_indices")
 
@@ -271,6 +272,147 @@ class PointerConfig:
 
 
 @dataclass(frozen=True)
+class PremiseGNNConfig:
+    """Config for PremiseGNN contrastive training."""
+    prepared_root: Path
+    run_root: Path
+    seed: int = 42
+    device: str = "auto"
+    edge_mode: str = "bidirectional"
+    use_node_type: bool = True
+    max_args: int = 3
+    
+    # PremiseGNN specific
+    hidden_dim: int = 128
+    num_layers: int = 3
+    heads: int = 4
+    dropout: float = 0.1
+    backbone: str = "gatv2"
+    temperature: float = 0.07
+    retrieval_k: int = 500
+    lemma_corpus_path: Path | None = None
+    
+    training: TrainingLoopConfig = field(default_factory=TrainingLoopConfig)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "PremiseGNNConfig":
+        if "prepared_root" not in payload:
+            raise ValueError("Training config is missing the required 'prepared_root' field.")
+        
+        model_payload = payload.get("model", {})
+        training_payload = payload.get("training", {})
+        lemma_path = payload.get("lemma_corpus_path")
+        
+        return cls(
+            prepared_root=Path(payload["prepared_root"]),
+            run_root=Path(payload.get("run_root", "runs/premise_gnn")),
+            seed=int(payload.get("seed", 42)),
+            device=str(payload.get("device", "auto")),
+            edge_mode=str(payload.get("edge_mode", "bidirectional")),
+            use_node_type=bool(payload.get("use_node_type", True)),
+            max_args=int(payload.get("max_args", 3)),
+            hidden_dim=int(model_payload.get("hidden_dim", 128)),
+            num_layers=int(model_payload.get("num_layers", 3)),
+            heads=int(model_payload.get("heads", 4)),
+            dropout=float(model_payload.get("dropout", 0.1)),
+            backbone=str(model_payload.get("backbone", "gatv2")),
+            temperature=float(payload.get("temperature", 0.07)),
+            retrieval_k=int(payload.get("retrieval_k", 500)),
+            lemma_corpus_path=Path(lemma_path) if lemma_path else None,
+            training=TrainingLoopConfig(
+                batch_size=int(training_payload.get("batch_size", 32)),
+                epochs=int(training_payload.get("epochs", 20)),
+                learning_rate=float(training_payload.get("learning_rate", 1e-3)),
+                weight_decay=float(training_payload.get("weight_decay", 1e-4)),
+                grad_clip=float(training_payload.get("grad_clip", 1.0)),
+                log_every_batches=int(training_payload.get("log_every_batches", 100)),
+                num_workers=int(training_payload.get("num_workers", 2)),
+                pin_memory=bool(training_payload.get("pin_memory", True)),
+                persistent_workers=bool(training_payload.get("persistent_workers", True)),
+                prefetch_factor=int(training_payload.get("prefetch_factor", 2)),
+                use_amp=bool(training_payload.get("use_amp", True)),
+            ),
+        ).normalized()
+
+    def normalized(self) -> "PremiseGNNConfig":
+        edge_mode = self.edge_mode.lower().strip()
+        if edge_mode not in {"forward", "bidirectional"}:
+            raise ValueError("edge_mode must be 'forward' or 'bidirectional'.")
+        
+        device = self.device.lower().strip()
+        if device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("device must be one of: auto, cpu, cuda.")
+        
+        if self.hidden_dim < 1:
+            raise ValueError("hidden_dim must be positive.")
+        if self.num_layers < 1:
+            raise ValueError("num_layers must be positive.")
+        if self.heads < 1:
+            raise ValueError("heads must be positive.")
+        if self.dropout < 0 or self.dropout >= 1:
+            raise ValueError("dropout must be in [0, 1).")
+        if self.backbone not in {"gatv2", "sage"}:
+            raise ValueError("backbone must be 'gatv2' or 'sage'.")
+        if self.temperature <= 0:
+            raise ValueError("temperature must be positive.")
+        if self.retrieval_k < 1:
+            raise ValueError("retrieval_k must be positive.")
+        if self.max_args < 1:
+            raise ValueError("max_args must be positive.")
+        if self.lemma_corpus_path is not None and not self.lemma_corpus_path.exists():
+            raise FileNotFoundError(f"Lemma corpus not found: {self.lemma_corpus_path}")
+        if self.training.batch_size < 1:
+            raise ValueError("training.batch_size must be positive.")
+        if self.training.epochs < 1:
+            raise ValueError("training.epochs must be positive.")
+        if self.training.learning_rate <= 0:
+            raise ValueError("training.learning_rate must be positive.")
+        if self.training.weight_decay < 0:
+            raise ValueError("training.weight_decay cannot be negative.")
+        if self.training.grad_clip <= 0:
+            raise ValueError("training.grad_clip must be positive.")
+
+        return PremiseGNNConfig(
+            prepared_root=self.prepared_root.resolve(),
+            run_root=self.run_root.resolve(),
+            seed=self.seed,
+            device=device,
+            edge_mode=edge_mode,
+            use_node_type=self.use_node_type,
+            max_args=self.max_args,
+            hidden_dim=self.hidden_dim,
+            num_layers=self.num_layers,
+            heads=self.heads,
+            dropout=self.dropout,
+            backbone=self.backbone,
+            temperature=self.temperature,
+            retrieval_k=self.retrieval_k,
+            lemma_corpus_path=self.lemma_corpus_path,
+            training=self.training,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "prepared_root": str(self.prepared_root),
+            "run_root": str(self.run_root),
+            "seed": self.seed,
+            "device": self.device,
+            "edge_mode": self.edge_mode,
+            "use_node_type": self.use_node_type,
+            "max_args": self.max_args,
+            "hidden_dim": self.hidden_dim,
+            "num_layers": self.num_layers,
+            "heads": self.heads,
+            "dropout": self.dropout,
+            "backbone": self.backbone,
+            "temperature": self.temperature,
+            "retrieval_k": self.retrieval_k,
+            "lemma_corpus_path": str(self.lemma_corpus_path) if self.lemma_corpus_path else None,
+            "training": self.training.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
 class PreparedMetadata:
     root: Path
     node_vocab: dict[str, int]
@@ -353,6 +495,28 @@ def load_pointer_config(
     if epochs_override is not None:
         payload.setdefault("training", {})["epochs"] = epochs_override
     return PointerConfig.from_dict(payload)
+
+
+def load_premise_gnn_config(
+    config_path: str | Path = DEFAULT_PREMISE_CONFIG_PATH,
+    *,
+    prepared_root_override: str | Path | None = None,
+    run_root_override: str | Path | None = None,
+    epochs_override: int | None = None,
+) -> PremiseGNNConfig:
+    """Load PremiseGNN configuration from JSON file."""
+    config_file = Path(config_path)
+    if not config_file.exists():
+        raise FileNotFoundError(f"Training config file '{config_file}' does not exist.")
+
+    payload = _read_json(config_file)
+    if prepared_root_override is not None:
+        payload["prepared_root"] = str(prepared_root_override)
+    if run_root_override is not None:
+        payload["run_root"] = str(run_root_override)
+    if epochs_override is not None:
+        payload.setdefault("training", {})["epochs"] = epochs_override
+    return PremiseGNNConfig.from_dict(payload)
 
 
 def load_prepared_metadata(prepared_root: str | Path) -> PreparedMetadata:
@@ -515,7 +679,7 @@ class PreparedGraphDataset(Dataset):
 
 def build_dataloaders(
     metadata: PreparedMetadata,
-    config: BaselineConfig | PointerConfig,
+    config: BaselineConfig | PointerConfig | PremiseGNNConfig,
     required_fields: tuple[str, ...] = REQUIRED_DATA_FIELDS,
 ) -> tuple[dict[str, PreparedGraphDataset], dict[str, DataLoader]]:
     use_workers = config.training.num_workers > 0
@@ -640,7 +804,26 @@ def build_pointer_model(metadata: PreparedMetadata, config: PointerConfig) -> Ta
     )
 
 
-def _use_cuda_amp(device: torch.device, config: BaselineConfig | PointerConfig) -> bool:
+def build_premise_gnn_model(
+    metadata: PreparedMetadata,
+    config: PremiseGNNConfig,
+) -> "PremiseGNN":
+    
+    """Build PremiseGNN model for contrastive learning."""
+    from .premise_gnn import PremiseGNN
+    return PremiseGNN(
+        num_node_labels=len(metadata.node_vocab),
+        num_tactics=len(metadata.tactic_vocab),
+        hidden_dim=config.hidden_dim,
+        num_layers=config.num_layers,
+        heads=config.heads,
+        dropout=config.dropout,
+        backbone=config.backbone,
+        num_node_types=len(NODE_TYPE_TO_ID),
+    )
+
+
+def _use_cuda_amp(device: torch.device, config) -> bool:
     return config.training.use_amp and device.type == "cuda"
 
 
@@ -803,9 +986,9 @@ def _create_run_dir(run_root: Path) -> Path:
 def _save_checkpoint(
     path: Path,
     *,
-    model: GraphSAGEStateClassifier | TacticWithArgsClassifier,
+    model,
     optimizer: AdamW,
-    config: BaselineConfig | PointerConfig,
+    config,
     epoch: int,
     val_metrics: dict[str, float | int],
 ) -> Path:
@@ -1252,8 +1435,246 @@ def train_pointer(
     console_print(f"  Training summary         : {run_dir / 'summary.json'}")
 
     return summary
+def train_premise_gnn(
+    config: PremiseGNNConfig,
+    *,
+    resume_run_dir: str | Path | None = None,
+) -> dict[str, object]:
+    """Train PremiseGNN with contrastive learning."""
+    from .lemma_index import LemmaIndex
+    from .premise_training import (
+        train_one_epoch_premise_gnn,
+        evaluate_premise_gnn,
+    )
+    
+    metadata = load_prepared_metadata(config.prepared_root)
+    set_seed(config.seed)
+    device = resolve_device(config.device)
+    use_amp = _use_cuda_amp(device, config)
+    datasets, loaders = build_dataloaders(
+        metadata, config, required_fields=REQUIRED_POINTER_DATA_FIELDS
+    )
+    
+    # Initialize lemma index
+    if config.lemma_corpus_path is None:
+        raise ValueError("lemma_corpus_path required for PremiseGNN")
+    lemma_index = None
+    if config.lemma_corpus_path is not None and not config.lemma_corpus_path.exists():
+        raise FileNotFoundError(f"Lemma corpus not found: {config.lemma_corpus_path}")
+    
+    # Create run directory
+    if resume_run_dir is None:
+        run_dir = _create_run_dir(config.run_root)
+        config_path = _write_json(run_dir / "config.json", config.to_dict())
+        start_epoch = 1
+        best_epoch = 0
+        best_coverage = -1.0
+    else:
+        run_dir = Path(resume_run_dir).resolve()
+        if not run_dir.exists():
+            raise FileNotFoundError(f"Resume run directory '{run_dir}' does not exist.")
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"Resume run path '{run_dir}' is not a directory.")
+        config_path = run_dir / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Resume run directory '{run_dir}' is missing 'config.json'.")
+        start_epoch = 1
+        best_epoch = 0
+        best_coverage = -1.0
 
+    metrics_path = run_dir / "metrics.jsonl"
+    best_checkpoint_path = run_dir / "best.pt"
+    last_checkpoint_path = run_dir / "last.pt"
 
+    # Build model
+    model = build_premise_gnn_model(metadata, config).to(device)
+    
+    # Optimizer
+    optimizer = AdamW(
+        model.parameters(),
+        lr=config.training.learning_rate,
+        weight_decay=config.training.weight_decay,
+    )
+    grad_scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
+
+    # Resume if needed
+    if resume_run_dir is not None:
+        if not last_checkpoint_path.exists():
+            raise FileNotFoundError(f"Resume run '{run_dir}' is missing 'last.pt'")
+        last_checkpoint = _load_checkpoint(last_checkpoint_path, device=device)
+        model.load_state_dict(last_checkpoint["model_state_dict"])
+        optimizer.load_state_dict(last_checkpoint["optimizer_state_dict"])
+        start_epoch = int(last_checkpoint["epoch"]) + 1
+        if best_checkpoint_path.exists():
+            best_checkpoint = _load_checkpoint(best_checkpoint_path, device=device)
+            best_epoch = int(best_checkpoint["epoch"])
+            best_coverage = float(
+                dict(best_checkpoint.get("val_metrics", {})).get("coverage", -1.0)
+            )
+
+    console_print(f"\n  Training PremiseGNN run in: {run_dir}")
+    console_print(f"  Prepared cache           : {config.prepared_root}")
+    console_print(f"  Device                   : {device}")
+    console_print(f"  AMP enabled              : {use_amp}")
+    console_print(f"  Backbone                 : {config.backbone}")
+    console_print(f"  Temperature              : {config.temperature}")
+    console_print(f"  Retrieval K              : {config.retrieval_k}")
+    console_print(f"  Max args                 : {config.max_args}")
+    console_print(
+        f"  Split sizes              : train={len(datasets['train'])}, "
+        f"val={len(datasets['val'])}, test={len(datasets['test'])}"
+    )
+    console_print(f"  Baseline coverage target : 0.3760")
+    if resume_run_dir is not None:
+        console_print(
+            f"  Resuming from checkpoint : {last_checkpoint_path} "
+            f"(next epoch {start_epoch})"
+        )
+
+    for epoch in range(start_epoch, config.training.epochs + 1):
+        train_metrics = train_one_epoch_premise_gnn(
+            model=model,
+            loader=loaders["train"],
+            lemma_index=lemma_index,
+            optimizer=optimizer,
+            grad_scaler=grad_scaler,
+            device=device,
+            grad_clip=config.training.grad_clip,
+            temperature=config.temperature,
+            k=config.retrieval_k,
+            max_args=config.max_args,
+            epoch=epoch,
+            total_epochs=config.training.epochs,
+            log_every_batches=config.training.log_every_batches,
+            use_amp=use_amp,
+            pin_memory=config.training.pin_memory,
+        )
+        
+        val_metrics = evaluate_premise_gnn(
+            model=model,
+            loader=loaders["val"],
+            lemma_index=lemma_index,
+            device=device,
+            temperature=config.temperature,
+            k=config.retrieval_k,
+            max_args=config.max_args,
+            split_name="val",
+            log_every_batches=config.training.log_every_batches,
+            use_amp=use_amp,
+            pin_memory=config.training.pin_memory,
+        )
+
+        # Log metrics
+        epoch_record = {
+            "epoch": epoch,
+            "train_loss": float(train_metrics["loss"]),
+            "train_example_count": int(train_metrics["example_count"]),
+            "val_loss": float(val_metrics["loss"]),
+            "val_coverage": float(val_metrics["coverage"]),
+            "val_mrr": float(val_metrics["mrr"]),
+            "val_hit1": float(val_metrics["hit1"]),
+            "val_hit5": float(val_metrics["hit5"]),
+            "val_valid_samples": int(val_metrics["valid_samples"]),
+            "val_target_present": int(val_metrics["target_present_count"]),
+        }
+        _append_jsonl(metrics_path, epoch_record)
+
+        # Save checkpoints
+        checkpoint = {
+            "epoch": epoch,
+            "config": config.to_dict(),
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_metrics": val_metrics,
+        }
+        torch.save(checkpoint, last_checkpoint_path)
+        
+        if val_metrics["coverage"] > best_coverage:
+            best_coverage = val_metrics["coverage"]
+            best_epoch = epoch
+            torch.save(checkpoint, best_checkpoint_path)
+
+        console_print(
+            f"  Epoch {epoch:02d}/{config.training.epochs:02d} | "
+            f"train_loss={epoch_record['train_loss']:.4f} | "
+            f"val_coverage={epoch_record['val_coverage']:.4f} | "
+            f"val_mrr={epoch_record['val_mrr']:.4f} | "
+            f"Hit@1={epoch_record['val_hit1']:.4f} | "
+            f"Hit@5={epoch_record['val_hit5']:.4f}"
+        )
+
+    # Final evaluation on best checkpoint
+    best_checkpoint = torch.load(best_checkpoint_path, map_location=device)
+    model.load_state_dict(best_checkpoint["model_state_dict"])
+    
+    eval_val = {
+        "split": "val",
+        "checkpoint": str(best_checkpoint_path),
+        "epoch": int(best_checkpoint["epoch"]),
+        **evaluate_premise_gnn(
+            model=model,
+            loader=loaders["val"],
+            lemma_index=lemma_index,
+            device=device,
+            temperature=config.temperature,
+            k=config.retrieval_k,
+            max_args=config.max_args,
+            split_name="val",
+            log_every_batches=config.training.log_every_batches,
+            use_amp=use_amp,
+            pin_memory=config.training.pin_memory,
+        ),
+    }
+    eval_test = {
+        "split": "test",
+        "checkpoint": str(best_checkpoint_path),
+        "epoch": int(best_checkpoint["epoch"]),
+        **evaluate_premise_gnn(
+            model=model,
+            loader=loaders["test"],
+            lemma_index=lemma_index,
+            device=device,
+            temperature=config.temperature,
+            k=config.retrieval_k,
+            max_args=config.max_args,
+            split_name="test",
+            log_every_batches=config.training.log_every_batches,
+            use_amp=use_amp,
+            pin_memory=config.training.pin_memory,
+        ),
+    }
+    
+    _write_eval_file(run_dir, split="val", metrics=eval_val)
+    _write_eval_file(run_dir, split="test", metrics=eval_test)
+
+    summary = {
+        "run_dir": str(run_dir),
+        "config_path": str(config_path),
+        "prepared_root": str(config.prepared_root),
+        "device": str(device),
+        "amp_enabled": use_amp,
+        "dataset_sizes": {split: len(dataset) for split, dataset in datasets.items()},
+        "start_epoch": start_epoch,
+        "best_epoch": best_epoch,
+        "best_coverage": best_coverage,
+        "baseline_coverage": 0.376,
+        "improvement": best_coverage - 0.376,
+        "best_checkpoint": str(best_checkpoint_path),
+        "last_checkpoint": str(last_checkpoint_path),
+        "best_validation": eval_val,
+        "test_evaluation": eval_test,
+    }
+    _write_json(run_dir / "summary.json", summary)
+
+    console_print(f"\n  Best checkpoint          : {best_checkpoint_path}")
+    console_print(f"  Best coverage            : {best_coverage:.4f}")
+    console_print(f"  Baseline (target)        : 0.3760")
+    console_print(f"  Improvement              : {(best_coverage - 0.376)*100:+.1f}%")
+    console_print(f"  Validation eval summary  : {run_dir / 'eval_val.json'}")
+    console_print(f"  Test eval summary        : {run_dir / 'eval_test.json'}")
+    console_print(f"  Training summary         : {run_dir / 'summary.json'}")
+
+    return summary
 def evaluate_baseline_run(run_dir: str | Path, *, split: str) -> dict[str, object]:
     run_directory = Path(run_dir)
     if not run_directory.exists():
@@ -1304,15 +1725,15 @@ def build_train_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model-type",
         type=str,
-        choices=["baseline", "pointer"],
+        choices=["baseline", "pointer", "premise-gnn"],
         default="baseline",
-        help="Which model type to train (baseline GraphSAGE or pointer argument selector)",
+        help="Which model type to train",
     )
     parser.add_argument(
         "--config",
         type=str,
         default=None,
-        help="Path to the training JSON config (defaults to baseline or pointer config)",
+        help="Path to the training JSON config",
     )
     parser.add_argument(
         "--prepared-root",
@@ -1337,6 +1758,26 @@ def build_train_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional override for the number of training epochs",
+    )
+    # PremiseGNN specific arguments
+    parser.add_argument(
+        "--lemma-corpus",
+        type=str,
+        default=None,
+        help="Path to lemma corpus for retrieval (required for premise-gnn)",
+    )
+    parser.add_argument(
+        "--retrieval-k",
+        type=int,
+        default=500,
+        help="Number of candidates to retrieve (premise-gnn only)",
+    )
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        choices=["gatv2", "sage"],
+        default="gatv2",
+        help="GNN backbone type (premise-gnn only)",
     )
     return parser
 
@@ -1375,6 +1816,7 @@ def train_main(argv: list[str] | None = None) -> int:
                     epochs_override=args.epochs,
                 )
                 train_baseline(config)
+                
         elif model_type == "pointer":
             config_path = args.config or DEFAULT_POINTER_CONFIG_PATH
             if args.resume_run_dir:
@@ -1389,9 +1831,39 @@ def train_main(argv: list[str] | None = None) -> int:
                     epochs_override=args.epochs,
                 )
                 train_pointer(config)
+                
+        elif model_type == "premise-gnn":
+            config_path = args.config or DEFAULT_PREMISE_CONFIG_PATH
+            if args.resume_run_dir:
+                resume_config_path = Path(args.resume_run_dir) / "config.json"
+                config = load_premise_gnn_config(resume_config_path, epochs_override=args.epochs)
+                train_premise_gnn(config, resume_run_dir=args.resume_run_dir)
+            else:
+                config = load_premise_gnn_config(
+                    config_path,
+                    prepared_root_override=args.prepared_root,
+                    run_root_override=args.run_root,
+                    epochs_override=args.epochs,
+                )
+                # CLI overrides
+                if args.lemma_corpus:
+                    config_dict = config.to_dict()
+                    config_dict["lemma_corpus_path"] = args.lemma_corpus
+                    config = PremiseGNNConfig.from_dict(config_dict)
+                if args.retrieval_k:
+                    config_dict = config.to_dict()
+                    config_dict["retrieval_k"] = args.retrieval_k
+                    config = PremiseGNNConfig.from_dict(config_dict)
+                if args.backbone:
+                    config_dict = config.to_dict()
+                    config_dict["backbone"] = args.backbone
+                    config = PremiseGNNConfig.from_dict(config_dict)
+                train_premise_gnn(config)
         else:
             console_print(f"  ERROR: Unknown model type '{model_type}'")
+            console_print("  Valid types: baseline, pointer, premise-gnn")
             return 1
+            
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         console_print(f"  ERROR: {exc}")
         return 1
@@ -1410,3 +1882,6 @@ def evaluate_main(argv: list[str] | None = None) -> int:
         return 1
 
     return 0
+
+if __name__ == "__main__":
+    raise SystemExit(train_main())

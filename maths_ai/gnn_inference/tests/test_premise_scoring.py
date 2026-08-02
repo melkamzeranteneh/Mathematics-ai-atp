@@ -271,5 +271,88 @@ class TestPremiseRankingLoss(unittest.TestCase):
         self.assertFalse(torch.allclose(scores1[0], scores2[0]))
 
 
+class TestSelectArguments(unittest.TestCase):
+    """Tests for PremiseScorer.select_arguments() autoregressive selection."""
+
+    def setUp(self) -> None:
+        self.hidden_dim = 8
+
+    def test_no_duplicate_indices_dot(self) -> None:
+        """select_arguments never picks the same index twice (dot mode)."""
+        scorer = PremiseScorer(self.hidden_dim, mode="dot")
+        state = torch.randn(self.hidden_dim)
+        tactic = torch.randn(self.hidden_dim)
+        candidates = torch.randn(6, self.hidden_dim)
+
+        indices, _ = scorer.select_arguments(state, tactic, candidates, num_args=4)
+
+        self.assertEqual(len(indices), 4)
+        self.assertEqual(len(set(indices)), 4)
+
+    def test_no_duplicate_indices_mlp(self) -> None:
+        """select_arguments never picks the same index twice (mlp mode)."""
+        scorer = PremiseScorer(self.hidden_dim, mode="mlp")
+        state = torch.randn(self.hidden_dim)
+        tactic = torch.randn(self.hidden_dim)
+        candidates = torch.randn(6, self.hidden_dim)
+
+        indices, _ = scorer.select_arguments(state, tactic, candidates, num_args=4)
+
+        self.assertEqual(len(indices), 4)
+        self.assertEqual(len(set(indices)), 4)
+
+    def test_num_args_zero_returns_empty(self) -> None:
+        """num_args <= 0 returns empty lists."""
+        scorer = PremiseScorer(self.hidden_dim, mode="dot")
+        state = torch.randn(self.hidden_dim)
+        tactic = torch.randn(self.hidden_dim)
+        candidates = torch.randn(5, self.hidden_dim)
+
+        indices, scores = scorer.select_arguments(state, tactic, candidates, num_args=0)
+
+        self.assertEqual(indices, [])
+        self.assertEqual(scores, [])
+
+    def test_step0_matches_score_top1_dot(self) -> None:
+        """First selection matches argmax of score() on step 0 (dot mode)."""
+        scorer = PremiseScorer(self.hidden_dim, mode="dot")
+        state = torch.randn(self.hidden_dim)
+        tactic = torch.randn(self.hidden_dim)
+        candidates = torch.randn(5, self.hidden_dim)
+
+        step0_scores = scorer.score(state, tactic, candidates)
+        expected_best = int(step0_scores.argmax().item())
+
+        indices, _ = scorer.select_arguments(state, tactic, candidates, num_args=1)
+
+        self.assertEqual(indices[0], expected_best)
+
+    def test_step0_matches_score_top1_mlp(self) -> None:
+        """First selection matches argmax of score() on step 0 (mlp mode)."""
+        scorer = PremiseScorer(self.hidden_dim, mode="mlp")
+        state = torch.randn(self.hidden_dim)
+        tactic = torch.randn(self.hidden_dim)
+        candidates = torch.randn(5, self.hidden_dim)
+
+        step0_scores = scorer.score(state, tactic, candidates)
+        expected_best = int(step0_scores.argmax().item())
+
+        indices, _ = scorer.select_arguments(state, tactic, candidates, num_args=1)
+
+        self.assertEqual(indices[0], expected_best)
+
+    def test_num_args_clamped_to_pool_size(self) -> None:
+        """num_args larger than pool size is clamped to pool size."""
+        scorer = PremiseScorer(self.hidden_dim, mode="dot")
+        state = torch.randn(self.hidden_dim)
+        tactic = torch.randn(self.hidden_dim)
+        candidates = torch.randn(3, self.hidden_dim)
+
+        indices, scores = scorer.select_arguments(state, tactic, candidates, num_args=10)
+
+        self.assertEqual(len(indices), 3)
+        self.assertEqual(len(set(indices)), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

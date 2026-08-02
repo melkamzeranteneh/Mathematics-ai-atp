@@ -3,11 +3,9 @@
 Provides ``PremiseGNN``, a GATv2-based (or GraphSAGE-based) encoder that maps
 proof-state graphs and library-lemma graphs into a shared embedding space.
 
-Contract (both Person A and Person B depend on this):
     encode_nodes(graph_batch) -> Tensor  [num_nodes, hidden_dim]
     readout(node_embeddings, graph_batch) -> Tensor  [batch_size, hidden_dim]
 """
-
 from __future__ import annotations
 
 import torch
@@ -25,6 +23,8 @@ class PremiseGNN(nn.Module):
     ----------
     num_node_labels : int
         Vocabulary size for node label embeddings.
+    num_tactics : int
+        Vocabulary size for tactic embeddings.
     hidden_dim : int
         Width of all hidden layers and the output embedding.
     num_layers : int
@@ -42,6 +42,7 @@ class PremiseGNN(nn.Module):
     def __init__(
         self,
         num_node_labels: int,
+        num_tactics: int,
         hidden_dim: int = 128,
         num_layers: int = 3,
         heads: int = 4,
@@ -55,21 +56,31 @@ class PremiseGNN(nn.Module):
             raise ValueError(f"backbone must be 'gatv2' or 'sage', got {backbone!r}")
         if num_layers < 1:
             raise ValueError("num_layers must be >= 1")
+        
+        if backbone == "gatv2" and hidden_dim % heads != 0:
+            raise ValueError(
+                f"hidden_dim ({hidden_dim}) must be divisible by heads ({heads}) for GATv2"
+            )
 
         self.hidden_dim = hidden_dim
         self.backbone = backbone
+        self.num_layers = num_layers
 
-        # Node feature embeddings (same scheme as GraphSAGEStateClassifier)
+        # Node feature embeddings
         self.label_embedding = nn.Embedding(num_node_labels, hidden_dim)
         self.node_type_embedding = nn.Embedding(num_node_types, hidden_dim)
         self.is_bound_embedding = nn.Embedding(2, hidden_dim)
         self.binder_depth_embedding = nn.Embedding(10, hidden_dim)
         self.binder_kind_embedding = nn.Embedding(6, hidden_dim)
 
+        self.tactic_embedding = nn.Embedding(num_tactics, hidden_dim)
+        self.query_proj = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.key_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.query_proj_ar = nn.Linear(hidden_dim * 3, hidden_dim)
+
         # Message-passing layers
         self.convs = nn.ModuleList()
         if backbone == "gatv2":
-            # First layer: hidden_dim -> hidden_dim (multi-head, then concat)
             self.convs.append(
                 GATv2Conv(hidden_dim, hidden_dim // heads, heads=heads, dropout=dropout)
             )
@@ -83,25 +94,8 @@ class PremiseGNN(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    # ------------------------------------------------------------------
-    # Contracted interface
-    # ------------------------------------------------------------------
-
     def encode_nodes(self, graph_batch) -> Tensor:
-        """Embed every node in the batched graph.
-
-        Parameters
-        ----------
-        graph_batch : torch_geometric.data.Batch
-            Batched PyG graph with attributes ``x``, ``edge_index``,
-            ``node_type``, and optionally ``is_bound``, ``binder_depth``,
-            ``binder_kind``.
-
-        Returns
-        -------
-        Tensor
-            Node embeddings, shape ``[num_nodes, hidden_dim]``.
-        """
+        """Embed every node in the batched graph."""
         x = self.label_embedding(graph_batch.x)
         x = x + self.node_type_embedding(graph_batch.node_type)
 
@@ -118,24 +112,12 @@ class PremiseGNN(nn.Module):
             if i < len(self.convs) - 1:
                 x = self.dropout(x)
 
-        return x  # [num_nodes, hidden_dim]
+        return x
 
     def readout(self, node_embeddings: Tensor, graph_batch) -> Tensor:
         """Read out one embedding per graph using the State root node.
-
-        Falls back to global mean pooling when ``state_node_index`` is absent
-        (e.g. when encoding a library lemma graph that has no State node).
-
-        Parameters
-        ----------
-        node_embeddings : Tensor
-            Output of ``encode_nodes``, shape ``[num_nodes, hidden_dim]``.
-        graph_batch : torch_geometric.data.Batch
-
-        Returns
-        -------
-        Tensor
-            Graph-level embeddings, shape ``[batch_size, hidden_dim]``.
+        
+        Falls back to global mean pooling when state_node_index is absent.
         """
         if hasattr(graph_batch, "state_node_index"):
             idx = graph_batch.state_node_index
@@ -143,25 +125,88 @@ class PremiseGNN(nn.Module):
                 idx = torch.tensor([int(idx)], dtype=torch.long, device=node_embeddings.device)
             else:
                 idx = idx.to(device=node_embeddings.device, dtype=torch.long).view(-1)
-            # idx contains per-graph local offsets; add the per-graph node offset
-            # so they become global indices into the batched node_embeddings tensor.
-            if hasattr(graph_batch, "ptr"):
-                ptr = graph_batch.ptr.to(device=node_embeddings.device)
-                # ptr[i] is the start of graph i in the batched node list
-                idx = idx + ptr[:-1]
-            return node_embeddings.index_select(0, idx)  # [batch_size, hidden_dim]
+            
+            # Safety clamp
+            idx = idx.clamp(0, node_embeddings.size(0) - 1)
+            return node_embeddings.index_select(0, idx)
 
-        # Lemma graphs: no State node — use mean pooling
-        return global_mean_pool(node_embeddings, graph_batch.batch)  # [batch_size, hidden_dim]
+        return global_mean_pool(node_embeddings, graph_batch.batch)
 
     def forward(self, graph_batch) -> Tensor:
         """Convenience wrapper: encode_nodes then readout."""
         node_embeddings = self.encode_nodes(graph_batch)
         return self.readout(node_embeddings, graph_batch)
 
-    # ------------------------------------------------------------------
-    # Per-node embedding cache (inference search loop)
-    # ------------------------------------------------------------------
+    def score_candidates(
+        self,
+        state_vecs: Tensor,
+        tactic_embs: Tensor,
+        pools,
+        temperature: float = 0.07,
+    ) -> list[Tensor]:
+        """Score all candidates in each pool."""
+        from .premise_pool import CandidatePool
+        
+        batch_size = state_vecs.size(0)
+        if len(pools) != batch_size:
+            raise ValueError(
+                f"Number of pools ({len(pools)}) does not match "
+                f"batch size ({batch_size})."
+            )
+
+        score_list: list[Tensor] = []
+        for b in range(batch_size):
+            query = self.query_proj(
+                torch.cat([state_vecs[b], tactic_embs[b]], dim=-1)
+            )
+            candidate_keys = self.key_proj(pools[b].candidate_vectors)
+            scores = (candidate_keys @ query) / temperature
+            score_list.append(scores)
+
+        return score_list
+
+    def score_and_select_arguments(
+        self,
+        state_vec: Tensor,
+        tactic_emb: Tensor,
+        candidate_vectors: Tensor,
+        candidate_sources: list[str],
+        candidate_ids: list[int],
+        num_args: int,
+        temperature: float = 0.07,
+    ) -> tuple[list[int], list[float], list[str], list[int]]:
+        """Autoregressively select arguments from the pool."""
+        num_args = min(num_args, candidate_vectors.size(0))
+        if num_args <= 0:
+            return [], [], [], []
+
+        state = state_vec.view(-1)
+        tactic = tactic_emb.view(-1)
+        keys = self.key_proj(candidate_vectors)
+
+        selected_indices: list[int] = []
+        selected_scores: list[float] = []
+        selected_sources: list[str] = []
+        selected_ids: list[int] = []
+        
+        mask = torch.zeros(candidate_vectors.size(0), dtype=torch.bool, device=state.device)
+        query = self.query_proj(torch.cat([state, tactic], dim=0))
+
+        for _ in range(num_args):
+            raw_scores = (keys @ query) / temperature
+            raw_scores = raw_scores.masked_fill(mask, float("-inf"))
+            
+            best = int(raw_scores.argmax().item())
+            selected_indices.append(best)
+            selected_scores.append(float(raw_scores[best].item()))
+            selected_sources.append(candidate_sources[best])
+            selected_ids.append(candidate_ids[best])
+            
+            mask[best] = True
+            prev = candidate_vectors[best].view(-1)
+            query = self.query_proj_ar(torch.cat([state, tactic, prev], dim=0))
+
+        return selected_indices, selected_scores, selected_sources, selected_ids
 
     def encode_lemma_cached(
         self,
@@ -169,56 +214,30 @@ class PremiseGNN(nn.Module):
         cache: dict[int, Tensor],
         lemma_ids: list[int],
     ) -> Tensor:
-        """Encode a batch of lemma graphs, reusing cached embeddings.
-
-        During the proof-search loop the same library lemma may be scored
-        against many different proof states.  This method avoids re-running
-        the GNN for lemmas whose embedding is already in ``cache``.
-
-        Parameters
-        ----------
-        graph_batch : torch_geometric.data.Batch | None
-            Batched lemma graphs for the cache-miss lemmas only, in the same
-            order as the miss positions.  Pass ``None`` when all lemmas are
-            already cached.
-        cache : dict[int, Tensor]
-            Maps lemma_id -> embedding vector ``[hidden_dim]``.  Updated
-            in-place with newly computed embeddings.
-        lemma_ids : list[int]
-            Lemma id for each requested lemma, in the desired output order.
-
-        Returns
-        -------
-        Tensor
-            Embeddings for all requested lemmas (cached + freshly computed),
-            shape ``[len(lemma_ids), hidden_dim]``, in the original order.
-        """
+        """Encode lemma graphs, reusing cached embeddings."""
         device = next(self.parameters()).device
         results: dict[int, Tensor] = {}
 
-        # Separate hits from misses
         miss_positions: list[int] = []
         for pos, lid in enumerate(lemma_ids):
             if lid in cache:
-                results[pos] = cache[lid]
+                vec = cache[lid].to(device)
+                cache[lid] = vec
+                results[pos] = vec
             else:
                 miss_positions.append(pos)
 
-        # Compute only the misses
         if miss_positions:
             if graph_batch is None:
-                raise ValueError(
-                    f"{len(miss_positions)} lemma(s) not in cache but graph_batch is None."
-                )
+                raise ValueError("Cache miss but graph_batch is None.")
             if len(miss_positions) != graph_batch.num_graphs:
                 raise ValueError(
                     f"graph_batch contains {graph_batch.num_graphs} graphs "
-                    f"but there are {len(miss_positions)} cache misses. "
-                    "Pass only the miss graphs in graph_batch."
+                    f"but there are {len(miss_positions)} cache misses."
                 )
             with torch.no_grad():
                 node_embs = self.encode_nodes(graph_batch)
-                state_embs = self.readout(node_embs, graph_batch)  # [num_misses, H]
+                state_embs = self.readout(node_embs, graph_batch)
             for i, pos in enumerate(miss_positions):
                 lid = lemma_ids[pos]
                 vec = state_embs[i].to(device)
@@ -226,3 +245,45 @@ class PremiseGNN(nn.Module):
                 results[pos] = vec
 
         return torch.stack([results[pos] for pos in range(len(lemma_ids))], dim=0)
+
+    def encode_state_cached(
+        self,
+        graph_batch,
+        cache: dict[int, Tensor],
+        state_ids: list[int],
+    ) -> Tensor:
+        """Encode state graphs, reusing cached embeddings."""
+        device = next(self.parameters()).device
+        results: dict[int, Tensor] = {}
+
+        miss_positions: list[int] = []
+        for pos, sid in enumerate(state_ids):
+            if sid in cache:
+                vec = cache[sid].to(device)
+                cache[sid] = vec
+                results[pos] = vec
+            else:
+                miss_positions.append(pos)
+
+        if miss_positions:
+            if graph_batch is None:
+                raise ValueError("Cache miss but graph_batch is None.")
+            with torch.no_grad():
+                node_embs = self.encode_nodes(graph_batch)
+                state_embs = self.readout(node_embs, graph_batch)
+            for i, pos in enumerate(miss_positions):
+                sid = state_ids[pos]
+                vec = state_embs[i].to(device)
+                cache[sid] = vec
+                results[pos] = vec
+
+        return torch.stack([results[pos] for pos in range(len(state_ids))], dim=0)
+
+    def get_state_and_local_embeddings(
+        self,
+        graph_batch,
+    ) -> tuple[Tensor, Tensor]:
+        """Get both state and node embeddings in one forward pass."""
+        node_embeddings = self.encode_nodes(graph_batch)
+        state_embeddings = self.readout(node_embeddings, graph_batch)
+        return state_embeddings, node_embeddings

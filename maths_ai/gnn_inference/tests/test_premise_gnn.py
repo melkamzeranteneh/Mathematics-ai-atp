@@ -7,6 +7,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.premise_gnn import PremiseGNN
 
 
 NUM_NODE_LABELS = 50
+NUM_TACTICS = 100  # ← Required for PremiseGNN init
 HIDDEN_DIM = 32
 
 
@@ -25,11 +26,22 @@ def _make_graph(num_nodes: int, num_edges: int, *, state_node_idx: int = 0) -> D
     return data
 
 
+def _make_lemma_graph(num_nodes: int, num_edges: int) -> Data:
+    """Build a lemma graph (no state_node_index)."""
+    data = _make_graph(num_nodes, num_edges)
+    del data.state_node_index
+    return data
+
+
 class TestPremiseGNNContract:
 
     def test_encode_nodes_shape(self):
         """encode_nodes returns [num_nodes, hidden_dim]."""
-        model = PremiseGNN(num_node_labels=NUM_NODE_LABELS, hidden_dim=HIDDEN_DIM)
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
         graph = _make_graph(5, 4)
         batch = Batch.from_data_list([graph])
         node_embs = model.encode_nodes(batch)
@@ -37,7 +49,11 @@ class TestPremiseGNNContract:
 
     def test_readout_single_graph(self):
         """readout returns [1, hidden_dim] for a single graph."""
-        model = PremiseGNN(num_node_labels=NUM_NODE_LABELS, hidden_dim=HIDDEN_DIM)
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
         graph = _make_graph(5, 4, state_node_idx=0)
         batch = Batch.from_data_list([graph])
         node_embs = model.encode_nodes(batch)
@@ -46,7 +62,11 @@ class TestPremiseGNNContract:
 
     def test_readout_batch(self):
         """readout selects the correct per-graph State node using ptr offsets."""
-        model = PremiseGNN(num_node_labels=NUM_NODE_LABELS, hidden_dim=HIDDEN_DIM)
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
         # 3 graphs, 4 nodes each, state_node_idx=0 per graph.
         # After batching: global state nodes are at positions 0, 4, 8.
         graphs = [_make_graph(4, 3, state_node_idx=0) for _ in range(3)]
@@ -61,9 +81,12 @@ class TestPremiseGNNContract:
 
     def test_readout_fallback_mean_pool(self):
         """readout falls back to mean pooling when state_node_index is absent (lemma graphs)."""
-        model = PremiseGNN(num_node_labels=NUM_NODE_LABELS, hidden_dim=HIDDEN_DIM)
-        graph = _make_graph(5, 4)
-        del graph.state_node_index  # simulate a lemma graph
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
+        graph = _make_lemma_graph(5, 4)
         batch = Batch.from_data_list([graph])
         node_embs = model.encode_nodes(batch)
         state_emb = model.readout(node_embs, batch)
@@ -71,7 +94,11 @@ class TestPremiseGNNContract:
 
     def test_forward_convenience_wrapper(self):
         """forward() == readout(encode_nodes()) in shape."""
-        model = PremiseGNN(num_node_labels=NUM_NODE_LABELS, hidden_dim=HIDDEN_DIM)
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
         graph = _make_graph(5, 4)
         batch = Batch.from_data_list([graph])
         out = model(batch)
@@ -80,7 +107,10 @@ class TestPremiseGNNContract:
     def test_sage_backbone(self):
         """backbone='sage' produces the same output shape as gatv2."""
         model = PremiseGNN(
-            num_node_labels=NUM_NODE_LABELS, hidden_dim=HIDDEN_DIM, backbone="sage"
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM,
+            backbone="sage"
         )
         graph = _make_graph(5, 4)
         batch = Batch.from_data_list([graph])
@@ -91,7 +121,11 @@ class TestPremiseGNNContract:
 
     def test_gradient_flow(self):
         """GNN parameters receive gradients through encode_nodes + readout."""
-        model = PremiseGNN(num_node_labels=NUM_NODE_LABELS, hidden_dim=HIDDEN_DIM)
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
         graph = _make_graph(4, 3)
         batch = Batch.from_data_list([graph])
         node_embs = model.encode_nodes(batch)
@@ -102,11 +136,12 @@ class TestPremiseGNNContract:
 
     def test_encode_lemma_cached(self):
         """encode_lemma_cached returns correct shape and populates the cache."""
-        model = PremiseGNN(num_node_labels=NUM_NODE_LABELS, hidden_dim=HIDDEN_DIM)
-        graphs = [_make_graph(4, 3) for _ in range(3)]
-        # Remove state_node_index to simulate lemma graphs
-        for g in graphs:
-            del g.state_node_index
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
+        graphs = [_make_lemma_graph(4, 3) for _ in range(3)]
         batch = Batch.from_data_list(graphs)
         lemma_ids = [10, 20, 30]
         cache: dict = {}
@@ -120,13 +155,16 @@ class TestPremiseGNNContract:
         """encode_lemma_cached skips the GNN for already-cached lemmas.
         graph_batch must contain only the miss graphs (lemma 20 here).
         """
-        model = PremiseGNN(num_node_labels=NUM_NODE_LABELS, hidden_dim=HIDDEN_DIM)
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
         cached_vec = torch.randn(HIDDEN_DIM)
         cache = {10: cached_vec}
 
         # Only lemma 20 is a miss — pass a single-graph batch for it only
-        graph = _make_graph(4, 3)
-        del graph.state_node_index
+        graph = _make_lemma_graph(4, 3)
         batch = Batch.from_data_list([graph])
 
         result = model.encode_lemma_cached(batch, cache, [10, 20])
@@ -134,3 +172,47 @@ class TestPremiseGNNContract:
         assert result.shape == (2, HIDDEN_DIM)
         assert torch.allclose(result[0], cached_vec)
         assert 20 in cache
+
+    def test_tactic_embedding_exists(self):
+        """PremiseGNN has tactic_embedding table."""
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
+        assert hasattr(model, "tactic_embedding")
+        assert isinstance(model.tactic_embedding, torch.nn.Embedding)
+        assert model.tactic_embedding.weight.shape == (NUM_TACTICS, HIDDEN_DIM)
+
+    def test_query_proj_exists(self):
+        """PremiseGNN has query_proj for contrastive learning."""
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
+        assert hasattr(model, "query_proj")
+        assert isinstance(model.query_proj, torch.nn.Linear)
+        assert model.query_proj.weight.shape == (HIDDEN_DIM, HIDDEN_DIM * 2)
+
+    def test_key_proj_exists(self):
+        """PremiseGNN has key_proj for contrastive learning."""
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
+        assert hasattr(model, "key_proj")
+        assert isinstance(model.key_proj, torch.nn.Linear)
+        assert model.key_proj.weight.shape == (HIDDEN_DIM, HIDDEN_DIM)
+
+    def test_query_proj_ar_exists(self):
+        """PremiseGNN has query_proj_ar for autoregressive selection."""
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
+        assert hasattr(model, "query_proj_ar")
+        assert isinstance(model.query_proj_ar, torch.nn.Linear)
+        assert model.query_proj_ar.weight.shape == (HIDDEN_DIM, HIDDEN_DIM * 3)

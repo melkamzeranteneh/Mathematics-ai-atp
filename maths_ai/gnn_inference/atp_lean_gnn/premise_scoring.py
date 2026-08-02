@@ -1,15 +1,4 @@
-"""Premise scoring head for unified candidate pools.
-
-This module provides ``PremiseScorer``, a tactic-conditioned scoring module
-that scores mixed candidate pools (local hypotheses + library lemmas) against
-a goal embedding.  Two scoring modes are supported:
-
-- **dot**: Scaled dot-product between a projected query and candidate vectors.
-- **mlp**: A two-layer MLP that takes the concatenation of query and candidate.
-
-The ``compute_premise_ranking_loss`` function computes cross-entropy ranking
-loss over the unified candidate pool for each sample in a batch.
-"""
+"""Premise scoring head for unified candidate pools."""
 
 from __future__ import annotations
 
@@ -44,16 +33,7 @@ class PremiseScorerConfig:
 
 
 class PremiseScorer(nn.Module):
-    """Score unified candidate premises with tactic-conditioned queries.
-
-    Parameters
-    ----------
-    hidden_dim : int
-        Dimensionality of state, tactic, and candidate embeddings.
-    mode : str
-        Scoring mode — ``"dot"`` for scaled dot-product, ``"mlp"`` for a
-        learned two-layer scorer.
-    """
+    """Score candidates with tactic-conditioned queries. Supports dot or MLP scoring."""
 
     def __init__(self, hidden_dim: int, *, mode: str = "dot") -> None:
         super().__init__()
@@ -64,10 +44,8 @@ class PremiseScorer(nn.Module):
         self.mode = mode
         self.hidden_dim = hidden_dim
 
-        # Project [state_vec; tactic_emb] → hidden_dim  (first-step query)
-        self.query_proj = nn.Linear(hidden_dim * 2, hidden_dim)
-        # Project [state_vec; tactic_emb; prev_arg] → hidden_dim  (autoregressive update)
-        self.query_proj_ar = nn.Linear(hidden_dim * 3, hidden_dim)
+        self.query_proj = nn.Linear(hidden_dim * 2, hidden_dim)        # Step 0: [state; tactic]
+        self.query_proj_ar = nn.Linear(hidden_dim * 3, hidden_dim)     # Step N: [state; tactic; prev]
         self.key_proj = nn.Linear(hidden_dim, hidden_dim)
 
         if mode == "mlp":
@@ -87,23 +65,7 @@ class PremiseScorer(nn.Module):
         tactic_emb: Tensor,
         candidate_vectors: Tensor,
     ) -> Tensor:
-        """Score each candidate against the tactic-conditioned proof state.
-
-        Parameters
-        ----------
-        state_vec : Tensor
-            Proof-state embedding, shape ``[H]`` or ``[1, H]``.
-        tactic_emb : Tensor
-            Tactic embedding, shape ``[H]`` or ``[1, H]``.
-        candidate_vectors : Tensor
-            Candidate embeddings, shape ``[C, H]``.
-
-        Returns
-        -------
-        Tensor
-            Scores, shape ``[C]``.
-        """
-        # Flatten to [H]
+        """Score candidates against the proof state."""
         state = state_vec.view(-1)
         tactic = tactic_emb.view(-1)
 
@@ -111,14 +73,12 @@ class PremiseScorer(nn.Module):
         candidate_vectors = self.key_proj(candidate_vectors)
 
         if self.mode == "dot":
-            # Scaled dot-product
-            scores = (candidate_vectors @ query) * self._scale  # [C]
+            scores = (candidate_vectors @ query) * self._scale
         else:
-            # MLP: concat query with each candidate and score
             num_candidates = candidate_vectors.size(0)
-            query_expanded = query.unsqueeze(0).expand(num_candidates, -1)  # [C, H]
-            combined = torch.cat([query_expanded, candidate_vectors], dim=1)  # [C, 2H]
-            scores = self.scorer(combined).squeeze(-1)  # [C]
+            query_expanded = query.unsqueeze(0).expand(num_candidates, -1)
+            combined = torch.cat([query_expanded, candidate_vectors], dim=1)
+            scores = self.scorer(combined).squeeze(-1)
 
         return scores
 
@@ -128,22 +88,7 @@ class PremiseScorer(nn.Module):
         tactic_embs: Tensor,
         pools: list[CandidatePool],
     ) -> list[Tensor]:
-        """Score all candidate pools in a batch.
-
-        Parameters
-        ----------
-        state_vecs : Tensor
-            Proof-state embeddings, shape ``[B, H]``.
-        tactic_embs : Tensor
-            Tactic embeddings, shape ``[B, H]``.
-        pools : list[CandidatePool]
-            One pool per sample in the batch.
-
-        Returns
-        -------
-        list[Tensor]
-            Per-sample score tensors, each of shape ``[C_i]``.
-        """
+        """Score all pools in a batch."""
         batch_size = state_vecs.size(0)
         if len(pools) != batch_size:
             raise ValueError(
@@ -151,16 +96,10 @@ class PremiseScorer(nn.Module):
                 f"batch size ({batch_size})."
             )
 
-        all_scores: list[Tensor] = []
-        for b in range(batch_size):
-            scores = self.score(
-                state_vecs[b],
-                tactic_embs[b],
-                pools[b].candidate_vectors,
-            )
-            all_scores.append(scores)
-
-        return all_scores
+        return [
+            self.score(state_vecs[b], tactic_embs[b], pools[b].candidate_vectors)
+            for b in range(batch_size)
+        ]
 
     def select_arguments(
         self,
@@ -169,30 +108,24 @@ class PremiseScorer(nn.Module):
         candidate_vectors: Tensor,
         num_args: int,
     ) -> tuple[list[int], list[float]]:
-        """Autoregressively select ``num_args`` candidates from the pool.
-
-        Step 0 uses ``query_proj([state; tactic])``.
-        Each subsequent step uses ``query_proj_ar([state; tactic; prev_arg])``
-        so the query shifts away from already-chosen candidates.
-        Already-selected positions are masked to ``-inf`` before each argmax.
-        """
+        """Autoregressively select arguments. Masks previously selected."""
         num_args = min(num_args, candidate_vectors.size(0))
         if num_args <= 0:
             return [], []
 
         state = state_vec.view(-1)
         tactic = tactic_emb.view(-1)
-        keys = self.key_proj(candidate_vectors)  # [C, H]
+        keys = self.key_proj(candidate_vectors)
 
         selected_indices: list[int] = []
         selected_scores: list[float] = []
         mask = torch.zeros(candidate_vectors.size(0), dtype=torch.bool, device=state.device)
 
-        query = self.query_proj(torch.cat([state, tactic], dim=0))  # [H]
+        query = self.query_proj(torch.cat([state, tactic], dim=0))
 
         for _ in range(num_args):
             if self.mode == "dot":
-                raw_scores = (keys @ query) * self._scale  # [C]
+                raw_scores = (keys @ query) * self._scale
             else:
                 num_c = keys.size(0)
                 q_exp = query.unsqueeze(0).expand(num_c, -1)
@@ -216,16 +149,7 @@ def _find_target_index_in_pool(
     arg_node_indices: list[int],
     arg_lemma_ids: list[int],
 ) -> int:
-    """Find the index of the true premise in the candidate pool.
-
-    Priority:
-    1. If any ``arg_node_indices`` entry is >= 0 and matches a local candidate,
-       return the pool position of that local node.
-    2. If any ``arg_lemma_ids`` entry is >= 0 and matches a library candidate,
-       return the pool position of that lemma.
-    3. Return -1 if no match is found.
-    """
-    # Try local matches first
+    """Find true premise in pool. Prefers local over lemma."""
     for node_id in arg_node_indices:
         if node_id < 0:
             continue
@@ -235,7 +159,6 @@ def _find_target_index_in_pool(
             if source == "local" and cid == node_id:
                 return pool_idx
 
-    # Try library matches
     for lemma_id in arg_lemma_ids:
         if lemma_id < 0:
             continue
@@ -254,32 +177,7 @@ def compute_premise_ranking_loss(
     arg_node_indices: Tensor,
     arg_lemma_ids: Tensor,
 ) -> tuple[Tensor, dict[str, float]]:
-    """Cross-entropy ranking loss over unified candidate pools, with metrics.
-
-    For each sample in the batch, we find the true premise in the candidate
-    pool and compute a cross-entropy loss against the scored candidates.
-    Also tracks retrieval and reranking metrics.
-
-    Parameters
-    ----------
-    score_list : list[Tensor]
-        Per-sample score tensors from ``PremiseScorer.forward()``.
-    pools : list[CandidatePool]
-        One pool per sample.
-    arg_node_indices : Tensor
-        Ground-truth local node indices, shape ``[B, max_args]``, -1 for invalid.
-    arg_lemma_ids : Tensor
-        Ground-truth lemma IDs, shape ``[B, max_args]``, -1 for invalid.
-
-    Returns
-    -------
-    loss : Tensor
-        Scalar ranking loss (averaged over valid samples).
-    metrics : dict
-        ``"premise_loss"``, ``"valid_samples"``, ``"total_samples"``,
-        ``"target_present_count"``, ``"top1_correct"``, ``"top5_correct"``,
-        ``"mrr_sum"``.
-    """
+    """Cross-entropy ranking loss over candidate pools with metrics."""
     batch_size = len(score_list)
     device = score_list[0].device if score_list else torch.device("cpu")
 
@@ -291,10 +189,9 @@ def compute_premise_ranking_loss(
     mrr_sum = 0.0
 
     for b in range(batch_size):
-        scores = score_list[b]  # [C_b]
+        scores = score_list[b]
         pool = pools[b]
 
-        # Get ground-truth node/lemma IDs for this sample
         b_node_ids = arg_node_indices[b].tolist() if arg_node_indices.dim() > 1 else [int(arg_node_indices[b].item())]
         b_lemma_ids = arg_lemma_ids[b].tolist() if arg_lemma_ids.dim() > 1 else [int(arg_lemma_ids[b].item())]
 
@@ -303,7 +200,6 @@ def compute_premise_ranking_loss(
             continue
 
         target_present_count += 1
-
         target_idx = _find_target_index_in_pool(
             pool,
             arg_node_indices=b_node_ids,
@@ -311,7 +207,6 @@ def compute_premise_ranking_loss(
         )
 
         if target_idx < 0:
-            # Target exists but wasn't retrieved in the pool — skip loss
             continue
 
         target = torch.tensor(target_idx, dtype=torch.long, device=device)
@@ -319,10 +214,8 @@ def compute_premise_ranking_loss(
         losses.append(loss)
         valid_count += 1
 
-        # Reranking metrics
-        # Sort scores in descending order to find the rank of the true target
         sorted_indices = scores.argsort(descending=True).tolist()
-        rank = sorted_indices.index(target_idx) + 1  # 1-indexed
+        rank = sorted_indices.index(target_idx) + 1
 
         if rank == 1:
             top1_correct += 1

@@ -64,8 +64,7 @@ def build_unified_pools(
         local_mask = graph_mask & premise_mask
         local_ids = local_mask.nonzero(as_tuple=False).view(-1)
         local_vecs = node_embeddings.index_select(0, local_ids)
-        local_id_list = [int(i - graph_offset) for i in local_ids.tolist()]
-
+        local_id_list = [int(i) for i in local_ids.tolist()] 
         lemma_ids = [int(x) for x in lemma_ids_batch[b]] if lemma_ids_batch else []
         lemma_vecs = lemma_vecs_batch[b] if lemma_vecs_batch is not None else torch.empty(0, node_embeddings.size(1), device=device)
 
