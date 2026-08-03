@@ -25,6 +25,16 @@ VALID_READOUTS = (
 )
 
 
+def _embed_binder_depth(
+    embedding: nn.Embedding, binder_depth: torch.Tensor
+) -> torch.Tensor:
+    """Embed ordinal depths, bucketing depths beyond the configured capacity."""
+    bounded_depth = binder_depth.clamp(
+        min=0, max=embedding.num_embeddings - 1
+    )
+    return embedding(bounded_depth)
+
+
 def _state_node_embeddings(node_embeddings: torch.Tensor, data) -> torch.Tensor:
     if not hasattr(data, "state_node_index"):
         raise ValueError("Batched graph data is missing the 'state_node_index' attribute.")
@@ -196,7 +206,9 @@ class GraphSAGEStateClassifier(nn.Module):
         if hasattr(data, "is_bound"):
             x = x + self.is_bound_embedding(data.is_bound)
         if hasattr(data, "binder_depth"):
-            x = x + self.binder_depth_embedding(data.binder_depth)
+            x = x + _embed_binder_depth(
+                self.binder_depth_embedding, data.binder_depth
+            )
         if hasattr(data, "binder_kind"):
             x = x + self.binder_kind_embedding(data.binder_kind)
 
@@ -315,7 +327,9 @@ class GATv2StateClassifier(nn.Module):
         if hasattr(data, "is_bound"):
             x = x + self.is_bound_embedding(data.is_bound)
         if hasattr(data, "binder_depth"):
-            x = x + self.binder_depth_embedding(data.binder_depth)
+            x = x + _embed_binder_depth(
+                self.binder_depth_embedding, data.binder_depth
+            )
         if hasattr(data, "binder_kind"):
             x = x + self.binder_kind_embedding(data.binder_kind)
 

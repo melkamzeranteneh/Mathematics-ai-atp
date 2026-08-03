@@ -96,6 +96,35 @@ def test_gatv2_and_sage_shapes_match():
     assert sage(data).shape == gat(data).shape
 
 
+@pytest.mark.parametrize(
+    "model",
+    [
+        GraphSAGEStateClassifier(
+            num_node_labels=10, num_tactics=5, hidden_dim=16, num_layers=2
+        ),
+        GATv2StateClassifier(
+            num_node_labels=10,
+            num_tactics=5,
+            hidden_dim=16,
+            num_layers=2,
+            heads=4,
+        ),
+    ],
+)
+def test_deep_binder_depths_use_the_final_embedding_bucket(model):
+    deep = _make_batch()
+    deep.is_bound = torch.zeros(deep.num_nodes, dtype=torch.long)
+    deep.binder_kind = torch.zeros(deep.num_nodes, dtype=torch.long)
+    deep.binder_depth = torch.full(
+        (deep.num_nodes,), 22, dtype=torch.long
+    )
+    capped = deep.clone()
+    capped.binder_depth.fill_(9)
+    model.eval()
+
+    assert torch.allclose(model(deep), model(capped))
+
+
 def test_state_mean_attention_readout_fuses_three_hidden_vectors():
     first = _make_batch(num_nodes=5, num_edges=6)
     second = _make_batch(num_nodes=3, num_edges=4)
