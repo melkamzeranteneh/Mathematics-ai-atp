@@ -10,12 +10,14 @@ import pytest
 from maths_ai.gnn_inference.atp_lean_gnn.dataset import DatasetRow
 from maths_ai.gnn_inference.atp_lean_gnn.pilot_sampling import (
     build_pilot_selection,
+    load_selection_manifest,
     selected_extraction_row_indices,
     selected_row_indices,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.preprocess import (
     _build_sexpr_map,
     _load_rows,
+    _load_selected_rows_once,
 )
 
 
@@ -291,6 +293,52 @@ def test_logical_holdout_loads_rows_from_manifest_source_split(tmp_path: Path):
         )
     assert [row.row_index for row in filtered] == [1, 3]
     assert all(row.split == "train" for row in filtered)
+
+
+def test_logical_partitions_share_one_source_scan(tmp_path: Path):
+    rows = _rows()
+    manifest = tmp_path / "holdout.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "dataset": "fake/dataset",
+                "splits": {
+                    "train": {"source_split": "train", "row_indices": [0, 2]},
+                    "val": {"source_split": "train", "row_indices": [1]},
+                    "test": {"source_split": "train", "row_indices": [3]},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = 0
+
+    def iter_rows(*, split: str, **_kwargs):
+        nonlocal calls
+        calls += 1
+        assert split == "train"
+        return iter(rows["train"])
+
+    with patch(
+        "maths_ai.gnn_inference.atp_lean_gnn.preprocess.iter_dataset_rows",
+        side_effect=iter_rows,
+    ):
+        selected = _load_selected_rows_once(
+            "fake/dataset", ("train", "val", "test"), manifest
+        )
+
+    assert calls == 1
+    assert [row.row_index for row in selected["train"]] == [0, 2]
+    assert [row.row_index for row in selected["val"]] == [1]
+    assert [row.row_index for row in selected["test"]] == [3]
+
+
+def test_empty_selection_manifest_names_the_file(tmp_path: Path):
+    manifest = tmp_path / "empty.json"
+    manifest.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"manifest is empty: .*empty\.json"):
+        load_selection_manifest(manifest)
 
 
 def test_selection_manifest_rejects_sample_limit(tmp_path: Path):

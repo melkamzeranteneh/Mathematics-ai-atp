@@ -18,8 +18,15 @@ PILOT_SCHEMA_VERSION = 1
 
 
 def load_selection_manifest(path: Path) -> dict[str, object]:
-    with Path(path).open(encoding="utf-8") as handle:
-        payload = json.load(handle)
+    path = Path(path)
+    try:
+        with path.open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except json.JSONDecodeError as exc:
+        detail = "empty" if path.stat().st_size == 0 else "invalid JSON"
+        raise ValueError(
+            f"Pilot selection manifest is {detail}: {path}"
+        ) from exc
     if payload.get("schema_version") != PILOT_SCHEMA_VERSION:
         raise ValueError(f"Unsupported pilot selection manifest: {path}")
     splits = payload.get("splits")

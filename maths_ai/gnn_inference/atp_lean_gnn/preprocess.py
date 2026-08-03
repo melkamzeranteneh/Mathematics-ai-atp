@@ -117,6 +117,48 @@ def _load_rows(
     return filtered
 
 
+def _load_selected_rows_once(
+    dataset_name: str,
+    splits: tuple[str, ...],
+    selection_manifest: Path,
+) -> dict[str, list[DatasetRow]]:
+    """Load theorem-holdout partitions with one dataset scan per source split."""
+    payload = load_selection_manifest(selection_manifest)
+    requested: dict[str, tuple[str, set[int]]] = {}
+    by_source: dict[str, set[int]] = {}
+    for split in splits:
+        split_payload = payload["splits"].get(split)
+        if not isinstance(split_payload, dict):
+            raise ValueError(f"Pilot selection manifest has no '{split}' split.")
+        source_split = str(split_payload.get("source_split", split))
+        indices = selected_row_indices(
+            selection_manifest, split, dataset_name=dataset_name
+        )
+        requested[split] = (source_split, indices)
+        by_source.setdefault(source_split, set()).update(indices)
+
+    source_rows: dict[str, dict[int, DatasetRow]] = {}
+    for source_split, wanted in by_source.items():
+        found: dict[int, DatasetRow] = {}
+        for row in iter_dataset_rows(dataset_name=dataset_name, split=source_split):
+            if row.row_index in wanted:
+                found[row.row_index] = row
+                if len(found) == len(wanted):
+                    break
+        missing = wanted - found.keys()
+        if missing:
+            raise RuntimeError(
+                f"Selection manifest contains {len(missing)} row indices not "
+                f"present in source split '{source_split}'."
+            )
+        source_rows[source_split] = found
+
+    return {
+        split: [source_rows[source][index] for index in sorted(indices)]
+        for split, (source, indices) in requested.items()
+    }
+
+
 def _build_sexpr_map(
     rows: list[DatasetRow],
     project_path: str,
@@ -181,14 +223,16 @@ def scan_train_split(
     use_sexpr: bool = False,
     sexpr_variant: str = "raw",
     selection_manifest: Path | None = None,
+    rows: list[DatasetRow] | None = None,
 ) -> tuple[dict[str, int], dict[str, int], SplitReport]:
     node_labels: set[str] = set()
     tactic_names: list[str] = []
     report = SplitReport(split="train")
 
-    rows = _load_rows(
-        dataset_name, "train", sample_per_split, selection_manifest
-    )
+    if rows is None:
+        rows = _load_rows(
+            dataset_name, "train", sample_per_split, selection_manifest
+        )
     sexpr_map = _build_sexpr_map(
         rows,
         project_path,
@@ -268,6 +312,7 @@ def process_split(
     use_sexpr: bool = False,
     sexpr_variant: str = "raw",
     selection_manifest: Path | None = None,
+    rows: list[DatasetRow] | None = None,
 ) -> tuple[SplitReport, dict[str, object]]:
     import torch
 
@@ -276,9 +321,10 @@ def process_split(
 
     report = SplitReport(split=split)
 
-    rows = _load_rows(
-        dataset_name, split, sample_per_split, selection_manifest
-    )
+    if rows is None:
+        rows = _load_rows(
+            dataset_name, split, sample_per_split, selection_manifest
+        )
     sexpr_map = _build_sexpr_map(
         rows,
         project_path,
@@ -410,6 +456,21 @@ def run_preprocessing(config: PreprocessConfig) -> dict[str, object]:
             enabled=True,
         )
 
+    selected_rows = None
+    if config.selection_manifest is not None:
+        console_print("  Loading selected dataset rows in one source scan...")
+        selected_rows = _load_selected_rows_once(
+            config.dataset_name,
+            config.splits,
+            config.selection_manifest,
+        )
+        console_print(
+            "  Selected rows loaded: "
+            + ", ".join(
+                f"{split}={len(rows)}" for split, rows in selected_rows.items()
+            )
+        )
+
     console_print(
         f"\n  Scanning train split from {config.dataset_name} to build train-only vocabularies..."
     )
@@ -422,6 +483,7 @@ def run_preprocessing(config: PreprocessConfig) -> dict[str, object]:
         use_sexpr=config.use_sexpr,
         sexpr_variant=config.sexpr_variant,
         selection_manifest=config.selection_manifest,
+        rows=None if selected_rows is None else selected_rows["train"],
     )
     console_print(
         f"  Train scan complete: attempted={train_scan.attempted_count}, "
@@ -453,6 +515,7 @@ def run_preprocessing(config: PreprocessConfig) -> dict[str, object]:
             use_sexpr=config.use_sexpr,
             sexpr_variant=config.sexpr_variant,
             selection_manifest=config.selection_manifest,
+            rows=None if selected_rows is None else selected_rows[split],
         )
         split_reports[split] = report
         manifests[split] = manifest
