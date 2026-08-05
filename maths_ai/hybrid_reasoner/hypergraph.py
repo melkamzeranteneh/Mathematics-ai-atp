@@ -104,12 +104,50 @@ class ProofNode:
 
 
 @dataclass
+class EdgeVisitStats:
+    """Per-edge MCTS visit statistics (HTPS-style).
+
+    ``N`` counts completed simulations whose backup passed through this
+    edge; ``W`` accumulates the backed-up values of those simulations, so
+    ``W / N`` is the empirical action value. ``virtual_loss`` counts
+    in-flight simulations that selected this edge but have not backed up
+    yet — each one is treated as a pending loss (contributes 0 to ``W``
+    while inflating the visit count), which steers concurrent simulations
+    in the same batch toward different branches. ``prior_prob`` is the
+    policy prior P(g,t) stamped once at edge creation by
+    ``ProofHypergraph.add_edge`` (the tactic-head probability
+    ``tactic.probability``) and read — never recomputed — by
+    ``puct_score`` on every later selection.
+    """
+
+    N: int = 0
+    W: float = 0.0
+    virtual_loss: int = 0
+    prior_prob: float = 0.0
+
+    @property
+    def Q(self) -> float:
+        """Mean action value under virtual loss.
+
+        An unvisited edge (no completed backups, no in-flight selections)
+        returns the first-play-urgency prior 0.5 rather than 0.0, so a
+        fresh edge is neither maximally attractive nor pre-emptively
+        written off before its first simulation.
+        """
+        count = self.N + self.virtual_loss
+        if count == 0:
+            return 0.5
+        return self.W / count
+
+
+@dataclass
 class ProofHyperedge:
     id: int
     source_id: int
     tactic: TacticCandidate
     child_ids: List[int] = field(default_factory=list)
     status: str = EdgeStatus.PENDING
+    visit_stats: EdgeVisitStats = field(default_factory=EdgeVisitStats)
 
     def summary(self) -> dict:
         return {
@@ -257,7 +295,13 @@ class ProofHypergraph:
                 child.note = "cycle: identical to an ancestor goal"
             child_ids.append(child_id)
 
-        edge = ProofHyperedge(id=edge_id, source_id=source_id, tactic=tactic, child_ids=child_ids)
+        edge = ProofHyperedge(
+            id=edge_id,
+            source_id=source_id,
+            tactic=tactic,
+            child_ids=child_ids,
+            visit_stats=EdgeVisitStats(prior_prob=tactic.probability),
+        )
         edge.status = self._derive_edge_status(edge)
         self.edges[edge_id] = edge
         self.nodes[source_id].outgoing_edge_ids.append(edge_id)
