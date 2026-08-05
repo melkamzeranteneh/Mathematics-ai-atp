@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import unittest
 
 import torch
@@ -64,6 +65,43 @@ class _RejectExecutor:
         return TacticOutcome(success=False, subgoals=[], error="rejected")
 
 
+class _SubgoalExecutor:
+    """Yield configurable subgoals for the first ``depth`` applications per
+    branch, then QED.
+
+    ``depth_map`` maps a goal expression to the subgoal expressions one tactic
+    application on it produces; an expression absent from the map QEDs. The
+    goal state is not consulted (the fakes carry no goals), so the routing key
+    is the tactic's *parent* expression — passed in at ``apply`` time via
+    ``self.current_goal``, set by the reasoner hook below.
+    """
+
+    def __init__(self, depth_map: dict[str, list[str]]):
+        self.server = _FakeServer()
+        self.depth_map = depth_map
+        self.current_goal: str | None = None
+        self.applications = 0
+
+    async def apply(self, server, state, tactic):
+        self.applications += 1
+        subgoal_exprs = self.depth_map.get(self.current_goal, [])
+        subgoals = [Goal(expression=e, hypotheses=[]) for e in subgoal_exprs]
+        return TacticOutcome(success=True, subgoals=subgoals)
+
+
+class _GoalTrackingReasoner(RLHybridReasoner):
+    """Route the executor by the expanding node's goal expression.
+
+    ``_SubgoalExecutor`` cannot see which node an application belongs to (the
+    fake goal states carry no goals), so this override records it before the
+    per-node execution stage runs.
+    """
+
+    async def _execute_and_link(self, graph, node, candidates):
+        self.executor.current_goal = node.goal.expression
+        return await super()._execute_and_link(graph, node, candidates)
+
+
 class _StubPLN:
     """PLN stand-in: a real (non-fallback) low score, no subprocess."""
 
@@ -76,7 +114,7 @@ GOAL_EXPR = "p → p"
 HYPS = ["p : Prop"]
 
 
-def _make_reasoner(executor, *, top_k=3, seed=0):
+def _make_reasoner(executor, *, top_k=3, seed=0, reasoner_cls=RLHybridReasoner, **search_kwargs):
     torch.manual_seed(seed)
     goal = Goal(expression=GOAL_EXPR, hypotheses=HYPS)
     # Vocab from the test goal's own DAG so featurization is non-degenerate.
@@ -93,7 +131,7 @@ def _make_reasoner(executor, *, top_k=3, seed=0):
         dropout=0.1,
         max_args=2,
     )
-    reasoner = RLHybridReasoner(
+    reasoner = reasoner_cls(
         model,
         node_vocab,
         TACTIC_VOCAB,
@@ -101,6 +139,7 @@ def _make_reasoner(executor, *, top_k=3, seed=0):
         top_k_tactics=top_k,
         max_depth=3,
         max_nodes=20,
+        **search_kwargs,
     )
     reasoner.petta_chainer = _StubPLN()  # keep unit tests free of the petta subprocess
     return reasoner, model, node_vocab
@@ -265,6 +304,155 @@ class OnPolicyLossTests(unittest.TestCase):
             return float(out[0].item())
 
         self.assertNotAlmostEqual(loss_with(1), loss_with(3))
+
+
+class MCTSSearchTests(unittest.TestCase):
+    """Multi-simulation search (selection_policy="puct") on the RL reasoner,
+    and the legacy/puct mode gate."""
+
+    ROOT = GOAL_EXPR  # "p → p"
+
+    def _prove(self, reasoner):
+        return asyncio.run(reasoner.prove(GOAL_EXPR, hypotheses=HYPS))
+
+    def test_default_legacy_loop_never_touches_visit_stats(self):
+        # selection_policy="legacy" (default): the best-first loop runs
+        # verbatim and no edge accumulates visit statistics — the regression
+        # guarantee.
+        executor = _SubgoalExecutor({self.ROOT: ["A", "B"]})
+        reasoner, _model, _vocab = _make_reasoner(
+            executor, reasoner_cls=_GoalTrackingReasoner
+        )
+        result = self._prove(reasoner)
+        self.assertTrue(result.graph.is_solved())
+        for edge in result.graph.edges.values():
+            self.assertEqual(edge.visit_stats.N, 0)
+            self.assertEqual(edge.visit_stats.W, 0.0)
+            self.assertEqual(edge.visit_stats.virtual_loss, 0)
+
+    def test_default_equals_explicit_legacy_structurally(self):
+        # A default-constructed reasoner and one with explicit
+        # selection_policy="legacy" run the same code path: same seed and
+        # executor script must produce structurally identical graphs. This
+        # pins the default to the legacy loop.
+        def run(**kwargs):
+            executor = _SubgoalExecutor({self.ROOT: ["A", "B"]})
+            reasoner, _model, _vocab = _make_reasoner(
+                executor, reasoner_cls=_GoalTrackingReasoner, **kwargs
+            )
+            return self._prove(reasoner).graph
+
+        default_graph = run()
+        legacy_graph = run(selection_policy="legacy")
+
+        self.assertEqual(
+            [(n.id, n.goal.expression, n.status) for n in default_graph.nodes.values()],
+            [(n.id, n.goal.expression, n.status) for n in legacy_graph.nodes.values()],
+        )
+        self.assertEqual(
+            [
+                (e.id, e.tactic.tactic_name, tuple(e.tactic.arguments), tuple(e.child_ids), e.status)
+                for e in default_graph.edges.values()
+            ],
+            [
+                (e.id, e.tactic.tactic_name, tuple(e.tactic.arguments), tuple(e.child_ids), e.status)
+                for e in legacy_graph.edges.values()
+            ],
+        )
+
+    def test_legacy_with_explicit_budget_raises(self):
+        # The gate is the policy: an explicit simulation budget under
+        # "legacy" would be silently ignored, so construction rejects it.
+        executor = _SubgoalExecutor({self.ROOT: ["A", "B"]})
+        with self.assertRaises(ValueError):
+            _make_reasoner(
+                executor, reasoner_cls=_GoalTrackingReasoner,
+                selection_policy="legacy", num_simulations=6,
+            )
+
+    def test_puct_single_simulation_runs_simulation_loop(self):
+        # selection_policy="puct" with num_simulations=1 runs the simulation
+        # loop, not the legacy loop — proving the gate is the policy, not the
+        # simulation count. One simulation selects the unexpanded root as its
+        # only leaf and stops after expanding it (its backup traverses no
+        # edges, since the descent chose none), so the graph holds exactly the
+        # root plus its subgoals, unsolved — where the legacy loop on the same
+        # script (see test_default_legacy_loop_never_touches_visit_stats)
+        # continues to root resolution.
+        executor = _SubgoalExecutor({self.ROOT: ["A", "B"]})
+        reasoner, _model, _vocab = _make_reasoner(
+            executor, top_k=1, reasoner_cls=_GoalTrackingReasoner,
+            selection_policy="puct", num_simulations=1,
+        )
+        result = self._prove(reasoner)
+        self.assertFalse(result.graph.is_solved())
+        expanded = [
+            n for n in result.graph.nodes.values() if n.outgoing_edge_ids or n.exhausted
+        ]
+        self.assertEqual([n.id for n in expanded], [result.graph.root_id])
+
+    def test_multi_sim_accumulates_stats_and_releases_virtual_loss(self):
+        executor = _SubgoalExecutor({self.ROOT: ["A", "B"]})
+        reasoner, _model, _vocab = _make_reasoner(
+            executor, top_k=1, reasoner_cls=_GoalTrackingReasoner,
+            selection_policy="puct", num_simulations=6, sim_batch_size=2,
+        )
+        result = self._prove(reasoner)
+        self.assertTrue(result.graph.is_solved())
+        # Simulations that descended through the root's edge backed values into
+        # its statistics (W ≤ N: every backup value is a product of [0,1] terms).
+        visited = [e for e in result.graph.edges.values() if e.visit_stats.N > 0]
+        self.assertGreater(len(visited), 0)
+        for edge in visited:
+            self.assertLessEqual(edge.visit_stats.W, edge.visit_stats.N)
+        # Every increment during selection was released during backup.
+        for edge in result.graph.edges.values():
+            self.assertEqual(edge.visit_stats.virtual_loss, 0)
+
+    def test_expired_deadline_returns_partial_graph(self):
+        executor = _SubgoalExecutor({self.ROOT: ["A", "B"]})
+        reasoner, _model, _vocab = _make_reasoner(
+            executor, reasoner_cls=_GoalTrackingReasoner,
+            selection_policy="puct", num_simulations=6, sim_batch_size=2,
+        )
+        result = asyncio.run(
+            reasoner.prove(GOAL_EXPR, hypotheses=HYPS, deadline=time.monotonic() - 1.0)
+        )
+        # The loop stopped before the first simulation batch: only the root
+        # exists, unexpanded, and the partial graph came back instead of an error.
+        self.assertEqual(len(result.graph.nodes), 1)
+        self.assertFalse(result.graph.is_solved())
+        self.assertEqual(executor.applications, 0)
+
+    def test_batched_expansion_attributes_failures_to_the_right_node(self):
+        # Regression for the per-node stash (Decision 1.1): one simulation's
+        # leaves A and B are proposed in one batched call; A's applications
+        # succeed (QED) while B's are rejected — every failure record must
+        # carry B's goal, never A's or the root's.
+        class _SelectiveExecutor(_SubgoalExecutor):
+            async def apply(self, server, state, tactic):
+                self.applications += 1
+                if self.current_goal == "B":
+                    return TacticOutcome(success=False, subgoals=[], error="rejected")
+                subgoal_exprs = self.depth_map.get(self.current_goal, [])
+                subgoals = [Goal(expression=e, hypotheses=[]) for e in subgoal_exprs]
+                return TacticOutcome(success=True, subgoals=subgoals)
+
+        executor = _SelectiveExecutor({self.ROOT: ["A", "B"]})
+        reasoner, _model, _vocab = _make_reasoner(
+            executor, top_k=2, reasoner_cls=_GoalTrackingReasoner,
+            selection_policy="puct", num_simulations=6, sim_batch_size=2,
+        )
+        result = self._prove(reasoner)
+        self.assertGreater(len(result.failure_actions), 0)
+        for record in result.failure_actions:
+            self.assertEqual(record.goal.expression, "B")
+        # A's QED edge is in the on-policy join table with a matching tactic.
+        solved_edges = [
+            eid for eid, e in result.graph.edges.items()
+            if result.graph.nodes[e.source_id].goal.expression == "A"
+        ]
+        self.assertTrue(any(eid in result.edge_actions for eid in solved_edges))
 
 
 if __name__ == "__main__":

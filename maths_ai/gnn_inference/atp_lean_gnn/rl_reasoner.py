@@ -1,17 +1,25 @@
 """Training-mode search: on-policy sampling expansion over the hybrid reasoner.
 
-``RLHybridReasoner`` overrides exactly two seams of ``HybridReasoner``:
+``RLHybridReasoner`` overrides these seams of ``HybridReasoner``:
 
-  * ``predict_next_tactic`` — instead of the deterministic GNN-engine top-k, draw ``k``
-    i.i.d. actions from the actor-critic policy (``model.act``), decode each into a
-    ``TacticCandidate`` the Pantograph executor can apply, and stash the integer action
-    record (``EdgeAction``) keyed by a candidate fingerprint.
-  * ``_link`` — when the executor accepts a candidate and the base ``_expand`` links it
-    into the hypergraph, migrate the stash entry from fingerprint to ``edge.id`` so the
-    train phase can join each harvested transition to the action that produced it.
+  * ``predict_next_tactic`` / ``predict_next_tactics_batch`` — instead of the
+    deterministic GNN-engine top-k, draw ``k`` i.i.d. actions from the actor-critic
+    policy (``model.act``), decode each into a ``TacticCandidate`` the Pantograph
+    executor can apply, and stash the integer action record (``EdgeAction``) in the
+    proposing node's pending sub-dict. The batch variant runs one multi-graph policy
+    forward across all leaves of a simulation batch.
+  * ``_link`` — when the executor accepts a candidate and the base expansion links it
+    into the hypergraph, migrate the stash entry from the pending sub-dict to
+    ``edge.id`` so the train phase can join each harvested transition to the action
+    that produced it.
+  * ``_leaf_value`` — the critic head's value estimate for an unresolved simulation
+    leaf (HTPS's ``v_T(g) = c_θ(g)``), used by ``_backup_simulation``.
 
-Stash entries still pending after a node's expansion belong to executor-REJECTED samples;
-they are flushed to ``failure_actions`` and train the actor with
+The pending stash is keyed per node (``goal_key → {fingerprint → EdgeAction}``): a
+node's still-pending entries after its expansion completes belong to executor-REJECTED
+samples, and ``_on_expansion_complete`` flushes exactly that node's sub-dict to
+``failure_actions`` — so batching proposals across several leaves cannot misattribute
+one leaf's pending entries to another. Failure records train the actor with
 ``return = terminal_failure − step_penalty`` (no critic target — the state may still be
 provable, only that action failed).
 
@@ -31,10 +39,14 @@ from torch_geometric.data import Batch
 
 from maths_ai.data_models.proof_components import Goal, TacticCandidate
 from maths_ai.hybrid_reasoner.hypergraph import ProofHypergraph, ProofNode
-from maths_ai.hybrid_reasoner.joint_inference import HybridReasoner
+from maths_ai.hybrid_reasoner.joint_inference import (
+    HybridReasoner,
+    _sanitize_inaccessible_names,
+)
 
 from .actor_critic import ActorCriticWithArgsClassifier
 from .inference import _resolve_local_node_name
+from .labels import get_tactic_arity
 from .pln_rl_training import EdgeAction, FailureRecord, make_dag_featurizer
 
 
@@ -50,8 +62,20 @@ class RLSearchResult:
     failure_actions: List[FailureRecord] = field(default_factory=list)
 
 
-def _fingerprint(goal: Goal, tactic_name: str, arguments: tuple[str, ...]) -> tuple:
-    return (goal.expression, tuple(goal.hypotheses), tactic_name, arguments)
+def _goal_key(goal: Goal) -> tuple:
+    return (goal.expression, tuple(goal.hypotheses))
+
+
+def _fingerprint(tactic_name: str, arguments: tuple[str, ...]) -> tuple:
+    return (tactic_name, arguments)
+
+
+@dataclass
+class _PendingNode:
+    """One proposing node's sampled-but-not-yet-linked actions."""
+
+    goal: Goal
+    actions: Dict[tuple, EdgeAction] = field(default_factory=dict)
 
 
 class RLHybridReasoner(HybridReasoner):
@@ -87,9 +111,10 @@ class RLHybridReasoner(HybridReasoner):
             **reasoner_kwargs,
         )
 
-        # Per-search stashes, reset by prove(); _pending is per-node (flushed by _expand).
-        self._pending: Dict[tuple, EdgeAction] = {}
-        self._pending_goal: Optional[Goal] = None
+        # Per-search stashes, reset by prove(); _pending holds one sub-dict per
+        # proposing node (flushed by _on_expansion_complete when that node's
+        # expansion finishes).
+        self._pending: Dict[tuple, _PendingNode] = {}
         self._result: Optional[RLSearchResult] = None
         # Argmax proposals (evaluation) vs. i.i.d. sampling (training); set per prove().
         self._greedy: bool = False
@@ -108,96 +133,166 @@ class RLHybridReasoner(HybridReasoner):
         Identical draws are deduplicated for the EXECUTOR (Lean would reject the
         duplicate edge) but recorded with ``multiplicity = m`` so the policy-gradient
         term is weighted by how often the policy actually produced the action
-        (refinement 1). Every decoded candidate is stashed pending; ``_link`` claims
-        the ones that produce edges and ``_expand``'s epilogue (via ``_flush_pending``)
-        converts the rest into failure records.
+        (refinement 1). Every decoded candidate is stashed pending under this goal's
+        sub-dict; ``_link`` claims the ones that produce edges and
+        ``_on_expansion_complete`` converts the rest into failure records.
 
         If ``self._greedy`` is True (set by ``prove(greedy=True)``), draw k argmax
         actions instead of sampling — used for evaluation.
         """
-        self._flush_pending()  # anything left from the previous node is a failure
-        self._pending_goal = sub_goal
+        return self.predict_next_tactics_batch([sub_goal])[0]
 
-        dag, data = self.dag_featurize(sub_goal)
-        batch = Batch.from_data_list([data]).to(self.device)
+    def predict_next_tactics_batch(self, sub_goals: List[Goal]) -> List[List[TacticCandidate]]:
+        """Batched proposal: one multi-graph policy forward per draw across all
+        ``sub_goals`` (instead of ``k × len(sub_goals)`` single-graph forwards).
 
-        candidates: List[TacticCandidate] = []
+        Each goal's sampled actions land in its own pending sub-dict, so a later
+        flush of one goal's failures cannot touch another's (Decision 1.1).
+        """
+        pendings: List[_PendingNode] = []
+        for sub_goal in sub_goals:
+            key = _goal_key(sub_goal)
+            pending = self._pending.get(key)
+            if pending is None:
+                pending = _PendingNode(goal=sub_goal)
+                self._pending[key] = pending
+            pendings.append(pending)
+
+        dags = []
+        datas = []
+        for sub_goal in sub_goals:
+            dag, data = self.dag_featurize(sub_goal)
+            dags.append(dag)
+            datas.append(data)
+        batch = Batch.from_data_list(datas).to(self.device)
+
+        all_candidates: List[List[TacticCandidate]] = [[] for _ in sub_goals]
         self.model.eval()
         with torch.no_grad():
             for _ in range(self.top_k_tactics):
                 sample = self.model.act(batch, id_to_tactic=self.id_to_tactic, greedy=self._greedy)
-                candidate, action = self._decode(sample, dag)
-                if candidate is None:
-                    continue
-                key = _fingerprint(sub_goal, candidate.tactic_name, tuple(candidate.arguments))
-                existing = self._pending.get(key)
-                if existing is not None:
-                    self._pending[key] = EdgeAction(
-                        tactic_id=existing.tactic_id,
-                        arg_indices=existing.arg_indices,
-                        multiplicity=existing.multiplicity + 1,
-                    )
-                else:
-                    self._pending[key] = action
-                    candidates.append(candidate)
-        return candidates
+                for row, (dag, pending) in enumerate(zip(dags, pendings)):
+                    candidate, action = self._decode_row(sample, row, dag)
+                    if candidate is None:
+                        continue
+                    key = _fingerprint(candidate.tactic_name, tuple(candidate.arguments))
+                    existing = pending.actions.get(key)
+                    if existing is not None:
+                        pending.actions[key] = EdgeAction(
+                            tactic_id=existing.tactic_id,
+                            arg_indices=existing.arg_indices,
+                            multiplicity=existing.multiplicity + 1,
+                        )
+                    else:
+                        pending.actions[key] = action
+                        all_candidates[row].append(candidate)
+        return all_candidates
 
-    def _decode(self, sample, dag) -> tuple[Optional[TacticCandidate], Optional[EdgeAction]]:
-        """Turn one batch-size-1 ``ActionSample`` into ``(TacticCandidate, EdgeAction)``.
+    def _decode_row(self, sample, row: int, dag) -> tuple[Optional[TacticCandidate], Optional[EdgeAction]]:
+        """Turn row ``row`` of a batched ``ActionSample`` into
+        ``(TacticCandidate, EdgeAction)``.
 
         Tactic: ``tactic_id → name`` via the inverted tactic vocab; an id outside the
         vocab (or the ``<UNK>`` family) is unplayable — drop the draw. Arguments: each
-        sampled index is a padded per-graph position; at batch size 1 that equals the
-        node's offset in ``dag.nodes`` (``dag_to_pyg`` preserves node order), so render
-        it with ``_resolve_local_node_name``. Out-of-range indices (padding) are dropped
-        from the argument list but KEPT in ``arg_indices`` — the recompute must evaluate
-        the log-prob of what was actually sampled, and ``forced_step`` zeroes invalid rows.
+        sampled index is a padded per-graph position, which equals the node's offset in
+        this row's ``dag.nodes`` (``_score_nodes`` assigns offsets within each graph),
+        so render it with ``_resolve_local_node_name``. The number of argument steps in
+        a multi-graph batch follows the batch's MAX sampled arity, so rows whose tactic
+        has a smaller arity are truncated to their own arity — matching what a
+        single-graph proposal would have sampled. Out-of-range indices (padding) are
+        dropped from the argument list but KEPT in ``arg_indices`` — the recompute must
+        evaluate the log-prob of what was actually sampled, and ``forced_step`` zeroes
+        invalid rows.
         """
-        tactic_id = int(sample.tactic_action[0])
+        tactic_id = int(sample.tactic_action[row])
         tactic_name = self.id_to_tactic.get(tactic_id)
         if tactic_name is None or tactic_name.startswith("<"):
             return None, None
 
-        arg_indices = tuple(int(a[0]) for a in sample.arg_actions)
+        arity = min(get_tactic_arity(tactic_name), self.model.max_args)
+        arg_indices = tuple(int(a[row]) for a in sample.arg_actions[:arity])
         arguments: List[str] = []
         for idx in arg_indices:
             if 0 <= idx < len(dag.nodes):
                 arguments.append(_resolve_local_node_name(dag.nodes[idx], dag))
 
-        probability = float(math.exp(float(sample.tactic_logp[0])))
+        probability = float(math.exp(float(sample.tactic_logp[row])))
         candidate = TacticCandidate(
             tactic_name=tactic_name, arguments=arguments, probability=probability
         )
         action = EdgeAction(tactic_id=tactic_id, arg_indices=arg_indices, multiplicity=1)
         return candidate, action
 
+    def _decode(self, sample, dag) -> tuple[Optional[TacticCandidate], Optional[EdgeAction]]:
+        """Batch-size-1 view of ``_decode_row`` (kept for tests and callers
+        holding a single-graph ``ActionSample``)."""
+        return self._decode_row(sample, 0, dag)
+
     # ------------------------------------------------------------------
     # Stash migration: fingerprint → edge.id on link, failures on flush
     # ------------------------------------------------------------------
 
+    def _pending_for_node(self, node_goal: Goal) -> Optional[tuple]:
+        """Locate the pending sub-dict for a node.
+
+        Proposals fingerprint the SANITIZED goal (that is what ``_expand`` /
+        ``_expand_leaves`` pass to the proposal seam), while graph nodes carry
+        the original goal — try the raw key first, then the sanitized one.
+        """
+        key = _goal_key(node_goal)
+        if key in self._pending:
+            return key
+        sanitized_key = _goal_key(_sanitize_inaccessible_names(node_goal))
+        if sanitized_key in self._pending:
+            return sanitized_key
+        return None
+
     def _link(self, graph: ProofHypergraph, node: ProofNode, tactic: TacticCandidate, ranked_subgoals: list):
         edge = super()._link(graph, node, tactic, ranked_subgoals)
-        key = _fingerprint(node.goal, tactic.tactic_name, tuple(tactic.arguments))
         # PLN_fallback pseudo-edges carry no sampled action; leave them out of the join.
-        # node.goal must match the fingerprint's goal: predict_next_tactic fingerprinted
-        # the SANITIZED goal, so try that too.
-        action = self._pending.pop(key, None)
-        if action is None and self._pending_goal is not None:
-            key = _fingerprint(self._pending_goal, tactic.tactic_name, tuple(tactic.arguments))
-            action = self._pending.pop(key, None)
-        if action is not None and edge is not None and self._result is not None:
-            self._result.edge_actions[edge.id] = action
+        pending_key = self._pending_for_node(node.goal)
+        if pending_key is not None:
+            fingerprint = _fingerprint(tactic.tactic_name, tuple(tactic.arguments))
+            action = self._pending[pending_key].actions.pop(fingerprint, None)
+            if action is not None and edge is not None and self._result is not None:
+                self._result.edge_actions[edge.id] = action
         return edge
 
-    def _flush_pending(self) -> None:
-        """Convert still-pending samples (executor-rejected) into failure records."""
-        if self._pending and self._pending_goal is not None and self._result is not None:
-            for action in self._pending.values():
+    def _on_expansion_complete(self, node: ProofNode) -> None:
+        """Flush this node's still-pending samples (executor-rejected) into
+        failure records — and only this node's, so batched expansion of other
+        leaves leaves their pending actions untouched."""
+        pending_key = self._pending_for_node(node.goal)
+        if pending_key is not None:
+            self._flush_pending(pending_key)
+
+    def _flush_pending(self, key: tuple) -> None:
+        """Convert one node's still-pending samples into failure records."""
+        pending = self._pending.pop(key, None)
+        if pending is None:
+            return
+        if self._result is not None:
+            for action in pending.actions.values():
                 self._result.failure_actions.append(
-                    FailureRecord(goal=self._pending_goal, action=action)
+                    FailureRecord(goal=pending.goal, action=action)
                 )
-        self._pending = {}
-        self._pending_goal = None
+
+    # ------------------------------------------------------------------
+    # Leaf evaluation: the critic as v_T(g) (HTPS)
+    # ------------------------------------------------------------------
+
+    def _leaf_value(self, node: ProofNode) -> float:
+        """Critic value estimate for an unresolved simulation leaf.
+
+        Featurize the goal, run ``model.encode`` under ``no_grad``, and return
+        the value head's scalar — no autograd tensor escapes the search.
+        """
+        _dag, data = self.dag_featurize(_sanitize_inaccessible_names(node.goal))
+        batch = Batch.from_data_list([data]).to(self.device)
+        self.model.eval()
+        with torch.no_grad():
+            _nodes, _state, _logits, values = self.model.encode(batch)
+        return float(values.squeeze().item())
 
     # ------------------------------------------------------------------
     # Per-search result (refinement 6)
@@ -209,23 +304,30 @@ class RLHybridReasoner(HybridReasoner):
         *,
         hypotheses: Optional[List[str]] = None,
         greedy: bool = False,
+        deadline: Optional[float] = None,
     ) -> RLSearchResult:
         """Run the search and return ``RLSearchResult(graph, edge_actions, failure_actions)``.
 
         Stashes are reset per call, so one reasoner instance must run searches
         sequentially (cross-theorem concurrency needs per-search instances).
 
-        ``greedy=True`` makes ``predict_next_tactic`` propose argmax actions instead of
+        ``greedy=True`` makes the proposal seams draw argmax actions instead of
         i.i.d. samples — used by evaluation to measure the deterministic policy. The
         stash still fills, but the caller ignores it (no gradient step follows an eval).
+
+        ``deadline`` (a ``time.monotonic()`` timestamp) is forwarded to the base
+        search loop, which stops cleanly between expansions / simulation batches
+        and returns the partial graph.
         """
         self._pending = {}
-        self._pending_goal = None
         self._greedy = greedy
         self._result = RLSearchResult(graph=None)  # graph attached after the base search
         try:
-            graph = await super().prove(goal, hypotheses=hypotheses)
-            self._flush_pending()  # last expanded node's rejects
+            graph = await super().prove(goal, hypotheses=hypotheses, deadline=deadline)
+            # Any sub-dicts not flushed by _on_expansion_complete (search ended
+            # mid-expansion, e.g. deadline) are this search's remaining rejects.
+            for key in list(self._pending):
+                self._flush_pending(key)
             self._result.graph = graph
             result, self._result = self._result, None
         finally:
