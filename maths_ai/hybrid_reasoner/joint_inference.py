@@ -3,12 +3,14 @@ import argparse
 import random
 import re
 import json
+import time
 try:
     from graphviz import Digraph
 except ImportError:
     Digraph = None
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional, Set
+from dataclasses import dataclass, field
 from pantograph.server import Server, GoalState
 
 from maths_ai.data_models.proof_components import Goal, RankedSubgoal, STV, TacticCandidate
@@ -16,11 +18,30 @@ from maths_ai.gnn_inference.inference_engine import GNNModelEngine
 from maths_ai.pln_inference.model import PLNInference
 from maths_ai.pln_inference.metta.translator.translator_modules.runner import DynamicThompsonSampler
 
-from maths_ai.hybrid_reasoner.hypergraph import ProofHypergraph, ProofNode, TacticExecutor, TacticOutcome
+from maths_ai.hybrid_reasoner.hypergraph import (
+    EdgeStatus,
+    NodeStatus,
+    ProofHypergraph,
+    ProofNode,
+    TacticExecutor,
+    TacticOutcome,
+)
+from maths_ai.hybrid_reasoner.selection_policy import puct_score, resolve_search_params
 from maths_ai.core.config import settings
 from maths_ai.gnn_inference.atp_lean_gnn.reporting import console_print
 
 _INACCESSIBLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*✝[⁰-⁹¹²³]*")
+
+
+@dataclass
+class _Simulation:
+    """One selected partial hypertree: the OR-choice made at each EXPANDED
+    node (``chosen_edges[node_id] = edge_id``) and the unexpanded OPEN
+    leaves the descent reached.
+    """
+
+    chosen_edges: Dict[int, int] = field(default_factory=dict)
+    leaves: List[int] = field(default_factory=list)
 
 
 def _sanitize_inaccessible_names(goal: Goal) -> Goal:
@@ -152,6 +173,10 @@ class HybridReasoner:
         top_k_subgoals: int = 3,
         max_depth: int = 10,
         max_nodes: int = 500,
+        selection_policy: Literal["legacy", "puct", "rp"] = "legacy",
+        num_simulations: Optional[int] = None,
+        sim_batch_size: Optional[int] = None,
+        puct_c: Optional[float] = None,
         dts_sampler: Optional[DynamicThompsonSampler] = None,
         dts_c: float = None,
         dts_random_seed: Optional[int] = None,
@@ -200,6 +225,13 @@ class HybridReasoner:
         self.top_k_subgoals = top_k_subgoals
         self.max_depth = max_depth
         self.max_nodes = max_nodes
+        self.selection_policy = selection_policy
+        # resolve_search_params rejects a budget set under "legacy" and requires
+        # num_simulations under "puct"; the resolved numeric values are stored
+        # (legacy receives placeholders its loop never reads).
+        self.num_simulations, self.sim_batch_size, self.puct_c = resolve_search_params(
+            selection_policy, num_simulations, sim_batch_size, puct_c
+        )
 
     # GNN side
     def _build_gnn_engine(
@@ -344,22 +376,42 @@ class HybridReasoner:
      
     # Joint search
      
-    async def prove(self, goal: str, *, hypotheses: Optional[List[str]] = None) -> ProofHypergraph:
-        """Run best-first AND-OR search over the hypergraph rooted at ``goal``.
+    async def prove(
+        self,
+        goal: str,
+        *,
+        hypotheses: Optional[List[str]] = None,
+        deadline: Optional[float] = None,
+    ) -> ProofHypergraph:
+        """Run AND-OR search over the hypergraph rooted at ``goal``.
 
-        Loop: pop the highest-``combined_rank`` open node, expand it
-        (``_expand``), which links any new subgoals into the hypergraph —
-        and every link immediately backpropagates updated status/rank to
-        every ancestor (``ProofHypergraph._propagate``), re-ordering the
-        frontier for the next iteration.
+        Two search modes, selected by ``selection_policy``:
+
+        * ``"legacy"`` (default) — the best-first loop: pop the
+          highest-``combined_rank`` open node, expand it (``_expand``), which
+          links any new subgoals into the hypergraph — and every link
+          immediately backpropagates updated status/rank to every ancestor
+          (``ProofHypergraph._propagate``), re-ordering the frontier for the
+          next iteration. Terminates on root SOLVED/DEAD, empty frontier,
+          ``max_nodes``, or deadline.
+        * ``"puct"`` — HTPS-style repeated simulation (``_prove_mcts``):
+          PUCT-guided partial-hypertree selection with virtual loss, batched
+          leaf expansion, and per-edge N/W visit statistics backed up after
+          every simulation, for ``num_simulations`` simulations.
+
+        ``deadline`` is a ``time.monotonic()`` timestamp: when exceeded, the
+        loop stops between expansions (or between simulation batches) and the
+        partial graph is returned — the caller keeps whatever experience was
+        gathered rather than losing it to a hard cancellation.
 
         Termination (design-report "no-goal ambiguity" — resolved here as):
           * root SOLVED  → proof found; ``graph.proof_trace()`` replays it
           * root DEAD    → provably unsolvable within the explored space
-          * frontier empty / ``max_nodes`` reached → budget exhaustion
-            (open design question: what to return — we return the partial
-            graph so the caller can inspect ``graph.frontier()``, resume, or
-            visualize it; see ``ProofHypergraph.summary``)
+          * frontier empty / ``max_nodes`` reached / deadline exceeded →
+            budget exhaustion (open design question: what to return — we
+            return the partial graph so the caller can inspect
+            ``graph.frontier()``, resume, or visualize it; see
+            ``ProofHypergraph.summary``)
 
         ``max_depth`` bounds branch depth and ``max_nodes`` bounds total
         graph size — the design report's "branching-factor explosion"
@@ -367,10 +419,17 @@ class HybridReasoner:
         ancestors) is handled inside ``ProofHypergraph.add_edge``.
         """
         graph = ProofHypergraph(Goal(expression=goal, hypotheses=hypotheses or []))
+
+        if self.selection_policy == "puct":
+            await self._prove_mcts(graph, deadline)
+            return graph
+
         loop_count = 0
 
         #Running through the loop untill the theorem is solved or the depth_limit is reached
         while not graph.is_solved() and not graph.is_exhausted() and len(graph.nodes) < self.max_nodes:
+            if not self._within_deadline(deadline):
+                break
             frontier = graph.frontier()
             if not frontier:
                 break
@@ -380,6 +439,193 @@ class HybridReasoner:
             await self._expand(graph, node)
 
         return graph
+
+    @staticmethod
+    def _within_deadline(deadline: Optional[float]) -> bool:
+        return deadline is None or time.monotonic() < deadline
+
+    # ------------------------------------------------------------------
+    # HTPS-style multi-simulation search (selection_policy == "puct")
+    # ------------------------------------------------------------------
+
+    async def _prove_mcts(self, graph: ProofHypergraph, deadline: Optional[float]) -> None:
+        """Repeated-simulation loop: select B partial hypertrees under PUCT +
+        virtual loss, expand their unexpanded leaves in one batched proposal,
+        then back up each simulation's value into the traversed edges' N/W
+        statistics.
+        """
+        simulations_done = 0
+        while (
+            not graph.is_solved()
+            and not graph.is_exhausted()
+            and len(graph.nodes) < self.max_nodes
+            and simulations_done < self.num_simulations
+            and self._within_deadline(deadline)
+        ):
+            simulations: List[_Simulation] = []
+            for _ in range(min(self.sim_batch_size, self.num_simulations - simulations_done)):
+                simulation = self._select_partial_hypertree(graph)
+                if simulation is None:
+                    break  # no selectable path (everything resolved or stuck)
+                simulations.append(simulation)
+            if not simulations:
+                break
+
+            # Deduplicate leaves across the batch: two simulations steered
+            # apart by virtual loss can still meet at a shared leaf.
+            leaf_ids: List[int] = []
+            seen: Set[int] = set()
+            for simulation in simulations:
+                for node_id in simulation.leaves:
+                    if node_id not in seen:
+                        seen.add(node_id)
+                        leaf_ids.append(node_id)
+
+            await self._expand_leaves(graph, leaf_ids)
+
+            for simulation in simulations:
+                self._backup_simulation(graph, simulation)
+            simulations_done += len(simulations)
+
+    def _select_partial_hypertree(self, graph: ProofHypergraph) -> Optional["_Simulation"]:
+        """Descend from the root, at each EXPANDED node picking the non-DEAD
+        edge that maximizes ``puct_score`` and entering **every** child of
+        that edge — a simulation must reach a full set of leaves consistent
+        with one candidate proof (the AND semantics). Each traversed edge's
+        ``virtual_loss`` is incremented so the next selection in the same
+        batch is steered away from this in-flight path.
+
+        Returns ``None`` when no path exists (the root is resolved, or every
+        edge under it is DEAD) — the caller stops the simulation batch.
+        """
+        chosen_edges: Dict[int, int] = {}
+        leaves: List[int] = []
+        stack: List[int] = [graph.root_id]
+        while stack:
+            node_id = stack.pop()
+            node = graph.nodes[node_id]
+            if node.status in (NodeStatus.SOLVED, NodeStatus.DEAD):
+                continue  # terminal for this simulation; backup reads the status
+            if node.status == NodeStatus.OPEN:
+                leaves.append(node_id)
+                continue
+            # EXPANDED: OR-choice over surviving tactic edges.
+            viable = [
+                graph.edges[eid]
+                for eid in node.outgoing_edge_ids
+                if graph.edges[eid].status != EdgeStatus.DEAD
+            ]
+            if not viable:
+                continue  # stuck node (all edges dead, not yet propagated DEAD)
+            total_visits = sum(e.visit_stats.N + e.visit_stats.virtual_loss for e in viable)
+            best = max(
+                viable,
+                key=lambda e: puct_score(e.visit_stats, total_visits, self.puct_c),
+            )
+            chosen_edges[node_id] = best.id
+            best.visit_stats.virtual_loss += 1
+            stack.extend(best.child_ids)
+
+        if not chosen_edges and not leaves:
+            return None
+        return _Simulation(chosen_edges=chosen_edges, leaves=leaves)
+
+    def predict_next_tactics_batch(self, sub_goals: List[Goal]) -> List[List[TacticCandidate]]:
+        """Propose tactic candidates for several goals at once.
+
+        Default implementation loops ``predict_next_tactic`` so the base
+        class and non-RL callers are unaffected; ``RLHybridReasoner``
+        overrides it with one multi-graph policy forward across the batch.
+        """
+        return [self.predict_next_tactic(sub_goal) for sub_goal in sub_goals]
+
+    async def _expand_leaves(self, graph: ProofHypergraph, leaf_ids: List[int]) -> None:
+        """Expand a batch of unexpanded leaves: one batched proposal call
+        across all of them, then the existing execute-and-link logic per
+        leaf, sequentially (one Pantograph server — Lean execution cannot
+        batch).
+        """
+        to_propose: List[ProofNode] = []
+        for node_id in leaf_ids:
+            node = graph.nodes[node_id]
+            if node.status != NodeStatus.OPEN:
+                continue  # resolved by an earlier leaf's propagation this batch
+            if node.depth >= self.max_depth:
+                graph.mark_node_exhausted(node.id, note=f"depth limit ({self.max_depth}) reached")
+                self._on_expansion_complete(node)
+                continue
+            to_propose.append(node)
+        if not to_propose:
+            return
+
+        sanitized = [_sanitize_inaccessible_names(node.goal) for node in to_propose]
+        proposals = self.predict_next_tactics_batch(sanitized)
+
+        for node, candidates in zip(to_propose, proposals):
+            if not candidates:
+                graph.mark_node_exhausted(node.id, note="GNN returned no viable tactic")
+                self._on_expansion_complete(node)
+                continue
+            await self._execute_and_link(graph, node, candidates)
+
+    def _backup_simulation(self, graph: ProofHypergraph, simulation: "_Simulation") -> None:
+        """Walk the simulated tree bottom-up, updating each traversed edge's
+        visit statistics.
+
+        Node values: SOLVED = 1.0, DEAD = 0.0, unresolved leaf =
+        ``_leaf_value`` (the critic in the RL subclass), interior =
+        product over the chosen edge's children (the AND-combine of the
+        value-target convention, ``HarvestConfig.and_combine="product"``).
+        Each chosen edge gets ``N += 1``, ``W += value`` and its virtual
+        loss released. Status propagation is not this walk's job —
+        ``add_edge`` already ran ``_propagate`` during expansion.
+        """
+        values: Dict[int, float] = {}
+
+        def node_value(node_id: int) -> float:
+            if node_id in values:
+                return values[node_id]
+            node = graph.nodes[node_id]
+            if node.status == NodeStatus.SOLVED:
+                v = 1.0
+            elif node.status == NodeStatus.DEAD:
+                v = 0.0
+            else:
+                edge_id = simulation.chosen_edges.get(node_id)
+                if edge_id is None:
+                    v = self._leaf_value(node)
+                else:
+                    v = 1.0
+                    for child_id in graph.edges[edge_id].child_ids:
+                        v *= node_value(child_id)
+            values[node_id] = v
+            return v
+
+        for node_id, edge_id in simulation.chosen_edges.items():
+            edge = graph.edges[edge_id]
+            edge_value = 1.0
+            for child_id in edge.child_ids:
+                edge_value *= node_value(child_id)
+            stats = edge.visit_stats
+            stats.N += 1
+            stats.W += edge_value
+            stats.virtual_loss = max(0, stats.virtual_loss - 1)
+
+    def _leaf_value(self, node: ProofNode) -> float:
+        """Value estimate for an unresolved simulation leaf.
+
+        The base class has no critic, so it returns the uninformed 0.5;
+        ``RLHybridReasoner`` overrides this with the critic head's value
+        estimate (HTPS's ``v_T(g) = c_θ(g)``).
+        """
+        return 0.5
+
+    def _on_expansion_complete(self, node: ProofNode) -> None:
+        """Hook: called once a node's expansion has fully finished (all
+        candidates executed and linked, or the node was exhausted without a
+        proposal). The RL subclass flushes that node's still-pending sampled
+        actions to failure records here.
+        """
 
     async def _start_state(self, goal: Goal) -> GoalState:
         """Reconstruct a Lean goal state for ``goal``, including its local
@@ -429,6 +675,7 @@ class HybridReasoner:
         """
         if node.depth >= self.max_depth:
             graph.mark_node_exhausted(node.id, note=f"depth limit ({self.max_depth}) reached")
+            self._on_expansion_complete(node)
             return
 
         sanitized = _sanitize_inaccessible_names(node.goal)
@@ -436,8 +683,20 @@ class HybridReasoner:
         candidates = self.predict_next_tactic(sanitized)
         if not candidates:
             graph.mark_node_exhausted(node.id, note="GNN returned no viable tactic")
+            self._on_expansion_complete(node)
             return
 
+        await self._execute_and_link(graph, node, candidates)
+
+    async def _execute_and_link(
+        self, graph: ProofHypergraph, node: ProofNode, candidates: List[TacticCandidate]
+    ) -> None:
+        """Execute each proposed candidate against Lean and link the
+        survivors into the hypergraph — the per-node execution stage shared
+        by the best-first path (``_expand``) and the batched MCTS path
+        (``_expand_leaves``). Ends with ``mark_node_exhausted`` (the node's
+        candidate set is spent) and the ``_on_expansion_complete`` hook.
+        """
         state = await self._start_state(node.goal)
         any_applied = False
 
@@ -494,12 +753,14 @@ class HybridReasoner:
             if stv.score >= 0.9:
                 print(f"  [PLN Fallback] high confidence — closing node {node.id} as solved!")
                 graph.add_edge(node.id, TacticCandidate(tactic_name="PLN_fallback", arguments=[], probability=1.0), ranked_subgoals=[])
+                self._on_expansion_complete(node)
                 return
 
         note = None if any_applied else "executor rejected every candidate tactic"
         if note:
             print(f"  [Node {node.id} EXHAUSTED] {note}")
         graph.mark_node_exhausted(node.id, note=note)
+        self._on_expansion_complete(node)
 
 
 
