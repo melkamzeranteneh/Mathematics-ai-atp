@@ -4,7 +4,19 @@ This document walks one training round through every mechanism, in execution ord
 the exact tensors and file locations. It describes the system as implemented in
 `atp_lean_gnn/` (`actor_critic.py`, `rl_reasoner.py`, `pln_reward.py`,
 `search_harvest.py`, `pln_rl_training.py`, `rl_training_driver.py`) and
-`hybrid_reasoner/` (`hypergraph.py`, `joint_inference.py`).
+`hybrid_reasoner/` (`hypergraph.py`, `joint_inference.py`,
+`selection_policy.py`).
+
+Two search modes are available, selected by `selection_policy` in `RLTrainingConfig`:
+
+- **`"legacy"`** (default) — the original best-first AND-OR loop, unchanged in behavior.
+  An explicit simulation budget under this mode raises `ValueError` at config construction.
+- **`"puct"`** — HTPS-style repeated simulation: PUCT-guided partial-hypertree selection
+  with virtual loss, batched leaf expansion, per-edge N/W visit statistics, and a decoupled
+  imitation + soft-critic step fed from the accumulated visit data.
+
+Sections 2–6 describe both modes side by side. The legacy path is the original document's
+text; the HTPS additions are clearly delimited.
 
 ## Symbol table
 
@@ -16,12 +28,20 @@ the exact tensors and file locations. It describes the system as implemented in
 | `a = (τ, u_1…u_K)` | one full action | `EdgeAction(tactic_id, arg_indices, multiplicity)` |
 | `π(a\|s)` | the policy: tactic head × autoregressive pointer | `ActorCriticWithArgsClassifier` |
 | `V(s)` | the critic's value estimate for state `s` | `CriticHead` on the state embedding |
-| `Φ(s)` | shaping potential = PLN strength σ of `s` (0 at terminals) | `pln_reward.potential` |
+| `Φ(s)` | shaping potential = PLN strength σ of `s` (0 at terminals, 0 when stv is None) | `pln_reward.potential` |
 | `r` | per-edge shaped reward `r_term + Σ_j(γΦ(child_j) − Φ(parent))` | `pln_reward.edge_shaped_reward` |
 | `G` | per-edge return `r + γ·AND-combine(children's backup values)` | `search_harvest.extract_transitions` |
 | `Â` | advantage `G − V(s)`, batch-normalized | `pln_rl_training.compute_onpolicy_loss` |
 | `m` | multiplicity: how many of the k i.i.d. draws produced this action | `EdgeAction.multiplicity` |
 | `γ` | discount (default 0.99) | `RewardConfig.gamma` |
+| `N(e)` | visit count: completed simulations whose backup traversed edge `e` | `EdgeVisitStats.N` |
+| `W(e)` | accumulated backed-up value over those N simulations | `EdgeVisitStats.W` |
+| `VL(e)` | virtual loss: in-flight simulations holding edge `e` | `EdgeVisitStats.virtual_loss` |
+| `P(e)` | policy prior: tactic probability stamped at edge creation | `EdgeVisitStats.prior_prob` |
+| `Q(e)` | mean action value `W/(N+VL)`, first-play-urgency 0.5 at count 0 | `EdgeVisitStats.Q` |
+| `c` | PUCT exploration constant (default 1.0) | `puct_c` in `RLTrainingConfig` |
+| `v_T(s)` | leaf value estimate for unresolved simulation leaf | `RLHybridReasoner._leaf_value` |
+| `B` | simulation batch size | `sim_batch_size` in `RLTrainingConfig` |
 
 ## 0. The model: one encoder, four heads
 
@@ -44,14 +64,18 @@ The pointer (`ArgumentSelector`) is the argument half of the policy: query =
 second argument on — autoregressive), keys = node embeddings, scaled dot-product scores
 over the state's nodes, non-premise/padding positions masked to −inf.
 
+Under the HTPS mode the critic head gains a second role: `_leaf_value` queries it at
+every unresolved simulation leaf as `v_T(s) = c_θ(s)`, providing the value estimate that
+`_backup_simulation` propagates back up the partial hypertree. A well-trained critic
+therefore steers simulations toward promising branches even before the leaf is expanded.
+
 ## 1. Action sampling: `model.act` (i.i.d.) vs. `greedy`
 
 `act(data, id_to_tactic, greedy)` (actor_critic.py) produces one full action per call:
 
 - **Tactic**: build `Categorical(logits=tactic_logits)`; **training** draws
-  `tactic_dist.sample()` — an i.i.d. sample from π(τ|s); **evaluation** takes
-  `argmax`. Either way `tactic_logp = log π(τ|s)` and the distribution entropy are
-  recorded.
+  `tactic_dist.sample()` — an i.i.d. sample from π(τ|s); **evaluation** takes `argmax`.
+  Either way `tactic_logp = log π(τ|s)` and the distribution entropy are recorded.
 - **Arguments**: the sampled tactic's arity (via `get_tactic_arity`) fixes the number of
   pointer steps. Each step calls `ArgumentSelector.sample_step` — again
   `Categorical(logits=scores).sample()` under training, and the **sampled** node's
@@ -67,53 +91,143 @@ gradient. So the RL search draws `top_k_tactics` independent samples instead —
 high-probability action may appear several times, and that repetition is *information*
 (section 3 keeps it as `multiplicity`).
 
+**Batched proposal (HTPS mode)**: `predict_next_tactics_batch` replaces the per-node loop
+with one `Batch.from_data_list` across all leaves of a simulation batch, runs
+`top_k_tactics` draws through `model.act` on the joint batch, and splits results back per
+goal. The policy math is identical — `model.act` sees the same batch size per draw; only
+the graph-construction overhead is amortized.
+
 Greedy mode exists solely for evaluation: `evaluate_proof_rate` measures the deterministic
 policy — the thing that will be deployed — not the exploration distribution around it.
 
 ## 2. Search: the AND-OR hypergraph as the environment loop
 
-`RLHybridReasoner.prove` (rl_reasoner.py) inherits the base best-first loop
-(`HybridReasoner.prove`, joint_inference.py) and swaps in the sampled policy at exactly
-two seams. One search proceeds:
+`RLHybridReasoner.prove` (rl_reasoner.py) inherits from `HybridReasoner` (joint_inference.py)
+and swaps in the sampled policy at specific seams. The active search mode is resolved at
+construction time by `resolve_search_params` (selection_policy.py) and stored on
+`self.selection_policy`.
+
+### 2a. Legacy best-first search (`selection_policy="legacy"`)
+
+The original best-first AND-OR loop, unchanged in behavior:
 
 1. **Root**: `ProofHypergraph(Goal(...))` creates node 0, `status=OPEN`.
 2. **Frontier pop**: `graph.frontier()` returns OPEN nodes sorted by `combined_rank`
    descending; the loop expands the top one. `combined_rank` starts as
-   `gnn_probability × STV.score` and is continuously revised by backprop (step 6).
+   `gnn_probability × STV.score` (or `gnn_probability × 1.0` when `stv is None`) and is
+   continuously revised by backprop (step 6 below).
 3. **Proposal** (seam 1, `predict_next_tactic`): featurize the node's sanitized goal —
    `Goal → goal_to_state → proof_state_to_dag → dag_to_pyg` under the **fixed prepared
-   vocab** — then draw k i.i.d. actions from `model.act` under `torch.no_grad()` (no
-   autograd graph is held across the search; see section 3). Each draw is **decoded**:
-   `tactic_id → name` via the inverted tactic vocab; each sampled pointer index → the DAG
-   node at that offset → a Lean argument string via `_resolve_local_node_name` (a `Hyp`
-   node renders as its bound name, e.g. `h`). Identical decoded actions are deduplicated
-   for the executor but counted (`multiplicity`).
-4. **Execution**: for each unique candidate, `PantographExecutor.apply` sends
-   `"{tactic} {args}"` to the live Lean server.
-   - **Rejected** → no edge is created; the candidate stays in the pending stash and
-     becomes a failure record (section 3).
-   - **Accepted, no subgoals** → QED: `add_edge(node, tactic, [])`, immediately SOLVED.
-   - **Accepted, subgoals** → PLN scores each subgoal concurrently
-     (`rank_subgoals` → `evaluate_async`, the petta subprocess dispatched off the event
-     loop), and the top-k `(Goal, STV)` pairs become the children of one **AND-edge**:
-     all of them must eventually close for this tactic to count.
-5. **Cycle guard**: `add_edge` fingerprints every child (`expression::sorted(hyps)`)
-   against the node's ancestors; a child identical to an ancestor is force-marked DEAD —
-   otherwise a tactic that rewrites a goal into an earlier one loops forever.
-6. **Propagation**: every mutation triggers `_propagate` — a bottom-up fixpoint walk that
-   re-derives the AND-OR statuses (node SOLVED ⇐ any edge SOLVED; edge SOLVED ⇐ all
-   children SOLVED or no children; edge DEAD ⇐ any child DEAD; node DEAD ⇐ exhausted and
-   all edges DEAD) and re-ranks every ancestor (`combined_rank = max(local_score,
-   max_edge tactic_prob × min_child rank)` — OR-max over edges, pessimistic AND-min over
-   children). This is what makes the search *best-first in provability*: a PLN score
-   assigned to a new leaf immediately re-orders the global frontier.
-7. **Termination**: root SOLVED (proof found), root DEAD (explored space exhausted), or
-   the `max_nodes` budget — the partial graph is still returned and still harvested.
+   vocab** — then draw k i.i.d. actions from `model.act` under `torch.no_grad()`. Each
+   draw is **decoded**: `tactic_id → name` via the inverted tactic vocab; each sampled
+   pointer index → the DAG node at that offset → a Lean argument string via
+   `_resolve_local_node_name`. Identical decoded actions are deduplicated for the executor
+   but counted (`multiplicity`).
+4. **Execution** (`_execute_and_link`): for each unique candidate,
+   `PantographExecutor.apply` sends `"{tactic} {args}"` to the live Lean server.
+   - Rejected → no edge; stays pending → failure record (section 3).
+   - Accepted, no subgoals → QED: `add_edge(node, tactic, [])`, immediately SOLVED.
+   - Accepted, with subgoals → PLN scores each subgoal concurrently (`rank_subgoals`);
+     the top-k `(Goal, STV)` pairs become the children of one AND-edge.
+5. **Cycle guard**: `add_edge` fingerprints every child against the node's ancestors; a
+   child matching an ancestor is force-marked DEAD.
+6. **Propagation**: every mutation triggers `_propagate` — a bottom-up fixpoint that
+   re-derives AND-OR statuses and re-ranks every ancestor's `combined_rank`. This is what
+   makes the search best-first in provability: a new leaf score immediately re-orders the
+   global frontier.
+7. **Termination**: root SOLVED, root DEAD, `max_nodes` budget, or the `deadline`
+   timestamp (`time.monotonic()`). The `deadline` check runs between expansions, so the
+   partial graph — with all experience gathered so far — is always returned intact.
+8. **Expansion hook**: `_on_expansion_complete(node)` fires when a node's expansion
+   fully finishes (all candidates executed, or the node was exhausted without a proposal).
+   The base class no-ops it; `RLHybridReasoner` flushes that node's still-pending sampled
+   actions to failure records there (section 3).
 
-So during the search the AND-OR graph plays two roles at once: it is the **control
-structure** (frontier ordering decides where the policy is asked next) and it is
-accumulating the **experience** the trainer will read (its topology and terminal statuses
-determine every reward and value target).
+### 2b. HTPS simulation loop (`selection_policy="puct"`)
+
+Replaces the single frontier-pop loop with `_prove_mcts`: repeated batches of B
+simulations, each simulation being a selection + expansion + backup cycle over the same
+growing hypergraph.
+
+#### 2b-i. Selection: `_select_partial_hypertree`
+
+Descend from the root. At each **EXPANDED** node, choose the non-DEAD outgoing edge that
+maximizes the PUCT score:
+
+```
+puct_score(e) = Q(e) + c · P(e) · sqrt(total_visits) / (1 + N(e) + VL(e))
+```
+
+where `total_visits = Σ_{e' viable} (N(e') + VL(e'))` over the node's non-DEAD edges,
+`P(e)` is the tactic probability stamped at edge creation time (`EdgeVisitStats.prior_prob
+= tactic.probability`), and `Q(e) = W(e) / (N(e) + VL(e))` with first-play-urgency 0.5
+when the count is zero.
+
+The AND semantics require entering **every child** of the chosen edge — all subgoals
+must close for the edge to count. The descent therefore pushes all children of the chosen
+edge onto the stack, not just one. Each traversed edge receives `virtual_loss += 1`
+immediately, so the next selection in the same batch sees an inflated visit count and
+steers toward a different branch (the batching effect: B simulations explore B distinct
+paths without waiting for each other's backups).
+
+An **OPEN** node is a leaf: append to `simulation.leaves` and stop descending through it.
+A **SOLVED** or **DEAD** node is a terminal for this simulation: stop, but the backup
+will read its status.
+
+Returns `_Simulation(chosen_edges={node_id: edge_id}, leaves=[...])` or `None` when no
+path exists (root already resolved, or all edges under it are DEAD).
+
+#### 2b-ii. Batched leaf expansion: `_expand_leaves`
+
+Collect all unique leaf node ids across the batch (two simulations can meet at a shared
+leaf after virtual-loss steering). For each:
+- Skip if already non-OPEN (an earlier leaf's propagation may have resolved it).
+- Apply depth limit → `mark_node_exhausted` + `_on_expansion_complete`.
+- Otherwise: add to `to_propose`.
+
+Call `predict_next_tactics_batch(sanitized_goals)` — one multi-graph policy forward
+across all proposing nodes. Then for each node, call `_execute_and_link` sequentially
+(one Pantograph server; Lean execution cannot be parallelized). The `_on_expansion_complete`
+hook fires per node when its execution finishes.
+
+#### 2b-iii. Backup: `_backup_simulation`
+
+Walk each simulation's `chosen_edges` and assign values bottom-up:
+
+```
+value(SOLVED node)   = 1.0
+value(DEAD node)     = 0.0
+value(unresolved leaf, no chosen edge below) = _leaf_value(node)   # critic: c_θ(s)
+value(interior node) = product of value(child) for each child of chosen_edges[node_id]
+```
+
+The product over children is the AND-combine: all subgoals of an edge must close. For
+each `(node_id, edge_id)` in `chosen_edges`:
+
+```
+edge_value = product of value(child) for child in edge.child_ids
+stats.N    += 1
+stats.W    += edge_value
+stats.virtual_loss = max(0, stats.virtual_loss - 1)   # release the in-flight hold
+```
+
+`_leaf_value` in the base class returns 0.5 (uninformed). `RLHybridReasoner` overrides it
+with the critic head's value estimate `c_θ(s)` — the same head used for the advantage
+baseline. A well-trained critic here focuses simulations toward branches the model already
+believes are promising.
+
+#### 2b-iv. Iteration
+
+After each batch of B simulations, the loop checks: root solved/dead, `max_nodes` budget,
+`num_simulations` counter, `deadline`. Because status propagation runs inside `add_edge`
+during `_execute_and_link`, the graph's structural state is up-to-date after every
+expansion — the next selection batch immediately sees the resolved subtrees.
+
+So under HTPS the AND-OR graph plays three roles simultaneously: **control structure**
+(PUCT selection decides where the policy is asked next), **experience accumulator** (edge
+visit statistics record what the search has learned about each branch), and **training
+data source** (its topology and terminal statuses drive rewards, critic targets, and
+imitation samples — see sections 4 and 4b).
 
 ## 3. Storage: what survives the search, and why only integers
 
@@ -122,30 +236,47 @@ design: holding autograd graphs for every sampled action across a multi-node asy
 would pin the memory of every intermediate activation for minutes. What is stored instead
 (rl_reasoner.py):
 
-- **Pending stash** — during a node's expansion, every decoded draw sits in
-  `self._pending: {fingerprint → EdgeAction}` where the fingerprint is
-  `(goal_expr, hyps, tactic_name, args)` and `EdgeAction` is three integers-worth of data:
-  `tactic_id`, `arg_indices` (the raw sampled pointer positions, including out-of-range
-  ones — the recompute must evaluate what was actually sampled), `multiplicity`.
-- **Edge join** (seam 2, `_link`) — when the base `_expand` links an accepted tactic into
-  the graph, the subclass moves the stash entry to `edge_actions[edge.id]`. This is the
-  join key between graph structure and policy actions.
-- **Failure flush** — entries still pending when the node's expansion ends (or the search
-  ends) were rejected by Lean: they move to `failure_actions` as
-  `FailureRecord(goal, action)`. With an untrained policy these are *most* of the signal —
-  an edge-less rejection would otherwise vanish without teaching anything.
+- **Per-node pending stash** — during a node's expansion, every decoded draw sits in
+  `self._pending: {goal_key → _PendingNode}`, where `goal_key = (expression, hyps)` and
+  `_PendingNode.actions = {fingerprint → EdgeAction}`. `fingerprint = (tactic_name,
+  args)`. `EdgeAction` is three integers-worth of data: `tactic_id`, `arg_indices` (the
+  raw sampled pointer positions — the recompute must evaluate what was actually sampled),
+  `multiplicity`.
+
+  The per-node keying (not a single flat dict) means that a batched proposal across
+  several simulation leaves cannot misattribute one leaf's rejected samples to another
+  node's goal. The flush is scoped to exactly the finished node.
+
+- **Edge join** (seam 2, `_link`) — when `_execute_and_link` links an accepted tactic
+  into the graph, the subclass moves the stash entry from the pending sub-dict to
+  `edge_actions[edge.id]`. This is the join key between graph structure and policy
+  actions. Under HTPS, the same `_link` override fires for every leaf of every simulation
+  batch — the join table accumulates across the entire search.
+
+- **Failure flush** (`_on_expansion_complete`) — entries still in the node's pending
+  sub-dict when `_on_expansion_complete` fires were rejected by Lean. They move to
+  `failure_actions` as `FailureRecord(goal, action)`. Under the legacy loop this fires at
+  the end of each `_expand` call; under HTPS it fires per leaf immediately after that
+  leaf's `_execute_and_link` finishes.
+
 - **Per-search container** — `prove` returns
-  `RLSearchResult(graph, edge_actions, failure_actions)` and resets its stashes, because
-  `edge.id` is unique only within one `ProofHypergraph`; collect therefore runs theorems
-  **sequentially** on one reasoner (`collect_round`, rl_training_driver.py), with
-  per-theorem timeout/exception isolation so one dead search cannot kill the round.
+  `RLSearchResult(graph, edge_actions, failure_actions)` and resets stashes. `edge.id` is
+  unique only within one `ProofHypergraph`; collect therefore runs theorems sequentially
+  on one reasoner (`collect_round`, rl_training_driver.py), with per-theorem
+  timeout/exception isolation so one dead search cannot kill the round.
 
-## 4. Harvest: turning the finished graph into training targets
+- **Visit statistics** (HTPS mode only) — `EdgeVisitStats.N`, `W`, `virtual_loss`,
+  `prior_prob` are stored on every `ProofHyperedge` inside the graph (hypergraph.py).
+  They survive in `RLSearchResult.graph` and are consumed after the search by
+  `extract_critic_samples` and `extract_minimal_hypertree` (section 4b).
 
-`train_step_onpolicy` (pln_rl_training.py) first harvests each result's graph:
+## 4. Harvest: turning the finished graph into on-policy training targets
+
+`train_step_onpolicy` (pln_rl_training.py) first harvests each result's graph. This
+section describes the on-policy A2C path that runs every round regardless of search mode.
 
 **Value backup** (`search_harvest.backup_values`) — a numeric AND-OR recursion, memoized
-and cycle-safe:
+and cycle-safe. In the legacy mode:
 
 ```
 value(SOLVED)      = 1.0
@@ -155,31 +286,42 @@ AND-combine        = product (default) or min of children          # all must cl
 value(unexpanded)  = 0.0                                           # not yet shown provable
 ```
 
-This is the same fixpoint logic as the status propagation, but in [0,1] — and it is the
-**critic's regression target**. Note what it is not: it contains no PLN number. Only
-demonstrated solvability enters the value target, so an unreliable PLN cannot poison the
-critic.
+Under HTPS, `backup_values` accepts an optional `visit_threshold`. For an unresolved
+interior or unexpanded node, the function also computes a **soft target**: the W/N ratio
+of the node's max-prior outgoing edge, provided that edge has at least `visit_threshold`
+completed simulations. When the soft target is available, the node's backup value is
+`max(hard_status_value, W/N)` — accumulated simulation consensus can lift the floor above
+zero but cannot overwrite a stronger status signal (SOLVED = 1.0 always wins). Under
+`selection_policy="legacy"` no edge accumulates visits, so the default `None` threshold
+reduces exactly to the original hard backup.
 
-**Per-edge reward** (`pln_reward.edge_shaped_reward`) — where PLN *does* enter, in the
-only provably-safe slot:
+The backup is the **critic's regression target**. It contains no PLN number — only
+demonstrated solvability (and, in HTPS mode, accumulated simulation consensus) enters the
+value target, so an unreliable PLN or an untrained critic cannot poison this signal.
+
+**Per-edge reward** (`pln_reward.edge_shaped_reward`) — where PLN enters, in the only
+provably-safe slot:
 
 ```
 r = r_term + Σ_j ( γ·Φ(child_j) − Φ(parent) )
 r_term = +terminal_success − step_penalty   if the edge is QED (no children, SOLVED)
          terminal_failure − step_penalty    if the edge is DEAD
          −step_penalty                      otherwise
-Φ(s)   = PLN strength σ of s, and 0 for SOLVED/DEAD nodes
+Φ(s)   = PLN strength σ of s
+         0 for SOLVED/DEAD nodes, and 0 when node.stv is None
 ```
 
-The shaping term is potential-based (Ng–Harada–Russell): because Φ is a function of state
-alone and Φ(terminal)=0, the shaping telescopes along every path to
-`γ^T·0 − Φ(s_0)` — a constant offset per trajectory — so it can bias *learning speed*
-toward states PLN likes but cannot change which policy is optimal. That is the entire
-reason a near-constant, unreliable PLN is safe to include.
+`Φ` returns 0 when `node.stv is None` — so in any context where PLN did not score a
+node (the kill-switch path on AC-branch, or any node expanded under HTPS after PLN was
+not called), the shaping term vanishes automatically and `r = r_term`. The shaping term
+is potential-based (Ng–Harada–Russell): because Φ is a function of state alone and
+Φ(terminal) = 0, the shaping telescopes along every path to `γ^T·0 − Φ(s_0)` — a
+constant offset per trajectory — so it can bias learning speed toward states PLN likes
+but cannot change which policy is optimal.
 
 **Transitions** (`extract_transitions`) — one `HarvestedTransition` per hyperedge,
 restricted to `edge_ids = keys(edge_actions)` so only policy-produced edges are harvested
-(the on-policy filter; PLN-fallback pseudo-edges are excluded automatically):
+(on-policy filter; PLN-fallback pseudo-edges are excluded automatically):
 
 ```
 HarvestedTransition(node_id, goal, tactic, reward=r,
@@ -189,12 +331,41 @@ HarvestedTransition(node_id, goal, tactic, reward=r,
                     edge_id)
 ```
 
-`return_` is a **one-step bootstrapped** target: the immediate shaped reward plus the
+`return_` is a one-step bootstrapped target: the immediate shaped reward plus the
 discounted AND-OR value of what the action produced. Because `children_value` comes from
 the backup — which already OR-maxes over everything the search discovered below — the
 return sees arbitrarily deep consequences without an explicit T-step rollout sum.
 
-## 5. The gradient step: recompute, then one update
+## 4b. HTPS-mode additional harvest: imitation + soft-critic queues
+
+After each search in HTPS mode, two more extraction passes run before the on-policy step,
+filling rolling deques that are consumed by `train_step_htps_style` later in the round.
+
+**Critic samples** (`extract_critic_samples`) — one `CriticSample(goal, hypotheses,
+target)` per node in the graph:
+- SOLVED node: `target = 1.0`.
+- DEAD node: `target = 0.0`.
+- Unresolved node with a max-prior outgoing edge whose `N ≥ visit_threshold`:
+  `target = W/N` — the search's own value consensus for that node. Nodes without
+  sufficient evidence emit no sample (insufficient visit count is no label, not a 0 label).
+
+These samples bypass the on-policy recompute entirely: they are supervised regression
+targets whose validity does not depend on the current parameters — any parameters that
+encode "this goal was proved" should output value near 1.0.
+
+**Minimal-hypertree imitation samples** (`extract_minimal_hypertree`) — for each SOLVED
+node, find the **step-minimal** proof path: the SOLVED outgoing edge whose subtree
+requires the fewest total tactic applications (memoized over the shared subgraph). Emit
+one `TacticImitationSample(goal, hypotheses, tactic_id, arg_indices)` per edge on that
+minimal tree, restricted to edges present in `edge_actions`. Only policy-produced edges
+become training data — the PLN-fallback pseudo-edge (`PLN_fallback`) is excluded by this
+filter even if it appears SOLVED in the graph.
+
+The minimal hypertree is the proof the search actually found expressed as the cheapest
+path to closure. Imitating it is more targeted than imitating every edge in the SOLVED
+subtree, which might include exploratory detours the search later proved suboptimal.
+
+## 5. The on-policy gradient step: recompute, then one update
 
 `compute_onpolicy_loss` (pln_rl_training.py) assembles one batch from all of the round's
 results (edge ids re-keyed per graph to avoid collisions), each row being either a
@@ -204,20 +375,16 @@ successful transition or a failure record:
 the encoder **with gradient** under the current parameters and evaluates the log-probs of
 the *stored* actions: `tactic_logp = log_softmax(logits)[τ]`, and the pointer is
 teacher-forced through `forced_step` — at step k the stored index `u_k`'s log-prob is
-gathered and `u_k`'s embedding (not a fresh sample's) feeds step k+1, so the recomputed
-trajectory is exactly the executed one. Invalid/-1 indices contribute log-prob 0 and a
-zero embedding. This is the standard A2C evaluate-actions pattern, and it is exactly
-on-policy **only because no optimizer step ran between collect and train** — θ is
-identical in both phases. Hence the hard invariant: exactly one `optimizer.step()` per
-collect round (a second step on the same data would need PPO's ratio clip). The same
-argument requires the featurizer identity: collect and train featurize through the *same*
-`make_dag_featurizer` instance, so the stored pointer indices land on the same DAG nodes.
+gathered and `u_k`'s embedding (not a fresh sample's) feeds step k+1. Invalid/-1 indices
+contribute log-prob 0 and a zero embedding. This is the standard A2C evaluate-actions
+pattern, and it is exactly on-policy **only because no optimizer step ran between collect
+and train** — θ is identical in both phases. Hence the hard invariant: exactly one
+`optimizer.step()` per collect round.
 
 **Returns per row type**:
 - success row: `G` from the harvest, plus its `value_target` for the critic;
 - failure row: `G = terminal_failure − step_penalty`, and **no critic target** — the
-  *action* failed, but the *state* may be provable by another tactic, so a failed action
-  says nothing about V(s).
+  action failed, but the state may still be provable by another tactic.
 
 **Advantage** — over all rows jointly:
 
@@ -227,10 +394,9 @@ argument requires the featurizer identity: collect and train featurize through t
 ```
 
 Joint normalization is deliberate: the failure rows' low returns and the success rows'
-bootstrapped returns supply the *contrast* that the near-constant PLN shaping lacks —
-without variance in Â, the actor gradient is zero regardless of how many transitions were
-collected. `detach()` on V keeps the critic out of the actor's gradient path (the baseline
-must not chase the policy).
+bootstrapped returns supply the contrast the near-constant PLN shaping lacks — without
+variance in Â, the actor gradient is zero regardless of how many transitions were
+collected. `detach()` on V keeps the critic out of the actor's gradient path.
 
 **The four loss terms**:
 
@@ -242,19 +408,57 @@ L_bc      = CE(tactic_logits, τ)             # success rows only, annealed weig
 total     = L_actor + 0.5·L_critic − 0.01·L_entropy + w_bc(t)·L_bc
 ```
 
-Reading `L_actor` mechanically: a positive advantage *increases* the joint log-probability
-of the executed tactic **and** its arguments (pointer-as-actor — the same Â weights both
-levels, `w_arg` balancing their scales); a negative advantage decreases it. The
-multiplicity `m` restores the i.i.d. weighting that executor-side dedup removed: an action
-drawn 3 times must contribute its gradient term 3 times or the estimator under-weights
-high-probability actions. The BC anchor is a supervised cross-entropy toward the
-search-executed tactic on success rows (never failures — that would clone rejections),
-annealed from `bc_anneal_start` to `bc_anneal_end` by `bc_weight_at_round`; it is a dense,
-low-variance gradient that holds the policy near supervised competence while terminal
-rewards are still rare, and it lives in the *loss*, not the reward, so it cannot
-contaminate the value target.
+`L_actor` mechanically: a positive advantage increases the joint log-probability of the
+executed tactic and its arguments; a negative advantage decreases it. The multiplicity
+`m` restores the i.i.d. weighting that executor-side dedup removed. The BC anchor is
+annealed from `bc_anneal_start` to `bc_anneal_end`; it lives in the loss, not the
+reward, so it cannot contaminate the value target.
 
 Then: `loss.backward()`, `clip_grad_norm_(grad_clip)`, **one** `optimizer.step()`.
+
+## 5b. HTPS decoupled step: imitation + soft-critic regression
+
+`train_step_htps_style` (pln_rl_training.py) runs after the on-policy step, using the
+queues filled in section 4b, through a **separate optimizer** (`optimizer_htps`). The
+one-step-per-collect invariant belongs to `compute_onpolicy_loss`'s score-function
+estimator only; supervised regression on stored (input, label) pairs has no
+importance-ratio to invalidate and may run many times per round.
+
+`htps_steps_per_round` controls how many times the decoupled step fires per round.
+Setting `htps_steps_per_round=0` (the default) disables it entirely — the queues never
+fill, no second optimizer is created, and existing behavior is unchanged.
+
+**Single forward, two losses**:
+
+Both `tactic_batch` (imitation samples) and `critic_batch` (critic samples) are
+featurized into one joint `Batch` and pushed through one `model.encode` forward.
+
+```
+L_tactic_imitation = CE(tactic_logits[imitation rows], tactic_id)
+                   + arg_loss_weight · Σ_k forced_step_logp(arg_indices_k)
+                     (critic-only rows carry label −1 and are masked from CE)
+L_critic_soft      = MSE(V(s)[critic rows], stored W/N-or-status target)
+loss               = L_tactic_imitation + w_critic_soft · L_critic_soft
+```
+
+`ArgumentSelector.forced_step` teacher-forces the argument pointer through the stored
+`arg_indices` — the same path `evaluate_actions` uses for the on-policy step. Invalid/−1
+argument positions contribute 0.
+
+`optimizer_htps` must be a separate instance from the on-policy optimizer (the driver
+asserts identity inequality). The two Adam moment buffers must not mix: the on-policy
+estimator's gradient signal comes from return–baseline contrasts in the search; the
+imitation estimator's signal comes from direct cross-entropy toward proved actions. Using
+one optimizer would corrupt both sets of moments.
+
+**Why the decoupled step does not invalidate the on-policy invariant**: the on-policy step
+uses log-probs recomputed under parameters θ that are identical to the collect-time
+parameters. The decoupled step runs on the *same* θ (it updates through `optimizer_htps`,
+not `optimizer`). After the decoupled step, θ has moved — but the on-policy step has
+already completed, so there is no stale-log-prob issue. The sequence per round is:
+collect → on-policy step (one `optimizer.step()`) → N decoupled steps
+(`optimizer_htps.step()` × N). The on-policy invariant is satisfied because the single
+`optimizer.step()` runs before any decoupled updates.
 
 ## 6. The driver loop around it
 
@@ -265,47 +469,70 @@ warm start (strict load of the supervised actor-critic best.pt)
 pool ← LeanDojo proof states (parse_state), size-sorted, eval set held out
 for round in 0..num_rounds:
     batch    ← sample from the curriculum window (easy prefix of the sorted pool)
-    results  ← collect_round(reasoner, batch)          # sequential, fault-isolated
-    metrics  ← train_step_onpolicy(..., bc_weight=anneal(round))   # ONE step
+    results  ← collect_round(reasoner, batch)        # sequential, fault-isolated
+    metrics  ← train_step_onpolicy(..., bc_weight=anneal(round))   # ONE optimizer.step()
+    [HTPS mode] extract_minimal_hypertree + extract_critic_samples → fill queues
+    [HTPS mode] train_step_htps_style × htps_steps_per_round
     window widens when the recent solve rate ≥ threshold
     last.pt every checkpoint_every rounds (model+optimizer+RNG+round → resumable)
     every eval_every rounds: greedy proof rate on the fixed eval pool → best.pt on improvement
 ```
 
+**Deadline and timeout** — `prove` receives `deadline = time.monotonic() + timeout_s`
+and checks it between expansions (legacy) or between simulation batches (HTPS). The
+partial graph is returned cleanly with all experience gathered so far. A hard
+`asyncio.wait_for(timeout=timeout_s * 1.25)` remains as a backstop for a hang inside a
+single Lean call, where the event loop is blocked and the deadline check cannot fire;
+that case loses the search's experience.
+
+**Checkpoint format (HTPS additions)** — `save_checkpoint` writes both optimizer state
+dicts and serializes the tactic/critic deques as lists of plain tuples (not pickled
+dataclasses), so checkpoints remain loadable across module refactors. The load side uses
+`.get` with empty-list defaults, so checkpoints from before the HTPS queues were added
+resume without errors.
+
 Two data-side choices matter for why this learns at all:
 
 - **Rollout roots are interior proof states, not theorem statements.** The terminal reward
   fires only when a rollout reaches QED, and the probability of that scales like `p^k` in
-  the distance-to-closure `k`. Dataset proof states sit 1–3 tactics from closure;
-  whole statements sit 10–30. Starting near the terminal boundary makes `terminal_success`
+  the distance-to-closure `k`. Dataset proof states sit 1–3 tactics from closure; whole
+  statements sit 10–30. Starting near the terminal boundary makes `terminal_success`
   actually occur, and the critic then carries that signal one step outward per curriculum
   widening (value bootstrapping = dynamic programming from the base case inward).
 - **Model selection is greedy proof rate on a fixed held-out pool**, never training
-  return: return is measured on a sampled policy over a *shifting* curriculum window, so
-  it is neither comparable across rounds nor robust to entropy collapse.
+  return: return is measured on a sampled policy over a shifting curriculum window, so it
+  is neither comparable across rounds nor robust to entropy collapse.
 
 ## 7. Invariants checklist
 
 | Invariant | Enforced by | Broken consequence |
 |---|---|---|
-| one optimizer step per collect | loop structure of `train_step_onpolicy` + driver | recomputed log-probs off-policy; biased gradient |
+| one `optimizer.step()` per collect | loop structure of `train_step_onpolicy` + driver | recomputed log-probs off-policy; biased gradient |
+| `optimizer_htps` is a separate instance | driver assertion at construction | Adam moments from on-policy and imitation gradients corrupt each other |
+| on-policy step fires before decoupled steps | driver round ordering (collect → on-policy → decoupled) | decoupled update shifts θ before on-policy recompute; log-probs stale |
 | featurizer identity collect↔train | `reasoner.dag_featurize_data` passed to the trainer | stored arg indices point at wrong DAG nodes |
 | vocabs from `prepared_root` only | `_load_vocabs`; never `build_vocab` on rollout states | warm-started embeddings mean the wrong tokens |
-| Φ(terminal) = 0 | `potential` returns 0 for SOLVED/DEAD | shaping stops telescoping; terminals get biased by `γ^T Φ(s_T)` |
-| critic sees success rows only | `success_t` mask in the loss | failed actions poison state values |
+| Φ(terminal) = 0 | `potential` returns 0 for SOLVED/DEAD and for `stv is None` | shaping stops telescoping; terminals get biased by `γ^T Φ(s_T)` |
+| critic sees success rows only | `success_t` mask in `compute_onpolicy_loss` | failed actions poison state values |
 | dedup with multiplicity | `EdgeAction.multiplicity` weighting | high-probability actions under-weighted |
-| value target from backup, not PLN | `backup_values` uses statuses only | unreliable PLN trains the critic |
-| sequential collect per reasoner | `collect_round` loop | edge-id collisions across concurrent stashes |
+| value target from backup, not PLN | `backup_values` uses statuses (+ soft W/N in HTPS) | unreliable PLN trains the critic |
+| per-node pending stash | `_pending: {goal_key → _PendingNode}` in `RLHybridReasoner` | batched proposals misattribute one leaf's failures to another goal |
+| edge-id uniqueness per search | sequential collect; `RLSearchResult` resets stashes | edge-id collisions corrupt the `edge_actions` join table |
+| virtual loss released by backup | `stats.virtual_loss = max(0, vl - 1)` in `_backup_simulation` | in-flight selections never clear; future PUCT scores permanently inflated |
+| prior_prob stamped once at `add_edge` | `EdgeVisitStats(prior_prob=tactic.probability)` | `puct_score` reads a stale or recomputed prior; selection not reproducible |
+| imitation filter excludes PLN-fallback edges | `extract_minimal_hypertree` restricted to `edge_actions` keys | fabricated QED edges contaminate the imitation target distribution |
 
 ## 8. File map
 
 | Step | Files |
 |---|---|
 | model + sampling + recompute | `atp_lean_gnn/actor_critic.py`, `atp_lean_gnn/argument_selector.py` |
-| search + graph | `hybrid_reasoner/joint_inference.py`, `hybrid_reasoner/hypergraph.py` |
-| RL search overrides + stash | `atp_lean_gnn/rl_reasoner.py` |
+| PUCT scoring + search-mode validation | `hybrid_reasoner/selection_policy.py` |
+| search + graph + visit stats | `hybrid_reasoner/joint_inference.py`, `hybrid_reasoner/hypergraph.py` |
+| RL search overrides + batched stash | `atp_lean_gnn/rl_reasoner.py` |
 | reward + shaping | `atp_lean_gnn/pln_reward.py` |
-| backup + transitions | `atp_lean_gnn/search_harvest.py` |
-| loss + train step | `atp_lean_gnn/pln_rl_training.py`, `atp_lean_gnn/actor_critic_loss.py` |
-| driver, curriculum, eval | `atp_lean_gnn/rl_training_driver.py`, `scripts/rl_train.py`, `configs/rl_actor_critic.json` |
-| tests | `tests/test_actor_critic.py`, `tests/test_pln_reward.py`, `tests/test_pln_rl_training.py`, `tests/test_rl_reasoner.py`, `tests/test_rl_training_driver.py` |
+| backup + transitions + critic/imitation harvest | `atp_lean_gnn/search_harvest.py` |
+| on-policy loss + decoupled HTPS step | `atp_lean_gnn/pln_rl_training.py`, `atp_lean_gnn/actor_critic_loss.py` |
+| driver, curriculum, eval, checkpointing | `atp_lean_gnn/rl_training_driver.py`, `scripts/rl_train.py`, `configs/rl_actor_critic.json` |
+| tests | `tests/test_actor_critic.py`, `tests/test_pln_reward.py`, `tests/test_pln_rl_training.py`, `tests/test_rl_reasoner.py`, `tests/test_rl_training_driver.py`, `tests/test_search_harvest.py`, `tests/test_selection_policy.py`, `tests/test_visit_stats.py` |
+
