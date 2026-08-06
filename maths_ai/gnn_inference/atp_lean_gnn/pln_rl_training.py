@@ -25,10 +25,17 @@ from torch_geometric.data import Batch, Data
 
 from .actor_critic import ActorCriticWithArgsClassifier
 from .actor_critic_loss import compute_bc_anchor_loss, compute_critic_loss, compute_entropy_bonus
+from .argument_selector import resolve_premise_mask
 from .graph import proof_state_to_dag
 from .pyg import build_premise_mask, dag_to_pyg
 from .pln_reward import RewardConfig
-from .search_harvest import HarvestConfig, HarvestedTransition, extract_transitions
+from .search_harvest import (
+    CriticSample,
+    HarvestConfig,
+    HarvestedTransition,
+    TacticImitationSample,
+    extract_transitions,
+)
 
 from maths_ai.data_models.proof_components import Goal
 
@@ -477,3 +484,121 @@ def collect_and_train_onpolicy(
     """One on-policy round: sequential collect (async) → one gradient step (sync)."""
     results = asyncio.run(collect_batch_onpolicy(reasoner, theorems))
     return train_step_onpolicy(model, optimizer, results, featurize, **train_kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Decoupled HTPS-style step (Phases 2–3): supervised regression on stored pairs
+# ---------------------------------------------------------------------------
+
+
+def train_step_htps_style(
+    model: ActorCriticWithArgsClassifier,
+    optimizer_htps: torch.optim.Optimizer,
+    tactic_batch: list[TacticImitationSample],
+    critic_batch: list[CriticSample],
+    featurize: Callable[[Goal], Data],
+    *,
+    w_critic_soft: float = 0.5,
+    arg_loss_weight: float = 0.5,
+    grad_clip: float = 1.0,
+    device: torch.device | None = None,
+) -> dict[str, float]:
+    """One decoupled supervised step: tactic imitation + soft critic regression.
+
+    ``tactic_batch`` rows are (goal, tactic_id, arg_indices) pairs mined from minimal
+    proof hypertrees (``extract_minimal_hypertree``); ``critic_batch`` rows are
+    (goal, W/N-or-status) targets (``extract_critic_samples``). Both sample sets are
+    featurized into ONE batch and pushed through one ``model.encode`` forward. Losses:
+
+      * ``L_tactic_imitation`` — cross-entropy of the tactic head toward ``tactic_id``
+        (via ``compute_bc_anchor_loss``; critic-only rows carry label ``-1`` and are
+        ignored), plus the teacher-forced argument log-probs through
+        ``ArgumentSelector.forced_step`` (the same path ``evaluate_actions`` uses),
+        weighted by ``arg_loss_weight``. Invalid/-1 argument positions contribute 0.
+      * ``L_critic_soft`` — MSE of the value head against the stored targets on
+        critic rows, raw scale (the advantage-normalization convention applies to the
+        actor's score-function estimator only).
+
+      ``loss = L_tactic_imitation + w_critic_soft · L_critic_soft``
+
+    **One-step-per-collect exemption:** this function may run many times per round.
+    That invariant belongs to ``compute_onpolicy_loss``'s score-function estimator,
+    whose recomputed log-probs are on-policy only under unchanged parameters. Here
+    every input is a stored ``(input, label)`` pair whose validity does not depend on
+    which parameters generated it — supervised regression, no importance ratio to
+    invalidate. ``optimizer_htps`` must be a separate optimizer instance from the
+    on-policy one (separate Adam moments; the driver asserts identity inequality).
+    """
+    device = device or torch.device("cpu")
+    if not tactic_batch and not critic_batch:
+        return {"tactic_imitation_loss": 0.0, "critic_soft_loss": 0.0, "htps_total_loss": 0.0,
+                "num_imitation_rows": 0.0, "num_critic_rows": 0.0}
+
+    datas: list[Data] = []
+    tactic_labels: list[int] = []       # -1 on critic-only rows (ignored by the CE)
+    arg_rows: list[tuple[int, ...]] = []
+    for s in tactic_batch:
+        datas.append(featurize(Goal(expression=s.goal, hypotheses=list(s.hypotheses))))
+        tactic_labels.append(s.tactic_id)
+        arg_rows.append(s.arg_indices)
+    critic_targets: list[float] = []
+    for s in critic_batch:
+        datas.append(featurize(Goal(expression=s.goal, hypotheses=list(s.hypotheses))))
+        tactic_labels.append(-1)
+        arg_rows.append(())
+        critic_targets.append(s.target)
+
+    n_imitation = len(tactic_batch)
+    batch = Batch.from_data_list(datas).to(device)
+
+    model.train()
+    optimizer_htps.zero_grad(set_to_none=True)
+    node_embeddings, state_emb, tactic_logits, values = model.encode(batch)
+
+    labels_t = torch.tensor(tactic_labels, dtype=torch.long, device=device)
+    tactic_loss = compute_bc_anchor_loss(tactic_logits, labels_t)
+
+    # Teacher-forced argument log-probs on imitation rows (same forced_step path as
+    # evaluate_actions; critic rows carry all -1 indices and contribute 0).
+    max_args = max((len(r) for r in arg_rows), default=0)
+    if max_args > 0 and n_imitation > 0:
+        arg_indices = torch.full((len(arg_rows), max_args), -1, dtype=torch.long, device=device)
+        for i, row in enumerate(arg_rows):
+            for j, idx in enumerate(row):
+                arg_indices[i, j] = idx
+        tactic_emb = model.tactic_embedding(labels_t.clamp(min=0))
+        premise_mask = resolve_premise_mask(batch, node_embeddings.device)
+        batch_index = batch.batch.to(device=node_embeddings.device)
+        arg_logp = torch.zeros(len(arg_rows), device=device)
+        prev_arg_emb = None
+        for t in range(max_args):
+            step_logp, selected_emb = model.argument_selector.forced_step(
+                state_emb, tactic_emb, node_embeddings, premise_mask, batch_index,
+                arg_indices[:, t], prev_arg_emb=prev_arg_emb,
+            )
+            arg_logp = arg_logp + step_logp
+            prev_arg_emb = selected_emb
+        arg_loss = -(arg_logp[:n_imitation].mean())
+    else:
+        arg_loss = values.sum() * 0.0
+
+    imitation_loss = tactic_loss + arg_loss_weight * arg_loss
+
+    if critic_targets:
+        targets_t = torch.tensor(critic_targets, dtype=torch.float32, device=device)
+        critic_soft_loss = compute_critic_loss(values[n_imitation:], targets_t)
+    else:
+        critic_soft_loss = values.sum() * 0.0
+
+    total = imitation_loss + w_critic_soft * critic_soft_loss
+    total.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer_htps.step()
+
+    return {
+        "tactic_imitation_loss": float(imitation_loss.item()),
+        "critic_soft_loss": float(critic_soft_loss.item()),
+        "htps_total_loss": float(total.item()),
+        "num_imitation_rows": float(n_imitation),
+        "num_critic_rows": float(len(critic_batch)),
+    }
