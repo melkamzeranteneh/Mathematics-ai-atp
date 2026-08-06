@@ -267,5 +267,129 @@ class OnPolicyLossTests(unittest.TestCase):
         self.assertNotAlmostEqual(loss_with(1), loss_with(3))
 
 
+class PLNDisabledTests(unittest.TestCase):
+    """Tests for the use_pln=False kill switch in RLHybridReasoner."""
+
+    def _make_no_pln(self, executor, *, top_k=3, top_k_subgoals=3, seed=0):
+        """Build an RLHybridReasoner with use_pln=False.
+
+        _make_reasoner installs a _StubPLN to keep the petta subprocess out of
+        unit tests; here we intentionally do NOT do that — the point is that
+        petta_chainer is None and nothing dereferences it.
+        """
+        torch.manual_seed(seed)
+        goal = Goal(expression=GOAL_EXPR, hypotheses=HYPS)
+        from maths_ai.gnn_inference.atp_lean_gnn.graph import proof_state_to_dag
+        from maths_ai.gnn_inference.atp_lean_gnn.pyg import build_vocab
+        from maths_ai.gnn_inference.atp_lean_gnn.pln_rl_training import goal_to_state
+
+        node_vocab = build_vocab([proof_state_to_dag(goal_to_state(goal))])
+        model = ActorCriticWithArgsClassifier(
+            num_node_labels=len(node_vocab),
+            num_tactics=len(TACTIC_VOCAB),
+            hidden_dim=16,
+            num_layers=2,
+            dropout=0.1,
+            max_args=2,
+        )
+        reasoner = RLHybridReasoner(
+            model,
+            node_vocab,
+            TACTIC_VOCAB,
+            executor=executor,
+            top_k_tactics=top_k,
+            top_k_subgoals=top_k_subgoals,
+            max_depth=3,
+            max_nodes=20,
+            use_pln=False,
+        )
+        return reasoner, model, node_vocab
+
+    def _prove(self, reasoner):
+        return asyncio.run(reasoner.prove(GOAL_EXPR, hypotheses=HYPS))
+
+    def test_pln_objects_are_none(self):
+        """use_pln=False means neither petta_chainer nor dts_sampler is constructed."""
+        reasoner, _, _ = self._make_no_pln(_QEDExecutor())
+        self.assertIsNone(reasoner.petta_chainer)
+        self.assertIsNone(reasoner.dts_sampler)
+
+    def test_subgoal_nodes_have_none_stv_in_executor_order(self):
+        """With PLN off, subgoals carry stv=None and are kept in Lean's order, capped."""
+        # Build an executor that returns two subgoals for the root, then QED on each.
+        root_goal = Goal(expression=GOAL_EXPR, hypotheses=HYPS)
+        sg1 = Goal(expression="p", hypotheses=HYPS)
+        sg2 = Goal(expression="True", hypotheses=[])
+        sg3 = Goal(expression="False", hypotheses=[])  # third — should be capped
+
+        class _TwoSubgoalThenQEDExecutor:
+            """First apply: returns two subgoals; subsequent applies: QED."""
+            def __init__(self):
+                self.server = _FakeServer()
+                self._calls = 0
+
+            async def apply(self, server, state, tactic):
+                self._calls += 1
+                if self._calls == 1:
+                    return TacticOutcome(success=True, subgoals=[sg1, sg2, sg3])
+                return TacticOutcome(success=True, subgoals=[])
+
+        executor = _TwoSubgoalThenQEDExecutor()
+        reasoner, _, _ = self._make_no_pln(executor, top_k=1, top_k_subgoals=2)
+        result = self._prove(reasoner)
+
+        # Verify subgoal children carry stv=None (PLN never scored them).
+        child_stvs = [
+            result.graph.nodes[nid].stv
+            for nid in result.graph.nodes
+            if result.graph.nodes[nid].incoming_edge_id is not None
+        ]
+        self.assertTrue(all(stv is None for stv in child_stvs),
+                        f"expected all stv=None, got {child_stvs}")
+        # Verify cap: at most top_k_subgoals=2 children per edge.
+        for edge in result.graph.edges.values():
+            self.assertLessEqual(len(edge.child_ids), 2)
+
+    def test_no_pln_fallback_qed_on_total_rejection(self):
+        """With PLN off, a fully-rejected node is exhausted, not fake-closed."""
+        reasoner, _, _ = self._make_no_pln(_RejectExecutor())
+        result = self._prove(reasoner)
+
+        self.assertFalse(result.graph.is_solved())
+        pln_fb_edges = [
+            e for e in result.graph.edges.values()
+            if e.tactic.tactic_name == "PLN_fallback"
+        ]
+        self.assertEqual(pln_fb_edges, [], "PLN_fallback edge must not exist when use_pln=False")
+        root = result.graph.root
+        self.assertTrue(root.exhausted)
+        self.assertIn("executor rejected", root.note or "")
+
+    def test_reward_is_terminal_only_when_pln_off(self):
+        """With PLN off every node has stv=None, so edge_shaping==0 for all edges."""
+        from maths_ai.gnn_inference.atp_lean_gnn.pln_reward import (
+            edge_shaped_reward,
+            edge_terminal_reward,
+            RewardConfig,
+        )
+        reasoner, _, _ = self._make_no_pln(_QEDExecutor())
+        result = self._prove(reasoner)
+        cfg = RewardConfig(step_penalty=0.0)
+        for edge in result.graph.edges.values():
+            shaped = edge_shaped_reward(edge, result.graph, cfg)
+            terminal = edge_terminal_reward(edge, result.graph, cfg)
+            self.assertAlmostEqual(shaped, terminal, places=6,
+                                   msg=f"edge {edge.id}: shaping should be 0 but got {shaped - terminal}")
+
+    def test_rank_subgoals_guard_raises(self):
+        """Calling rank_subgoals on a use_pln=False reasoner raises RuntimeError."""
+        reasoner, _, _ = self._make_no_pln(_QEDExecutor())
+        goal = Goal(expression=GOAL_EXPR, hypotheses=HYPS)
+        from maths_ai.data_models.proof_components import TacticCandidate
+        tactic = TacticCandidate(tactic_name="intro", arguments=[], probability=1.0)
+        with self.assertRaises(RuntimeError):
+            asyncio.run(reasoner.rank_subgoals(goal.expression, [goal], tactic))
+
+
 if __name__ == "__main__":
     unittest.main()

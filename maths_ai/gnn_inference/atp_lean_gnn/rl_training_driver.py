@@ -86,6 +86,9 @@ class RLTrainingConfig:
     top_k_subgoals: int = 3
     max_depth: int = 8
     max_nodes: int = 64
+    # Set to False to disable all PLN involvement (no petta subprocess, no reward
+    # shaping, no PLN fallback QED).  Reward degrades to terminal-only.
+    use_pln: bool = True
 
     # Optimizer / loss.
     learning_rate: float = 1e-4
@@ -473,6 +476,7 @@ async def run_rl_training(
             top_k_subgoals=cfg.top_k_subgoals,
             max_depth=cfg.max_depth,
             max_nodes=cfg.max_nodes,
+            use_pln=cfg.use_pln,
         )
     else:
         reasoner = reasoner_factory(model, node_vocab, tactic_vocab, cfg)

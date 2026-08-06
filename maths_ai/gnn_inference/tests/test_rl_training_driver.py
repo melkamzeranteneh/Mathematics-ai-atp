@@ -363,5 +363,34 @@ class EvalTests(unittest.TestCase):
             self.assertEqual(state["best_proof_rate"], 0.0)
 
 
+class PLNKillSwitchConfigTests(unittest.TestCase):
+    """Tests for use_pln threading through RLTrainingConfig and run_rl_training."""
+
+    def test_use_pln_false_survives_roundtrip(self):
+        """use_pln=False survives to_dict / from_json without being reset."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _write_config(Path(tmp), use_pln=False)
+            path = Path(tmp) / "cfg.json"
+            with open(path, "w") as f:
+                json.dump(cfg.to_dict(), f)
+            loaded = RLTrainingConfig.from_json(path)
+            self.assertFalse(loaded.use_pln)
+
+    def test_use_pln_false_reaches_factory(self):
+        """use_pln=False is forwarded to the reasoner factory via cfg."""
+        received: list[bool] = []
+
+        def _recording_factory(model, node_vocab, tactic_vocab, cfg):
+            received.append(cfg.use_pln)
+            return _make_reasoner(model, node_vocab, _QEDExecutor(), top_k=cfg.top_k_tactics)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, use_pln=False, num_rounds=1)
+            torch.manual_seed(0)
+            asyncio.run(run_rl_training(cfg, reasoner_factory=_recording_factory, pool=_pool()))
+        self.assertEqual(received, [False])
+
+
 if __name__ == "__main__":
     unittest.main()

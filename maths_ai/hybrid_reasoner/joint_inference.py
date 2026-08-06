@@ -155,7 +155,9 @@ class HybridReasoner:
         dts_sampler: Optional[DynamicThompsonSampler] = None,
         dts_c: float = None,
         dts_random_seed: Optional[int] = None,
+        use_pln: bool = True,
     ) -> None:
+        self.use_pln = use_pln
         self.gnn_engine = self._build_gnn_engine(
             config_path=config_path,
             tactic_model_path=tactic_model_path,
@@ -163,35 +165,42 @@ class HybridReasoner:
             index_path=index_path,
             corpus_path=corpus_path,
         )
-        self.petta_chainer = PLNInference()
         self.atomic_tactics = {}
 
         # Always use Thompson sampling as fallback - it's automatic and internal
         self.pln_fallback_strategy = "thompson"
-        
+
         # Use config defaults if not provided
         if dts_c is None:
             dts_c = settings.dts_default_c
         if dts_random_seed is None:
             dts_random_seed = settings.dts_default_seed
-        
+
+        # _dts_rng is cheap; construct it unconditionally so subclasses and other
+        # callers can always reference it without an is-None check.
         self._dts_rng = random.Random(dts_random_seed)
-        
-        # Initialize or use provided DTS sampler
-        if dts_sampler is not None:
-            self.dts_sampler = dts_sampler
-            self.dts_sampler.C = dts_c
+
+        if not use_pln:
+            # PLN disabled: no petta subprocess will ever be spawned.
+            self.petta_chainer = None
+            self.dts_sampler = None
         else:
-            # Try to load existing state from default location
-            if settings.dts_state_file.exists():
-                try:
-                    self.dts_sampler = DynamicThompsonSampler.load_from(str(settings.dts_state_file), C=dts_c)
-                except Exception:
-                    # If loading fails, create fresh sampler
-                    self.dts_sampler = DynamicThompsonSampler(C=dts_c)
+            self.petta_chainer = PLNInference()
+            # Initialize or use provided DTS sampler
+            if dts_sampler is not None:
+                self.dts_sampler = dts_sampler
+                self.dts_sampler.C = dts_c
             else:
-                # Create new sampler
-                self.dts_sampler = DynamicThompsonSampler(C=dts_c)
+                # Try to load existing state from default location
+                if settings.dts_state_file.exists():
+                    try:
+                        self.dts_sampler = DynamicThompsonSampler.load_from(str(settings.dts_state_file), C=dts_c)
+                    except Exception:
+                        # If loading fails, create fresh sampler
+                        self.dts_sampler = DynamicThompsonSampler(C=dts_c)
+                else:
+                    # Create new sampler
+                    self.dts_sampler = DynamicThompsonSampler(C=dts_c)
 
         self.executor = executor
         self.server = executor.server
@@ -273,6 +282,10 @@ class HybridReasoner:
         *,
         gnn_probability: float = 1.0,
     ) -> List[RankedSubgoal]:
+        if self.petta_chainer is None:
+            raise RuntimeError(
+                "rank_subgoals requires PLN; the reasoner was constructed with use_pln=False"
+            )
         """Score ``sub_goals`` with PLN and rank them best-first.
 
         Now async: the per-subgoal PLN queries (blocking ``subprocess.run`` inside
@@ -456,23 +469,29 @@ class HybridReasoner:
                 self._link(graph, node, tactic, ranked_subgoals=[])
                 continue
 
-            print(f"  [PLN Ranking] scoring {len(outcome.subgoals)} subgoal(s)...")
-            ranked = await self.rank_subgoals(
-                node.goal.expression, outcome.subgoals, tactic, gnn_probability=tactic.probability
-            )
-            print(f"  [PLN Done] ranked {len(ranked)} subgoal(s)")
-            for i, rs in enumerate(ranked):
-                print(f"    subgoal {i}: {rs.goal.expression} | stv=({rs.stv.strength:.3f}, {rs.stv.confidence:.3f}) | combined_rank={rs.combined_rank:.4f}")
+            if self.use_pln:
+                print(f"  [PLN Ranking] scoring {len(outcome.subgoals)} subgoal(s)...")
+                ranked = await self.rank_subgoals(
+                    node.goal.expression, outcome.subgoals, tactic, gnn_probability=tactic.probability
+                )
+                print(f"  [PLN Done] ranked {len(ranked)} subgoal(s)")
+                for i, rs in enumerate(ranked):
+                    print(f"    subgoal {i}: {rs.goal.expression} | stv=({rs.stv.strength:.3f}, {rs.stv.confidence:.3f}) | combined_rank={rs.combined_rank:.4f}")
+                chosen = ranked[: self.top_k_subgoals]
+                self._link(
+                    graph,
+                    node,
+                    tactic,
+                    ranked_subgoals=[(candidate.goal, candidate.stv) for candidate in chosen],
+                )
+            else:
+                # PLN disabled: keep Lean's executor order, cap at top_k_subgoals,
+                # set stv=None so potential() returns 0 and local_score degrades to
+                # gnn_probability alone.
+                chosen = [(g, None) for g in outcome.subgoals[: self.top_k_subgoals]]
+                self._link(graph, node, tactic, ranked_subgoals=chosen)
 
-            chosen = ranked[: self.top_k_subgoals]
-            self._link(
-                graph,
-                node,
-                tactic,
-                ranked_subgoals=[(candidate.goal, candidate.stv) for candidate in chosen],
-            )
-
-        if not any_applied:
+        if not any_applied and self.use_pln:
             print(f"  [PLN Fallback] evaluating goal: {node.goal.expression}  hyps: {node.goal.hypotheses}")
             pln_result = await self.petta_chainer.evaluate_async(
                 node.goal.expression,

@@ -221,11 +221,15 @@ class ProofHypergraph:
         self,
         source_id: int,
         tactic: TacticCandidate,
-        ranked_subgoals: List[Tuple[Goal, STV]],
+        ranked_subgoals: List[Tuple[Goal, Optional[STV]]],
     ) -> ProofHyperedge:
         """Record a tactic application from ``source_id`` producing the given
         ``(subgoal, stv)`` children (already scored by PLN and capped to the
         chosen top-k — see ``HybridReasoner.rank_subgoals``).
+
+        ``stv=None`` means the node is unscored (PLN disabled); ``local_score``
+        already handles ``None`` by treating it as 1.0, and ``potential()`` in
+        ``pln_reward`` already returns 0.0 for ``None`` — no behavior change.
 
         An empty ``ranked_subgoals`` list models the "no-goal" terminal state
         (the tactic fully discharges ``source_id``'s goal): the edge is
