@@ -79,12 +79,12 @@ class _RaisingReasoner:
         self.model = inner.model
         self.dag_featurize_data = inner.dag_featurize_data
 
-    async def prove(self, goal, *, hypotheses=None, greedy=False):
+    async def prove(self, goal, *, hypotheses=None, greedy=False, deadline=None):
         idx = self._calls
         self._calls += 1
         if idx in self._raise_on:
             raise RuntimeError("simulated Lean transport failure")
-        return await self._inner.prove(goal, hypotheses=hypotheses, greedy=greedy)
+        return await self._inner.prove(goal, hypotheses=hypotheses, greedy=greedy, deadline=deadline)
 
 
 TACTIC_VOCAB = {"trivial": 0, "intro": 1, "exact": 2}
@@ -201,6 +201,21 @@ class ConfigTests(unittest.TestCase):
                 json.dump({"prepared_root": "x"}, f)  # no warmstart_checkpoint
             with self.assertRaises(TypeError):
                 RLTrainingConfig.from_json(path)
+
+    def test_config_rejects_budget_under_legacy_policy(self):
+        # __post_init__ runs resolve_search_params: an explicit simulation
+        # budget under selection_policy="legacy" fails at config construction,
+        # before any Lean server spins up.
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                _write_config(Path(tmp), num_simulations=8)
+
+    def test_config_puct_requires_num_simulations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                _write_config(Path(tmp), selection_policy="puct")
+            cfg = _write_config(Path(tmp), selection_policy="puct", num_simulations=8)
+            self.assertEqual(cfg.num_simulations, 8)
 
 
 class PoolTests(unittest.TestCase):
@@ -361,6 +376,97 @@ class EvalTests(unittest.TestCase):
             # written once (first eval), but records rate 0.
             state = torch.load(run_dir / "best.pt", weights_only=False)
             self.assertEqual(state["best_proof_rate"], 0.0)
+
+
+class HTPSDriverTests(unittest.TestCase):
+    """Phase 2–3 driver wiring: queues, decoupled step, checkpoint round-trip."""
+
+    def _metric_rows(self, run_dir: Path) -> list[dict]:
+        rows = [json.loads(l) for l in (run_dir / "metrics.jsonl").read_text().splitlines()]
+        return [r for r in rows if "num_transitions" in r]
+
+    def test_default_off_runs_no_decoupled_step(self):
+        # htps_steps_per_round defaults to 0: mining still fills the queues
+        # (pure bookkeeping, no gradient), but no decoupled loss is ever logged.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, num_rounds=1)
+            self.assertEqual(cfg.htps_steps_per_round, 0)
+            torch.manual_seed(0)
+            asyncio.run(run_rl_training(cfg, reasoner_factory=_qed_factory, pool=_pool()))
+            run_dir = next((tmp / "runs").iterdir())
+            for row in self._metric_rows(run_dir):
+                self.assertNotIn("tactic_imitation_loss", row)
+                self.assertNotIn("critic_soft_loss", row)
+
+    def test_enabled_step_logs_losses_and_queues_grow(self):
+        # QED executor ⇒ every root is SOLVED: the critic queue gets hard 1.0
+        # labels and the tactic queue gets the minimal hypertree's QED edges.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, num_rounds=1, htps_steps_per_round=2, htps_batch_size=4)
+            torch.manual_seed(0)
+            asyncio.run(run_rl_training(cfg, reasoner_factory=_qed_factory, pool=_pool()))
+            run_dir = next((tmp / "runs").iterdir())
+            rows = self._metric_rows(run_dir)
+            self.assertGreater(rows[-1]["tactic_queue_len"], 0)
+            self.assertGreater(rows[-1]["critic_queue_len"], 0)
+            self.assertGreater(rows[-1]["imitation_samples_mined"], 0)
+            self.assertIn("tactic_imitation_loss", rows[-1])
+            self.assertIn("critic_soft_loss", rows[-1])
+
+    def test_checkpoint_roundtrips_optimizer_htps_and_queues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, num_rounds=1, htps_steps_per_round=1, htps_batch_size=4)
+            torch.manual_seed(0)
+            asyncio.run(run_rl_training(cfg, reasoner_factory=_qed_factory, pool=_pool()))
+            run_dir = next((tmp / "runs").iterdir())
+            state = torch.load(run_dir / "last.pt", weights_only=False)
+            # The decoupled step ran ⇒ its optimizer carries Adam moments.
+            self.assertIn("optimizer_htps_state_dict", state)
+            self.assertGreater(len(state["optimizer_htps_state_dict"]["state"]), 0)
+            # Queues serialize as plain tuples, not pickled dataclass instances.
+            self.assertGreater(len(state["tactic_queue"]), 0)
+            goal, hyps, tactic_id, arg_indices = state["tactic_queue"][0]
+            self.assertIsInstance(goal, str)
+            self.assertIsInstance(tactic_id, int)
+            self.assertGreater(len(state["critic_queue"]), 0)
+            goal_c, hyps_c, target = state["critic_queue"][0]
+            self.assertEqual(target, 1.0)  # QED executor ⇒ SOLVED root ⇒ hard label
+
+            # Resume restores the queues: with num_rounds == start_round the loop
+            # body never runs, so the final checkpoint's queues are exactly the
+            # restored ones.
+            cfg.num_rounds = int(state["round"]) + 1
+            torch.manual_seed(0)
+            asyncio.run(run_rl_training(
+                cfg, resume_run_dir=run_dir, reasoner_factory=_qed_factory, pool=_pool()
+            ))
+            state2 = torch.load(run_dir / "last.pt", weights_only=False)
+            self.assertEqual(state2["tactic_queue"], state["tactic_queue"])
+            self.assertEqual(state2["critic_queue"], state["critic_queue"])
+
+    def test_pre_htps_checkpoint_still_resumes(self):
+        # A checkpoint written before the HTPS keys existed must load with the
+        # defaults (empty queues, fresh optimizer_htps).
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, num_rounds=1)
+            torch.manual_seed(0)
+            asyncio.run(run_rl_training(cfg, reasoner_factory=_qed_factory, pool=_pool()))
+            run_dir = next((tmp / "runs").iterdir())
+            state = torch.load(run_dir / "last.pt", weights_only=False)
+            for key in ("optimizer_htps_state_dict", "tactic_queue", "critic_queue"):
+                state.pop(key, None)  # strip back to the pre-HTPS format
+            torch.save(state, run_dir / "last.pt")
+
+            cfg.num_rounds = 2
+            torch.manual_seed(0)
+            metrics = asyncio.run(run_rl_training(
+                cfg, resume_run_dir=run_dir, reasoner_factory=_qed_factory, pool=_pool()
+            ))
+            self.assertEqual(metrics["round"], 1)
 
 
 if __name__ == "__main__":

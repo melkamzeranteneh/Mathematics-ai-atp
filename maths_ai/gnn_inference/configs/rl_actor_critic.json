@@ -32,6 +32,20 @@
   "max_depth": 8,
   "max_nodes": 64,
 
+  "num_simulations": null,
+  "sim_batch_size": null,
+  "puct_c": null,
+  "selection_policy": "legacy",
+
+  "visit_threshold": 4,
+  "critic_queue_size": 10000,
+  "htps_steps_per_round": 0,
+  "htps_batch_size": 64,
+  "htps_learning_rate": 0.0001,
+  "w_critic_soft": 0.5,
+  "tactic_queue_size": 10000,
+  "mine_all_solved_nodes": true,
+
   "learning_rate": 0.0001,
   "weight_decay": 0.0001,
   "grad_clip": 1.0,

@@ -2,7 +2,9 @@
 LeanDojo proof states, BC annealing, fault tolerance, eval-by-proof-rate.
 
 Encodes the three invariants:
-  - one optimizer step per collect round (on-policy A2C),
+  - one optimizer step per collect round (on-policy A2C) — the decoupled
+    HTPS-style step (``train_step_htps_style``) is exempt: supervised regression
+    on stored pairs through its own optimizer,
   - one featurizer instance shared between collect and train (index alignment),
   - vocabs always from prepared_root (embedding alignment across all phases).
 
@@ -16,6 +18,7 @@ import asyncio
 import json
 import random
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -24,13 +27,20 @@ import torch
 from torch.optim import AdamW
 
 from maths_ai.data_models.proof_components import Goal
+from maths_ai.hybrid_reasoner.selection_policy import resolve_search_params
 
 from .actor_critic import ActorCriticWithArgsClassifier
 from .dataset import iter_dataset_rows
 from .pln_reward import RewardConfig
-from .pln_rl_training import make_dag_featurizer, train_step_onpolicy
+from .pln_rl_training import make_dag_featurizer, train_step_htps_style, train_step_onpolicy
 from .reporting import console_print
 from .rl_reasoner import RLHybridReasoner, RLSearchResult
+from .search_harvest import (
+    CriticSample,
+    TacticImitationSample,
+    extract_critic_samples,
+    extract_minimal_hypertree,
+)
 from .state import parse_state
 
 
@@ -87,6 +97,28 @@ class RLTrainingConfig:
     max_depth: int = 8
     max_nodes: int = 64
 
+    # Search mode (see hybrid_reasoner/selection_policy.py, the single
+    # authority for this contract). "legacy" runs the best-first loop and
+    # forbids an explicit simulation budget; "puct" enables PUCT-guided
+    # repeated simulation with virtual loss and per-edge visit statistics
+    # and requires num_simulations. None = "left alone" (resolved by
+    # resolve_search_params); "rp" is reserved for the deferred variant.
+    selection_policy: str = "legacy"
+    num_simulations: int | None = None
+    sim_batch_size: int | None = None
+    puct_c: float | None = None
+
+    # Decoupled HTPS-style step (Phases 2–3). htps_steps_per_round=0 disables it
+    # entirely — no queues fill semantics change, no second optimizer steps.
+    visit_threshold: int = 4          # min edge visits before W/N becomes a critic target
+    critic_queue_size: int = 10000
+    htps_steps_per_round: int = 0     # 0 ⇒ decoupled step disabled ⇒ current behavior
+    htps_batch_size: int = 64
+    htps_learning_rate: float = 1e-4
+    w_critic_soft: float = 0.5
+    tactic_queue_size: int = 10000
+    mine_all_solved_nodes: bool = True  # False = root-only mining (ablation)
+
     # Optimizer / loss.
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
@@ -112,6 +144,14 @@ class RLTrainingConfig:
     device: str = "auto"
 
     _PATH_FIELDS = ("warmstart_checkpoint", "prepared_root", "theorem_file", "run_root")
+
+    def __post_init__(self) -> None:
+        # Fail at config construction — before any Lean server spins up. Only
+        # validates; the reasoner constructor runs the same resolver again and
+        # stores the resolved values.
+        resolve_search_params(
+            self.selection_policy, self.num_simulations, self.sim_batch_size, self.puct_c
+        )
 
     @classmethod
     def from_json(cls, path: str | Path) -> "RLTrainingConfig":
@@ -272,15 +312,28 @@ async def collect_round(
     A theorem whose search raises or times out contributes no result; the round
     trains on the survivors. Sequential because one reasoner holds one action
     stash at a time (refinement 6).
+
+    Timeout handling: ``prove`` receives a monotonic ``deadline`` and stops
+    cleanly between expansions / simulation batches, returning the partial
+    graph — a multi-simulation search that runs out of time keeps its
+    completed simulations as experience. ``asyncio.wait_for`` stays as a
+    backstop at ``timeout_s * 1.25`` for a hang inside a single Lean call,
+    where cancellation (and the loss of that search) is the only option left.
     """
     results: list[RLSearchResult] = []
     solved = 0
     failed = 0
     for item in batch:
         try:
+            deadline = time.monotonic() + timeout_s
             result = await asyncio.wait_for(
-                reasoner.prove(item.goal.expression, hypotheses=item.goal.hypotheses, greedy=greedy),
-                timeout=timeout_s,
+                reasoner.prove(
+                    item.goal.expression,
+                    hypotheses=item.goal.hypotheses,
+                    greedy=greedy,
+                    deadline=deadline,
+                ),
+                timeout=timeout_s * 1.25,
             )
             results.append(result)
             if result.graph.is_solved():
@@ -312,19 +365,39 @@ def save_checkpoint(
     curriculum_size: int,
     best_proof_rate: float,
     path: Path,
+    *,
+    optimizer_htps: torch.optim.Optimizer | None = None,
+    tactic_queue: "deque[TacticImitationSample] | None" = None,
+    critic_queue: "deque[CriticSample] | None" = None,
 ) -> None:
+    """Write the resume state (Decision 1.4: optimizer-htps + queues included).
+
+    Queue samples are serialized as plain tuples of strings/ints/floats, not
+    pickled dataclass instances, so the checkpoint stays loadable across module
+    refactors. Old checkpoints without the new keys still resume (``.get`` with
+    defaults on the load side).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "round": round_idx,
-            "curriculum_size": curriculum_size,
-            "best_proof_rate": best_proof_rate,
-            "torch_rng_state": torch.get_rng_state(),
-        },
-        path,
-    )
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "round": round_idx,
+        "curriculum_size": curriculum_size,
+        "best_proof_rate": best_proof_rate,
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    if optimizer_htps is not None:
+        payload["optimizer_htps_state_dict"] = optimizer_htps.state_dict()
+    if tactic_queue is not None:
+        payload["tactic_queue"] = [
+            (s.goal, tuple(s.hypotheses), s.tactic_id, tuple(s.arg_indices))
+            for s in tactic_queue
+        ]
+    if critic_queue is not None:
+        payload["critic_queue"] = [
+            (s.goal, tuple(s.hypotheses), s.target) for s in critic_queue
+        ]
+    torch.save(payload, path)
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +500,18 @@ async def run_rl_training(
     console_print(f"Warm start (strict): {cfg.warmstart_checkpoint}")
 
     optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    # Decoupled HTPS-style step: separate optimizer instance over the SAME
+    # parameters, so the supervised imitation/soft-critic gradient keeps its own
+    # Adam moment estimates instead of contaminating the on-policy ones.
+    optimizer_htps = AdamW(
+        model.parameters(), lr=cfg.htps_learning_rate, weight_decay=cfg.weight_decay
+    )
+    assert optimizer_htps is not optimizer  # the decoupled step must never touch the on-policy optimizer
+
+    # Replay queues for the decoupled step (Decision 1.4: checkpointed).
+    tactic_queue: deque[TacticImitationSample] = deque(maxlen=cfg.tactic_queue_size)
+    critic_queue: deque[CriticSample] = deque(maxlen=cfg.critic_queue_size)
+    rng = random.Random(cfg.seed)
 
     # Run dir / resume.
     start_round = 0
@@ -440,6 +525,19 @@ async def run_rl_training(
         state = torch.load(last_path, map_location=device, weights_only=False)
         model.load_state_dict(state["model_state_dict"], strict=True)
         optimizer.load_state_dict(state["optimizer_state_dict"])
+        # New keys restored with defaults so pre-HTPS checkpoints still resume.
+        if state.get("optimizer_htps_state_dict") is not None:
+            optimizer_htps.load_state_dict(state["optimizer_htps_state_dict"])
+        tactic_queue.extend(
+            TacticImitationSample(
+                goal=g, hypotheses=tuple(h), tactic_id=int(tid), arg_indices=tuple(args)
+            )
+            for g, h, tid, args in state.get("tactic_queue", [])
+        )
+        critic_queue.extend(
+            CriticSample(goal=g, hypotheses=tuple(h), target=float(t))
+            for g, h, t in state.get("critic_queue", [])
+        )
         torch.set_rng_state(state["torch_rng_state"].cpu())
         start_round = int(state["round"]) + 1
         best_proof_rate = float(state.get("best_proof_rate", -1.0))
@@ -473,6 +571,10 @@ async def run_rl_training(
             top_k_subgoals=cfg.top_k_subgoals,
             max_depth=cfg.max_depth,
             max_nodes=cfg.max_nodes,
+            selection_policy=cfg.selection_policy,
+            num_simulations=cfg.num_simulations,
+            sim_batch_size=cfg.sim_batch_size,
+            puct_c=cfg.puct_c,
         )
     else:
         reasoner = reasoner_factory(model, node_vocab, tactic_vocab, cfg)
@@ -511,6 +613,11 @@ async def run_rl_training(
         bc_weight = bc_weight_at_round(round_idx, cfg)
         if results:
             # Exactly ONE optimizer step per collect round (on-policy invariant).
+            # The decoupled train_step_htps_style below is EXEMPT: it is supervised
+            # regression on stored (input, label) pairs through its own optimizer —
+            # the invariant belongs to the score-function estimator in
+            # compute_onpolicy_loss, whose recomputed log-probs are on-policy only
+            # under the parameters that sampled the actions.
             metrics = train_step_onpolicy(
                 model,
                 optimizer,
@@ -526,6 +633,45 @@ async def run_rl_training(
             )
         else:
             metrics = {"num_transitions": 0.0, "num_failures": 0.0}
+
+        # Decoupled HTPS-style step (Phases 2–3): mine every collected graph —
+        # solved or not — into the replay queues, then run the configured number
+        # of supervised steps on samples drawn from them.
+        imitation_mined = 0
+        for r in results:
+            critic_queue.extend(
+                extract_critic_samples(r.graph, visit_threshold=cfg.visit_threshold)
+            )
+            mined = extract_minimal_hypertree(
+                r.graph, r.edge_actions, mine_all_solved_nodes=cfg.mine_all_solved_nodes
+            )
+            imitation_mined += len(mined)
+            tactic_queue.extend(mined)
+        metrics["imitation_samples_mined"] = float(imitation_mined)
+        metrics["tactic_queue_len"] = float(len(tactic_queue))
+        metrics["critic_queue_len"] = float(len(critic_queue))
+        for _ in range(cfg.htps_steps_per_round):
+            if not tactic_queue and not critic_queue:
+                break
+            tactic_batch = rng.sample(
+                list(tactic_queue), min(cfg.htps_batch_size, len(tactic_queue))
+            )
+            critic_batch = rng.sample(
+                list(critic_queue), min(cfg.htps_batch_size, len(critic_queue))
+            )
+            htps_metrics = train_step_htps_style(
+                model,
+                optimizer_htps,
+                tactic_batch,
+                critic_batch,
+                reasoner.dag_featurize_data,
+                w_critic_soft=cfg.w_critic_soft,
+                arg_loss_weight=cfg.arg_loss_weight,
+                grad_clip=cfg.grad_clip,
+                device=device,
+            )
+            metrics["tactic_imitation_loss"] = htps_metrics["tactic_imitation_loss"]
+            metrics["critic_soft_loss"] = htps_metrics["critic_soft_loss"]
 
         # Curriculum: grow when the recent training-window solve rate crosses threshold.
         solve_rate = collect_stats["solved"] / (collect_stats["attempted"] or 1.0)
@@ -564,6 +710,9 @@ async def run_rl_training(
             save_checkpoint(
                 model, optimizer, round_idx, pool.curriculum_size, best_proof_rate,
                 run_dir / "last.pt",
+                optimizer_htps=optimizer_htps,
+                tactic_queue=tactic_queue,
+                critic_queue=critic_queue,
             )
 
         if cfg.eval_every > 0 and (round_idx + 1) % cfg.eval_every == 0 and pool.eval_items:
@@ -578,6 +727,9 @@ async def run_rl_training(
                 save_checkpoint(
                     model, optimizer, round_idx, pool.curriculum_size, best_proof_rate,
                     run_dir / "best.pt",
+                    optimizer_htps=optimizer_htps,
+                    tactic_queue=tactic_queue,
+                    critic_queue=critic_queue,
                 )
                 console_print(f"  New best proof rate {best_proof_rate:.3f} → best.pt")
 
@@ -585,6 +737,9 @@ async def run_rl_training(
     save_checkpoint(
         model, optimizer, cfg.num_rounds - 1, pool.curriculum_size, best_proof_rate,
         run_dir / "last.pt",
+        optimizer_htps=optimizer_htps,
+        tactic_queue=tactic_queue,
+        critic_queue=critic_queue,
     )
     return last_metrics
 
