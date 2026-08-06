@@ -1,0 +1,34 @@
+docs: updated rl_process_walkthrough for HTPS integration
+
+Rewrite the end-to-end walkthrough to cover both search modes:
+
+- Symbol table extended with N, W, VL, P, Q, c, v_T, B.
+- Section 0 (model): adds the critic's second role as _leaf_value
+  for simulation leaf estimates.
+- Section 1 (sampling): adds the batched proposal path
+  (predict_next_tactics_batch, one multi-graph forward per draw).
+- Section 2 restructured into 2a (legacy, unchanged) and 2b (HTPS):
+  selection via puct_score with virtual loss (2b-i), batched leaf
+  expansion (2b-ii), backup bottom-up with AND-combine and critic
+  leaf value (2b-iii), iteration termination conditions (2b-iv).
+- Section 3 (storage): per-node pending stash keying, _on_expansion_
+  complete flush, visit stats surviving in RLSearchResult.graph.
+- Section 4 (harvest): backup_values soft-target generalization under
+  visit_threshold; Phi=0 when stv is None.
+- New section 4b: HTPS-mode additional harvest — extract_critic_
+  samples (status + soft W/N targets) and extract_minimal_hypertree
+  (step-minimal proof path imitation), both feeding rolling deques.
+- Section 5 (on-policy step): unchanged.
+- New section 5b: decoupled HTPS step — separate optimizer, joint
+  batch of imitation and critic rows, one encode forward, two losses;
+  explains why the decoupled step does not invalidate the on-policy
+  invariant.
+- Section 6 (driver): deadline/backstop distinction, checkpoint
+  format additions, HTPS round sequence.
+- Section 7 (invariants): eight new rows covering optimizer_htps
+  separation, round ordering, per-node stash, virtual-loss release,
+  prior stamping, imitation filter.
+- Section 8 (file map): selection_policy.py, search_harvest.py
+  additions, four new test files.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
