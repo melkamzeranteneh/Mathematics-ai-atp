@@ -1,6 +1,6 @@
 {
-  "warmstart_checkpoint": "runs/actor_critic_gnn/REPLACE_WITH_RUN/best.pt",
-  "prepared_root": "artifacts/prepared/v1",
+  "warmstart_checkpoint": "/home/jovyan/Nol/Mathematics-ai-atp/runs/actor_critic_gnn/run_20260729_060637/best.pt",
+  "prepared_root": "/home/jovyan/Nol/Mathematics-ai-atp/maths_ai/_support_files/artifacts/prepared/v1",
   "run_root": "runs/rl_actor_critic",
   "device": "auto",
   "seed": 42,
@@ -31,7 +31,7 @@
   "top_k_subgoals": 3,
   "max_depth": 8,
   "max_nodes": 64,
-  "use_pln": true,
+  "use_pln": false,
 
   "learning_rate": 0.0001,
   "weight_decay": 0.0001,
