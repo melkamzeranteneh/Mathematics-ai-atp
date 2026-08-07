@@ -180,7 +180,9 @@ class HybridReasoner:
         dts_sampler: Optional[DynamicThompsonSampler] = None,
         dts_c: float = None,
         dts_random_seed: Optional[int] = None,
+        use_pln: bool = True,
     ) -> None:
+        self.use_pln = use_pln
         self.gnn_engine = self._build_gnn_engine(
             config_path=config_path,
             tactic_model_path=tactic_model_path,
@@ -188,35 +190,42 @@ class HybridReasoner:
             index_path=index_path,
             corpus_path=corpus_path,
         )
-        self.petta_chainer = PLNInference()
+
         self.atomic_tactics = {}
 
         # Always use Thompson sampling as fallback - it's automatic and internal
         self.pln_fallback_strategy = "thompson"
-        
+
         # Use config defaults if not provided
         if dts_c is None:
             dts_c = settings.dts_default_c
         if dts_random_seed is None:
             dts_random_seed = settings.dts_default_seed
-        
+
+        # _dts_rng is cheap and may be referenced by subclasses — always create it.
         self._dts_rng = random.Random(dts_random_seed)
-        
-        # Initialize or use provided DTS sampler
-        if dts_sampler is not None:
-            self.dts_sampler = dts_sampler
-            self.dts_sampler.C = dts_c
+
+        if not use_pln:
+            # PLN disabled: no petta subprocess ever spawns; no DTS I/O.
+            self.petta_chainer = None
+            self.dts_sampler = None
         else:
-            # Try to load existing state from default location
-            if settings.dts_state_file.exists():
-                try:
-                    self.dts_sampler = DynamicThompsonSampler.load_from(str(settings.dts_state_file), C=dts_c)
-                except Exception:
-                    # If loading fails, create fresh sampler
-                    self.dts_sampler = DynamicThompsonSampler(C=dts_c)
+            self.petta_chainer = PLNInference()
+            # Initialize or use provided DTS sampler
+            if dts_sampler is not None:
+                self.dts_sampler = dts_sampler
+                self.dts_sampler.C = dts_c
             else:
-                # Create new sampler
-                self.dts_sampler = DynamicThompsonSampler(C=dts_c)
+                # Try to load existing state from default location
+                if settings.dts_state_file.exists():
+                    try:
+                        self.dts_sampler = DynamicThompsonSampler.load_from(
+                            str(settings.dts_state_file), C=dts_c
+                        )
+                    except Exception:
+                        self.dts_sampler = DynamicThompsonSampler(C=dts_c)
+                else:
+                    self.dts_sampler = DynamicThompsonSampler(C=dts_c)
 
         self.executor = executor
         self.server = executor.server
@@ -335,6 +344,10 @@ class HybridReasoner:
         they're true), not a guarantee that the subgoal is actually provable.
         It is the best automatic heuristic available, not ground truth.
         """
+        if not self.use_pln:
+            raise RuntimeError(
+                "rank_subgoals requires PLN; the reasoner was constructed with use_pln=False"
+            )
         # Dispatch all PLN queries concurrently (off the event-loop thread).
         results = await asyncio.gather(
             *(
@@ -715,46 +728,61 @@ class HybridReasoner:
                 self._link(graph, node, tactic, ranked_subgoals=[])
                 continue
 
-            print(f"  [PLN Ranking] scoring {len(outcome.subgoals)} subgoal(s)...")
-            ranked = await self.rank_subgoals(
-                node.goal.expression, outcome.subgoals, tactic, gnn_probability=tactic.probability
-            )
-            print(f"  [PLN Done] ranked {len(ranked)} subgoal(s)")
-            for i, rs in enumerate(ranked):
-                print(f"    subgoal {i}: {rs.goal.expression} | stv=({rs.stv.strength:.3f}, {rs.stv.confidence:.3f}) | combined_rank={rs.combined_rank:.4f}")
+            if self.use_pln:
+                print(f"  [PLN Ranking] scoring {len(outcome.subgoals)} subgoal(s)...")
+                ranked = await self.rank_subgoals(
+                    node.goal.expression, outcome.subgoals, tactic,
+                    gnn_probability=tactic.probability,
+                )
+                print(f"  [PLN Done] ranked {len(ranked)} subgoal(s)")
+                for i, rs in enumerate(ranked):
+                    print(
+                        f"    subgoal {i}: {rs.goal.expression} | "
+                        f"stv=({rs.stv.strength:.3f}, {rs.stv.confidence:.3f}) | "
+                        f"combined_rank={rs.combined_rank:.4f}"
+                    )
+                chosen = [(c.goal, c.stv) for c in ranked[: self.top_k_subgoals]]
+            else:
+                # PLN disabled: keep Lean's executor order, cap at top_k_subgoals.
+                # stv=None propagates automatically: ProofNode.local_score degrades to
+                # gnn_probability, and potential() returns 0.0 (no shaping).
+                chosen = [(g, None) for g in outcome.subgoals[: self.top_k_subgoals]]
 
-            chosen = ranked[: self.top_k_subgoals]
-            self._link(
-                graph,
-                node,
-                tactic,
-                ranked_subgoals=[(candidate.goal, candidate.stv) for candidate in chosen],
-            )
+            self._link(graph, node, tactic, ranked_subgoals=chosen)
 
         if not any_applied:
-            print(f"  [PLN Fallback] evaluating goal: {node.goal.expression}  hyps: {node.goal.hypotheses}")
-            pln_result = await self.petta_chainer.evaluate_async(
-                node.goal.expression,
-                hypotheses=[*node.goal.hypotheses],
-            )
+            if self.use_pln:
+                print(f"  [PLN Fallback] evaluating goal: {node.goal.expression}  hyps: {node.goal.hypotheses}")
+                pln_result = await self.petta_chainer.evaluate_async(
+                    node.goal.expression,
+                    hypotheses=[*node.goal.hypotheses],
+                )
 
-            stv = pln_result.stv
-            pln_fb_key = f"PLN_fb::{node.goal.expression}::{'|'.join(node.goal.hypotheses)}"
+                stv = pln_result.stv
+                pln_fb_key = f"PLN_fb::{node.goal.expression}::{'|'.join(node.goal.hypotheses)}"
 
-            if pln_result.is_fallback and self.dts_sampler is not None:
-                sampled = self.dts_sampler.sample(pln_fb_key, self._dts_rng)
-                stv = STV(strength=sampled, confidence=1.0)
-                print(f"  [PLN Fallback] DTS override: sampled={sampled:.3f} (was random fallback)")
-            elif self.dts_sampler is not None:
-                self.dts_sampler.record_observation(pln_fb_key, reward=stv.score)
-                print(f"  [PLN Fallback] DTS recorded observation: score={stv.score:.3f}")
+                if pln_result.is_fallback and self.dts_sampler is not None:
+                    sampled = self.dts_sampler.sample(pln_fb_key, self._dts_rng)
+                    stv = STV(strength=sampled, confidence=1.0)
+                    print(f"  [PLN Fallback] DTS override: sampled={sampled:.3f} (was random fallback)")
+                elif self.dts_sampler is not None:
+                    self.dts_sampler.record_observation(pln_fb_key, reward=stv.score)
+                    print(f"  [PLN Fallback] DTS recorded observation: score={stv.score:.3f}")
 
-            print(f"  [PLN Fallback] final STV=({stv.strength:.3f}, {stv.confidence:.3f})  score={stv.score:.3f}  is_fallback={pln_result.is_fallback}")
-            if stv.score >= 0.9:
-                print(f"  [PLN Fallback] high confidence — closing node {node.id} as solved!")
-                graph.add_edge(node.id, TacticCandidate(tactic_name="PLN_fallback", arguments=[], probability=1.0), ranked_subgoals=[])
-                self._on_expansion_complete(node)
-                return
+                print(
+                    f"  [PLN Fallback] final STV=({stv.strength:.3f}, {stv.confidence:.3f})"
+                    f"  score={stv.score:.3f}  is_fallback={pln_result.is_fallback}"
+                )
+                if stv.score >= 0.9:
+                    print(f"  [PLN Fallback] high confidence — closing node {node.id} as solved!")
+                    graph.add_edge(
+                        node.id,
+                        TacticCandidate(tactic_name="PLN_fallback", arguments=[], probability=1.0),
+                        ranked_subgoals=[],
+                    )
+                    self._on_expansion_complete(node)
+                    return
+            # use_pln=False: fall through to mark_node_exhausted below.
 
         note = None if any_applied else "executor rejected every candidate tactic"
         if note:

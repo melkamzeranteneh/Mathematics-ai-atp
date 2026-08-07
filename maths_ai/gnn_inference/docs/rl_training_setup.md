@@ -2,9 +2,9 @@
 
 Step-by-step operational guide: where the weight files go, what format the loaders
 expect, how to prepare a fresh remote machine, and how to launch, monitor, resume, and
-evaluate the RL run. The *mechanics* of what the loaders do internally are in
-`docs/rl_process_walkthrough.md` and `docs/dev_plans/rl_training_driver.md`; this file is
-the checklist.
+evaluate the RL run. The *mechanics* of what the loaders do internally — including the
+HTPS simulation loop, the decoupled imitation/critic step, and the PLN kill switch — are
+in `docs/rl_process_walkthrough.md`; this file is the checklist.
 
 ## 0. The two hand-offs at a glance
 
@@ -19,6 +19,16 @@ supervised actor-critic best.pt ──(hand-off B: strict full load)──▶ RL
 The RL driver does **not** accept a pointer checkpoint directly — it strict-loads a full
 `ActorCriticWithArgsClassifier` state dict. If you only have pointer weights, run
 hand-off A first (even briefly) to produce one.
+
+The driver supports two search modes, controlled by `selection_policy` in the config:
+
+| `selection_policy` | Search loop | When to use |
+|---|---|---|
+| `"legacy"` (default) | Best-first AND-OR: pop highest-`combined_rank` node, expand, propagate | Baseline; simpler to debug; no HTPS budget to tune |
+| `"puct"` | HTPS repeated simulation: PUCT selection + virtual loss, batched leaf expansion, per-edge N/W backup | When you want MCTS-style exploration and the critic to serve as `v_T(g)` |
+
+PLN involvement is controlled by `use_pln` in the config (default `true`). Set to
+`false` for a pure terminal-reward run with no petta subprocess.
 
 ## 1. Checkpoint file format
 
@@ -41,6 +51,17 @@ Do not rename tensors from a foreign checkpoint to force a fit: matching shapes 
 different node/tactic vocab ordering loads without error and silently maps every
 embedding row to the wrong token. The checkpoint is only valid together with the
 `prepared_root` it was trained against.
+
+RL run checkpoints written by the HTPS-enabled driver contain additional keys:
+
+| Key | Contents | Missing = |
+|---|---|---|
+| `optimizer_htps_state_dict` | Adam moment state for the decoupled imitation/critic step | fresh optimizer on resume (no moments lost from on-policy step) |
+| `tactic_queue` | list of `(goal, hypotheses, tactic_id, arg_indices)` tuples | empty queue on resume |
+| `critic_queue` | list of `(goal, hypotheses, target)` tuples | empty queue on resume |
+
+Pre-HTPS checkpoints (missing these keys) still resume cleanly — the driver uses `.get`
+with defaults.
 
 ## 2. Where to copy the files on the server
 
@@ -68,9 +89,9 @@ the real absolute path of your prepared dataset.
 
 ## 3. Environment preparation (remote server, JupyterLab)
 
-The RL phase runs live Lean and petta subprocesses, so the Python packages alone are not
-enough. Work in a **JupyterLab terminal** (File → New → Terminal), not a notebook — the
-driver is a long-running CLI process.
+The RL phase runs live Lean and (when `use_pln=true`) petta subprocesses, so the Python
+packages alone are not enough. Work in a **JupyterLab terminal** (File → New →
+Terminal), not a notebook — the driver is a long-running CLI process.
 
 ### 3.1 Python side
 
@@ -109,11 +130,16 @@ asyncio.run(main())
 
 The first `Server.create()` may compile Lean core — minutes, one-time.
 
-### 3.3 petta (PLN)
+### 3.3 petta (PLN) — required only when `use_pln=true`
 
-The PLN reward path shells out to the `petta` binary. `PLNInference` finds it via, in
-order: the `petta_bin` constructor arg, the `PETTA_BIN` environment variable, or
-`shutil.which("petta")`. So either install it on PATH (e.g. `/usr/local/bin/petta`) or:
+If you are running with `"use_pln": false` (terminal-reward-only mode), skip this
+section entirely — `PLNInference` is never constructed and no petta subprocess ever
+spawns.
+
+When `use_pln=true` (the default), the PLN reward and ranking paths shell out to the
+`petta` binary. `PLNInference` finds it via, in order: the `petta_bin` constructor arg,
+the `PETTA_BIN` environment variable, or `shutil.which("petta")`. So either install it
+on PATH (e.g. `/usr/local/bin/petta`) or:
 
 ```bash
 export PETTA_BIN=/path/to/petta          # put this in ~/.bashrc for JupyterLab terminals
@@ -130,20 +156,28 @@ print('petta OK:', r.status, r.stv, 'fallback =', r.is_fallback)
 "
 ```
 
-`is_fallback=True` with status `petta_unavailable` means the binary wasn't found — the
-run would still work but every Φ would be exploration noise instead of PLN.
+`is_fallback=True` with status `petta_unavailable` means the binary wasn't found. With
+`use_pln=true`, every Φ would be exploration noise from the DTS bandit instead of PLN
+scores — the run proceeds but reward shaping is uninformed.
 
 ### 3.4 Sanity: unit suite + live smoke
 
 ```bash
 uv run python -m pytest maths_ai/gnn_inference/tests/ -q
 # expected: all green except the pre-existing test_premise_pool failure
-uv run python -m maths_ai.gnn_inference.scripts.rl_smoke
-# expected: "[rl_smoke] OK — collect → harvest → one on-policy gradient step completed."
 ```
 
-The smoke test needs no checkpoints (it builds a tiny fresh model) and validates the
-whole live chain: Pantograph server, petta scoring, sampling search, harvest, gradient.
+The smoke test validates the live chain end-to-end. Run the variant matching your
+intended config:
+
+```bash
+# with PLN (default — needs petta):
+uv run python -m maths_ai.gnn_inference.scripts.rl_smoke
+# expected: "[rl_smoke] OK — collect → harvest → one on-policy gradient step completed."
+
+# without PLN (use_pln=false — no petta needed):
+uv run python -m maths_ai.gnn_inference.scripts.rl_smoke --use-pln false
+```
 
 ## 4. Hand-off A: pointer weights → supervised actor-critic checkpoint
 
@@ -180,7 +214,13 @@ uv run python maths_ai/gnn_inference/scripts/train_baseline.py \
 
 ## 5. Hand-off B: launch the RL driver
 
-1. Edit `maths_ai/gnn_inference/configs/rl_actor_critic.json`:
+### 5.1 Config walkthrough
+
+Edit `maths_ai/gnn_inference/configs/rl_actor_critic.json`. The fields you must
+touch before a first run are the paths and the two mode knobs; everything else ships
+with working defaults.
+
+**Paths (required):**
 
 ```json
 "warmstart_checkpoint": "runs/actor_critic_gnn/<timestamp>/best.pt",
@@ -189,14 +229,101 @@ uv run python maths_ai/gnn_inference/scripts/train_baseline.py \
 "device": "auto"
 ```
 
-   Leave the architecture block (`hidden_dim` etc.) matching the checkpoint — the strict
-   load makes any disagreement a startup error, which is the guard working, not a bug.
-   The rest of the config (curriculum, BC anneal, budgets) ships with the plan's
-   defaults; the two you are most likely to tune first are `theorems_per_round` (8) and
-   `theorem_timeout_s` (120).
+Leave the architecture block (`hidden_dim`, `num_layers`, `max_args`, `use_node_type`)
+matching the checkpoint — the strict load makes any disagreement a startup error, which
+is the guard working, not a bug.
 
-2. Launch **inside a persistent terminal** — a JupyterLab terminal dies with your browser
-   session unless wrapped, so use tmux (or `nohup ... &`):
+**Search mode:**
+
+```json
+"selection_policy": "legacy",
+"num_simulations": null,
+"sim_batch_size": null,
+"puct_c": null
+```
+
+`"legacy"` runs the original best-first loop and requires all three budget fields to
+be `null`. To switch to HTPS/PUCT simulation, set:
+
+```json
+"selection_policy": "puct",
+"num_simulations": 50,
+"sim_batch_size": 8,
+"puct_c": 1.0
+```
+
+`num_simulations` is the total number of simulations per `prove()` call (the HTPS
+budget). `sim_batch_size` is how many partial hypertrees are selected and expanded in
+one batch before backup. `puct_c` is the exploration constant in the PUCT score
+`Q + c·P·sqrt(total)/(1 + N + VL)`. Validation runs at config construction: an
+explicit budget under `"legacy"` and a missing `num_simulations` under `"puct"` both
+raise `ValueError` before any Lean server starts.
+
+**PLN kill switch:**
+
+```json
+"use_pln": true
+```
+
+`true` (default): PLN ranks subgoals after every successful tactic application, the DTS
+bandit replaces fallback STVs, and the PLN fallback can close a node as SOLVED when its
+STV score ≥ 0.9. Reward shaping adds the PLN potential Φ = `stv.strength` to every
+edge's terminal reward.
+
+`false`: no petta subprocess ever spawns. Subgoals are linked in Lean's executor order,
+capped at `top_k_subgoals`, with `stv=None` on every child node.
+`ProofNode.local_score` degrades to GNN probability alone; `potential()` returns 0.0
+so `edge_shaped_reward = edge_terminal_reward` everywhere. The PLN fallback block is
+skipped — a node whose every tactic is rejected goes straight to exhausted.
+
+**HTPS decoupled step (Phases 2–3):**
+
+```json
+"htps_steps_per_round": 0,
+"htps_batch_size": 64,
+"htps_learning_rate": 0.0001,
+"w_critic_soft": 0.5,
+"visit_threshold": 4,
+"tactic_queue_size": 10000,
+"critic_queue_size": 10000,
+"mine_all_solved_nodes": true
+```
+
+`htps_steps_per_round=0` disables the decoupled step entirely — only the on-policy step
+runs, matching the pre-HTPS behavior. Set to a positive integer (e.g. 4) to also run
+supervised imitation + soft-critic regression steps per round through a separate
+optimizer (does not affect the on-policy optimizer's moments).
+
+After each collect round the driver mines every graph — solved or not — into two replay
+queues: the tactic queue receives `TacticImitationSample`s from `extract_minimal_hypertree`
+(step-minimal proof edges, PLN-fallback edges excluded); the critic queue receives
+`CriticSample`s from `extract_critic_samples` (SOLVED=1.0, DEAD=0.0, unresolved nodes
+with ≥ `visit_threshold` edge visits get a soft `W/N` target). The decoupled step then
+draws random batches from these queues and runs one joint forward (one `model.encode`
+call for both losses):
+
+```
+L = L_tactic_imitation + w_critic_soft · L_critic_soft
+```
+
+`mine_all_solved_nodes=true` mines the full minimal hypertree from every SOLVED node in
+the graph; `false` mines only from the root (ablation).
+
+**Per-round budgets (tune first):**
+
+```json
+"theorems_per_round": 8,
+"theorem_timeout_s": 120.0
+```
+
+These two have the most direct effect on wall-clock time per round and GPU utilization.
+Start with the defaults and tighten or loosen based on the round timing shown in the
+console.
+
+### 5.2 Launch
+
+Launch inside a persistent terminal — a JupyterLab terminal dies with your browser
+session unless wrapped:
 
 ```bash
 tmux new -s rl
@@ -207,19 +334,22 @@ uv run python maths_ai/gnn_inference/scripts/rl_train.py \
 # detach: Ctrl-b d      reattach later: tmux attach -t rl
 ```
 
-3. What startup prints, in order — each line is a checkpoint you can verify:
-   `Warm start (strict): ...` → `Run dir: runs/rl_actor_critic/<stamp>` →
-   `Theorem pool: N usable states, M dropped` → `Pool: X train / Y eval; curriculum
-   window Z` → per-round lines:
+What startup prints, in order — each line is a checkpoint you can verify:
+`Warm start (strict): ...` → `Run dir: runs/rl_actor_critic/<stamp>` →
+`Theorem pool: N usable states, M dropped` → `Pool: X train / Y eval; curriculum
+window Z` → per-round lines:
 
 ```
 Round 0: solved 2/8, trans 11, fail 19, return 0.213, loss 0.847, bc 0.500, 94.2s
 ```
 
+With `htps_steps_per_round > 0`, the round line is followed by additional loss fields
+once the queues are non-empty: `tactic_imitation_loss` and `critic_soft_loss`.
+
 ## 6. Monitoring, resuming, evaluating
 
-**Monitor** — from a JupyterLab notebook (this is the one place a notebook is the right
-tool), plot the metrics file the driver appends per round:
+**Monitor** — from a JupyterLab notebook, plot the metrics file the driver appends per
+round:
 
 ```python
 import json, pandas as pd
@@ -231,14 +361,32 @@ train.plot(x="round", y=["solved", "num_failures", "mean_return", "total_loss"],
 Healthy early signs: `num_failures` trending down, `solved` and `mean_return` up,
 `entropy` positive (not collapsing to 0), curriculum-widened lines appearing.
 
+When the decoupled HTPS step is enabled, additional columns appear once the queues fill:
+
+| Metric | Meaning |
+|---|---|
+| `imitation_samples_mined` | Step-minimal proof edges extracted from this round's graphs |
+| `tactic_queue_len` | Current size of the tactic imitation replay queue |
+| `critic_queue_len` | Current size of the soft-critic replay queue |
+| `tactic_imitation_loss` | Cross-entropy on proof-edge tactics + arguments (decoupled step) |
+| `critic_soft_loss` | MSE of critic head vs. SOLVED/DEAD/soft-W/N targets (decoupled step) |
+
+With `selection_policy="puct"`, also watch that `visit_stats.N > 0` on edges in the
+saved graphs — a consistently zero visit count means the simulation loop is not
+running, which would indicate the config validation was bypassed.
+
 **Resume after a disconnect/preemption** — the driver checkpoints `last.pt` (model +
-optimizer + RNG + round counter) every `checkpoint_every` rounds:
+both optimizers + both queues + RNG + round counter) every `checkpoint_every` rounds:
 
 ```bash
 uv run python maths_ai/gnn_inference/scripts/rl_train.py \
   --config maths_ai/gnn_inference/configs/rl_actor_critic.json \
   --resume runs/rl_actor_critic/<stamp>
 ```
+
+The resume path restores both optimizers and both queues. Pre-HTPS checkpoints
+(missing the HTPS keys) still resume cleanly with fresh optimizer moments and empty
+queues.
 
 **Evaluate** — greedy proof rate on the same held-out pool, for the comparison that
 matters (did RL beat its own warm start):
@@ -267,6 +415,9 @@ uv run python maths_ai/gnn_inference/scripts/rl_train.py \
 | `RuntimeError: Error(s) in loading state_dict ... size mismatch` | architecture block ≠ checkpoint | set `hidden_dim`/`num_layers`/`max_args` to the checkpoint's values |
 | `Missing key(s) in state_dict: "actor.base.weight" ...` | a pointer checkpoint was given to hand-off B | run hand-off A first |
 | `Warm-start shape mismatch (hidden_dim disagreement...)` | hand-off A config ≠ pointer architecture | same fix as above, in the AC config |
-| every PLN result `is_fallback=True` | petta not found | install petta / set `PETTA_BIN` |
+| `ValueError: selection_policy='legacy' cannot have an explicit simulation budget` | `num_simulations`/`sim_batch_size`/`puct_c` set non-null under `"legacy"` | set them all to `null` for legacy mode |
+| `ValueError: selection_policy='puct' requires num_simulations` | `"puct"` set without a simulation budget | add `"num_simulations": <int>` |
+| `RuntimeError: rank_subgoals requires PLN; ... use_pln=False` | `rank_subgoals` called directly on a `use_pln=False` reasoner | this is a guard, not a config error; indicates a code path that expects PLN was reached — check that the calling code respects the flag |
+| every PLN result `is_fallback=True` | petta not found (only relevant when `use_pln=true`) | install petta / set `PETTA_BIN`; or switch to `"use_pln": false` |
 | `Server.create()` hangs or errors | no Lean toolchain | install elan, `source ~/.elan/env` |
 | `ModuleNotFoundError: datasets` | streaming dep not installed | `uv add datasets` |

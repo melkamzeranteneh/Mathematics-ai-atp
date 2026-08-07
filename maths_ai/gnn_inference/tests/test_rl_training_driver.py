@@ -469,5 +469,39 @@ class HTPSDriverTests(unittest.TestCase):
             self.assertEqual(metrics["round"], 1)
 
 
+class PLNKillSwitchDriverTests(unittest.TestCase):
+    """use_pln=False: config roundtrip and threading to the reasoner factory."""
+
+    def test_use_pln_false_survives_config_roundtrip(self):
+        # use_pln=False must survive to_dict() → from_json() intact.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, use_pln=False)
+            self.assertFalse(cfg.use_pln)
+            path = tmp / "cfg_pln.json"
+            with open(path, "w") as f:
+                json.dump(cfg.to_dict(), f)
+            loaded = RLTrainingConfig.from_json(path)
+            self.assertFalse(loaded.use_pln)
+
+    def test_use_pln_false_reaches_reasoner_factory(self):
+        # When use_pln=False is set in config, the value must reach the factory.
+        # Inject a factory that records and asserts the flag, returning a mock
+        # reasoner so no live Lean server is needed.
+        received: list[bool] = []
+
+        def _recording_factory(model, node_vocab, tactic_vocab, cfg):
+            received.append(cfg.use_pln)
+            return _make_reasoner(model, node_vocab, _QEDExecutor(), top_k=cfg.top_k_tactics)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, use_pln=False, num_rounds=1)
+            torch.manual_seed(0)
+            asyncio.run(run_rl_training(cfg, reasoner_factory=_recording_factory, pool=_pool()))
+        self.assertEqual(len(received), 1)
+        self.assertFalse(received[0])
+
+
 if __name__ == "__main__":
     unittest.main()

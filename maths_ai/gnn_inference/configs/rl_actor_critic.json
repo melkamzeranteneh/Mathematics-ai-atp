@@ -36,6 +36,7 @@
   "sim_batch_size": null,
   "puct_c": null,
   "selection_policy": "legacy",
+  "use_pln": true,
 
   "visit_threshold": 4,
   "critic_queue_size": 10000,

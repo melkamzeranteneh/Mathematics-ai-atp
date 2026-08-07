@@ -97,6 +97,12 @@ class RLTrainingConfig:
     max_depth: int = 8
     max_nodes: int = 64
 
+    # PLN kill switch: False skips PLNInference construction, DTS sampler, rank_subgoals
+    # calls, and the _expand fallback block. Subgoal nodes receive stv=None, which
+    # ProofNode.local_score and potential() already handle — frontier ranking degrades to
+    # GNN probability and reward shaping vanishes, both with zero changes to those modules.
+    use_pln: bool = True
+
     # Search mode (see hybrid_reasoner/selection_policy.py, the single
     # authority for this contract). "legacy" runs the best-first loop and
     # forbids an explicit simulation budget; "puct" enables PUCT-guided
@@ -575,6 +581,7 @@ async def run_rl_training(
             num_simulations=cfg.num_simulations,
             sim_batch_size=cfg.sim_batch_size,
             puct_c=cfg.puct_c,
+            use_pln=cfg.use_pln,
         )
     else:
         reasoner = reasoner_factory(model, node_vocab, tactic_vocab, cfg)
@@ -792,6 +799,7 @@ def driver_main(argv: list[str] | None = None) -> int:
                 executor=PantographExecutor(server), device=device,
                 top_k_tactics=cfg.top_k_tactics, top_k_subgoals=cfg.top_k_subgoals,
                 max_depth=cfg.max_depth, max_nodes=cfg.max_nodes,
+                use_pln=cfg.use_pln,
             )
             pool = build_theorem_pool(cfg)
             stats = await evaluate_proof_rate(reasoner, pool.eval_items, timeout_s=cfg.theorem_timeout_s)
