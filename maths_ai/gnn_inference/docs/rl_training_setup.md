@@ -186,7 +186,8 @@ uv run python maths_ai/gnn_inference/scripts/train_baseline.py \
 "warmstart_checkpoint": "runs/actor_critic_gnn/<timestamp>/best.pt",
 "prepared_root": "/abs/path/artifacts/prepared/v1",
 "run_root": "runs/rl_actor_critic",
-"device": "auto"
+"device": "auto",
+"use_pln": true
 ```
 
    Leave the architecture block (`hidden_dim` etc.) matching the checkpoint — the strict
@@ -194,6 +195,20 @@ uv run python maths_ai/gnn_inference/scripts/train_baseline.py \
    The rest of the config (curriculum, BC anneal, budgets) ships with the plan's
    defaults; the two you are most likely to tune first are `theorems_per_round` (8) and
    `theorem_timeout_s` (120).
+
+   **`use_pln`** (default `true`) controls whether the PLN component participates in the
+   search. Setting it to `false`:
+   - No petta subprocess is ever spawned — `PLNInference` is never constructed.
+   - Subgoal nodes are added in the order Lean produces them, capped at `top_k_subgoals`;
+     frontier ranking degrades to GNN probability alone (`stv=None` is handled by the
+     existing `ProofNode.local_score` path with no code change).
+   - The `_expand` PLN-fallback path is disabled — a node whose tactic candidates were all
+     rejected by Lean is marked exhausted rather than closed via a fabricated QED edge.
+   - `edge_shaped_reward` reduces to `edge_terminal_reward`: every shaping potential
+     `Φ(node)` is zero because `potential()` already returns `0.0` when `node.stv is None`.
+
+   Use `"use_pln": false` for a terminal-reward-only ablation, or when petta is not
+   installed and you want a clean signal rather than fallback noise.
 
 2. Launch **inside a persistent terminal** — a JupyterLab terminal dies with your browser
    session unless wrapped, so use tmux (or `nohup ... &`):
@@ -267,6 +282,6 @@ uv run python maths_ai/gnn_inference/scripts/rl_train.py \
 | `RuntimeError: Error(s) in loading state_dict ... size mismatch` | architecture block ≠ checkpoint | set `hidden_dim`/`num_layers`/`max_args` to the checkpoint's values |
 | `Missing key(s) in state_dict: "actor.base.weight" ...` | a pointer checkpoint was given to hand-off B | run hand-off A first |
 | `Warm-start shape mismatch (hidden_dim disagreement...)` | hand-off A config ≠ pointer architecture | same fix as above, in the AC config |
-| every PLN result `is_fallback=True` | petta not found | install petta / set `PETTA_BIN` |
+| every PLN result `is_fallback=True` | petta not found | install petta / set `PETTA_BIN`; or set `"use_pln": false` to skip PLN entirely |
 | `Server.create()` hangs or errors | no Lean toolchain | install elan, `source ~/.elan/env` |
 | `ModuleNotFoundError: datasets` | streaming dep not installed | `uv add datasets` |
