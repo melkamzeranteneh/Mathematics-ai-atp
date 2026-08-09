@@ -6,34 +6,33 @@ on:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true    # Cancel previous CI runs when a new commit is pushed to the same PR
+  cancel-in-progress: true    
 
 permissions:
-  contents: read # The workflow only needs to checkout code and run tests,
+  contents: read 
 
 jobs:
   test:
-    runs-on: ubuntu-latest #vertual machine to rin temporarly and exixts only during the work flow excution
+    runs-on: ubuntu-latest 
 
     steps:
       - name: Checkout code # checking out the ubuntu machine is empty 
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11 #install python on the runner 
+      - name: Set up Python 3.11  
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
    
-      - name: Install uv # install the packet manager used  by the project
+      - name: Install uv 
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --no-dev # install  production dependeny only, not development-only packages
+        run: uv sync --no-dev 
         
-      - name: Install project #install the project itself
-        run: uv pip install -e . --no-deps # current repository with ediatable installaation also dont install dependency again
-
+      - name: Install project 
+        run: uv pip install -e . --no-deps 
       - name: Run tests
-        run: uv run pytest tests maths_ai -v --tb=short   # Execute all project test suites under tests/ and maths_ai/
+        run: uv run pytest tests maths_ai -v --tb=short   
