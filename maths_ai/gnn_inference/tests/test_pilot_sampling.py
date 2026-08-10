@@ -231,6 +231,67 @@ def test_cached_train_can_be_partitioned_into_theorem_disjoint_holdouts(
     assert not theorem_partitions["val"] & theorem_partitions["test"]
 
 
+def test_model_cache_only_pilot_uses_fully_normalized_theorem_groups(
+    tmp_path: Path,
+):
+    rows = _rows()
+
+    def iter_rows(*, split: str, **_kwargs):
+        return iter(rows[split])
+
+    def load_model(_cache, split: str, row_index: int, raw_record: dict):
+        assert split == "train"
+        row = next(row for row in rows["train"] if row.row_index == row_index)
+        assert raw_record == _raw_record(row)
+        file_index = int(
+            row.file_path.removeprefix("Mathlib/File").removesuffix(".lean")
+        )
+        return {"goal_sexp": "(:c Goal)"} if file_index % 2 == 0 else None
+
+    with (
+        patch(
+            "maths_ai.gnn_inference.atp_lean_gnn.pilot_sampling.iter_dataset_rows",
+            side_effect=iter_rows,
+        ),
+        patch(
+            "maths_ai.gnn_inference.atp_lean_gnn.pilot_sampling.SExprCache.load_for_row",
+            side_effect=lambda row, **_kwargs: _raw_record(row),
+        ),
+        patch(
+            "maths_ai.gnn_inference.atp_lean_gnn.pilot_sampling.ModelSExprCache.load_for_raw_record",
+            new=load_model,
+        ),
+    ):
+        manifest = build_pilot_selection(
+            prepared_root=tmp_path,
+            output_path=tmp_path / "model-cached.json",
+            dataset_name="fake/dataset",
+            target_train_rows=10,
+            target_val_rows=3,
+            target_test_rows=2,
+            seed=17,
+            require_cached_model_train=True,
+            evaluation_from_train=True,
+        )
+
+    selected = set().union(
+        *(
+            set(manifest["splits"][split]["row_indices"])
+            for split in ("train", "val", "test")
+        )
+    )
+    assert manifest["train_cache_required"] is True
+    assert manifest["train_model_cache_required"] is True
+    assert manifest["evaluation_from_train"] is True
+    assert selected
+    assert all(
+        int(row.file_path.removeprefix("Mathlib/File").removesuffix(".lean")) % 2
+        == 0
+        for row in rows["train"]
+        if row.row_index in selected
+    )
+
+
 def test_selection_manifest_filters_exact_rows(tmp_path: Path):
     rows = _rows()
     manifest = tmp_path / "pilot.json"

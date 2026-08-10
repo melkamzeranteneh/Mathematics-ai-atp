@@ -10,7 +10,7 @@ from typing import Iterable
 
 from .dataset import DATASET_NAME, DatasetRow, iter_dataset_rows
 from .labels import label_example
-from .preparation import SExprCache
+from .preparation import ModelSExprCache, SExprCache
 from .state import parse_state
 
 
@@ -338,6 +338,7 @@ def build_pilot_selection(
     target_test_rows: int = 2_000,
     seed: int = 42,
     require_cached_train: bool = False,
+    require_cached_model_train: bool = False,
     evaluation_from_train: bool = False,
 ) -> dict[str, object]:
     """Select complete train theorems before any S-expression extraction.
@@ -353,12 +354,21 @@ def build_pilot_selection(
         raise ValueError("target_train_rows must be positive.")
     if target_val_rows < 1 or target_test_rows < 1:
         raise ValueError("target_val_rows and target_test_rows must be positive.")
-    if evaluation_from_train and not require_cached_train:
-        raise ValueError("evaluation_from_train requires require_cached_train.")
+    cached_train_required = require_cached_train or require_cached_model_train
+    if evaluation_from_train and not cached_train_required:
+        raise ValueError(
+            "evaluation_from_train requires require_cached_train or "
+            "require_cached_model_train."
+        )
 
     cache = (
         SExprCache(prepared_root, project_path="", enabled=True)
-        if require_cached_train
+        if cached_train_required
+        else None
+    )
+    model_cache = (
+        ModelSExprCache(prepared_root, enabled=True)
+        if require_cached_model_train
         else None
     )
     split_rows = {
@@ -376,14 +386,23 @@ def build_pilot_selection(
     for group_id, theorem_rows in rows_by_theorem.items():
         file_path, theorem = group_id
         theorem_rows.sort(key=lambda row: row.row_index)
-        if cache is not None and any(
-            cache.load_for_row(
-                row, extractor_version=SExprCache.EXTRACTOR_VERSION
-            )
-            is None
-            for row in theorem_rows
-        ):
-            continue
+        if cache is not None:
+            group_is_cached = True
+            for row in theorem_rows:
+                raw_record = cache.load_for_row(
+                    row, extractor_version=SExprCache.EXTRACTOR_VERSION
+                )
+                if raw_record is None or (
+                    model_cache is not None
+                    and model_cache.load_for_raw_record(
+                        row.split, row.row_index, raw_record
+                    )
+                    is None
+                ):
+                    group_is_cached = False
+                    break
+            if not group_is_cached:
+                continue
         states = [parse_state(row.state) for row in theorem_rows]
         state_characters = sum(len(row.state) for row in theorem_rows)
         hypothesis_count = sum(len(state.hypotheses) for state in states)
@@ -573,7 +592,8 @@ def build_pilot_selection(
     manifest: dict[str, object] = {
         "schema_version": PILOT_SCHEMA_VERSION,
         "selection_basis": "dataset-metadata-file-clustered-v1",
-        "train_cache_required": require_cached_train,
+        "train_cache_required": cached_train_required,
+        "train_model_cache_required": require_cached_model_train,
         "evaluation_from_train": evaluation_from_train,
         "dataset": dataset_name,
         "seed": seed,

@@ -37,6 +37,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--require-cached-model-train",
+        action="store_true",
+        help=(
+            "Select train only from theorem groups whose raw S-expression rows "
+            "and digest-matched normalized model sidecars are fully validated. "
+            "This implies --require-cached-train."
+        ),
+    )
+    parser.add_argument(
         "--evaluation-from-train",
         action="store_true",
         help=(
@@ -59,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
             target_test_rows=args.test_rows,
             seed=args.seed,
             require_cached_train=args.require_cached_train,
+            require_cached_model_train=args.require_cached_model_train,
             evaluation_from_train=args.evaluation_from_train,
         )
     except (OSError, RuntimeError, ValueError) as exc:
@@ -71,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
         "selected_source_train_rows": manifest["selected_source_train_rows"],
         "selection_basis": manifest["selection_basis"],
         "train_cache_required": manifest["train_cache_required"],
+        "train_model_cache_required": manifest["train_model_cache_required"],
         "evaluation_from_train": manifest["evaluation_from_train"],
         "eligible_train_rows": manifest["eligible_train_rows"],
         "eligible_train_fraction": manifest["eligible_train_fraction"],
