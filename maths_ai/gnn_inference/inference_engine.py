@@ -26,22 +26,12 @@ class GNNModelEngine:
         k: int = 500,
         device: str = "cuda",
     ):
-        """
-            Args:
-                config_path: path to the baseline training config.json (model architecture
-                    and the prepared dataset root used to recover the node/tactic vocabs)
-                tactic_predictor_model_path: checkpoint (.pt) holding "model_state_dict" for
-                    the trained TacticWithArgsClassifier
-                argument_predictor_model_path: checkpoint (.pt) holding "scorer_state_dict"
-                    for the trained PremiseScorer
-                index_path: optional path to a FAISS lemma index directory
-                corpus_path: optional path to lemmas.jsonl for decoding retrieved lemma IDs
-        """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
         config = load_baseline_config(config_path)
         metadata = load_prepared_metadata(config.prepared_root)
 
+        # Load tactic model
         tactic_model = TacticWithArgsClassifier(
             num_node_labels=len(metadata.node_vocab),
             num_tactics=len(metadata.tactic_vocab),
@@ -52,13 +42,20 @@ class GNNModelEngine:
             max_args=getattr(config, "max_args", 3),
         )
         tactic_checkpoint = torch.load(tactic_predictor_model_path, map_location=self.device, weights_only=False)
-        tactic_model.load_state_dict(tactic_checkpoint.get("model_state_dict", tactic_checkpoint))
+        tactic_model.load_state_dict(
+            tactic_checkpoint.get("model_state_dict", tactic_checkpoint),
+            strict=False  # Compatibility with old checkpoints
+        )
         tactic_model = tactic_model.to(self.device)
         tactic_model.eval()
 
+        # Load argument scorer
         argument_model = PremiseScorer(hidden_dim=config.model.hidden_dim, mode=scorer_mode)
         argument_checkpoint = torch.load(argument_predictor_model_path, map_location=self.device, weights_only=False)
-        argument_model.load_state_dict(argument_checkpoint.get("scorer_state_dict", argument_checkpoint))
+        argument_model.load_state_dict(
+            argument_checkpoint.get("scorer_state_dict", argument_checkpoint),
+            strict=False  # query_proj_ar was added, old checkpoints need this
+        )
         argument_model = argument_model.to(self.device)
         argument_model.eval()
 
@@ -99,14 +96,7 @@ class GNNModelEngine:
         return {record.lemma_id: record for record in records}
 
     def inference(self, goal_expression: str, top_k: int = 3) -> List[TacticCandidate]:
-        """Predict ranked tactic candidates for ``goal_expression``.
-
-        Contract (depended on by ``HybridReasoner.predict_next_tactic``):
-        return up to ``top_k`` candidates, each a ``TacticCandidate``
-        carrying the tactic family name, its selected argument/premise
-        names, and the model's predicted probability — sorted by
-        probability, descending.
-        """
+        """Predict ranked tactic candidates for ``goal_expression``."""
         predictions = self.gnn_inference.predict_tactics_with_arguments(goal_expression, top_k=top_k)
         print(*predictions, "\n")
         return [

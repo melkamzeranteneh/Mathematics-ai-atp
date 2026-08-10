@@ -1,0 +1,30 @@
+{
+    "prepared_root": "maths_ai/gnn_inference/artifacts/prepared",
+    "run_root": "maths_ai/gnn_inference/runs/premise_gnn",
+    "seed": 42,
+    "device": "auto",
+    "edge_mode": "bidirectional",
+    "use_node_type": true,
+    "max_args": 3,
+    "hidden_dim": 128,
+    "num_layers": 3,
+    "heads": 4,
+    "dropout": 0.1,
+    "backbone": "sage",
+    "temperature": 0.07,
+    "retrieval_k": 500,
+    "lemma_corpus_path": "maths_ai/gnn_inference/runs/lemma_corpus_v1",
+    "training": {
+        "batch_size": 32,
+        "epochs": 20,
+        "learning_rate": 1e-3,
+        "weight_decay": 1e-4,
+        "grad_clip": 1.0,
+        "log_every_batches": 100,
+        "num_workers": 2,
+        "pin_memory": true,
+        "persistent_workers": true,
+        "prefetch_factor": 2,
+        "use_amp": true
+    }
+}

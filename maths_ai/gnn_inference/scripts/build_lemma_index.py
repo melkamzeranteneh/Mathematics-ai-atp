@@ -1,4 +1,4 @@
-from __future__ import annotations
+"""Build FAISS index for lemma embeddings using baseline or PremiseGNN encoder."""
 
 import argparse
 import json
@@ -21,6 +21,7 @@ if __package__ in {None, ""}:
 
 from maths_ai.gnn_inference.atp_lean_gnn.graph import lemma_statement_to_dag
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import load_lemma_corpus
+from maths_ai.gnn_inference.atp_lean_gnn.premise_gnn import PremiseGNN
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import dag_to_pyg
 from maths_ai.gnn_inference.atp_lean_gnn.training import (
     BaselineConfig,
@@ -87,6 +88,30 @@ def _iter_batches(items: list, batch_size: int) -> Iterable[list]:
         yield batch
 
 
+def _load_premise_gnn(
+    checkpoint_path: Path,
+    device: torch.device,
+    metadata,
+) -> PremiseGNN:
+    """Load a PremiseGNN from a checkpoint saved by the premise training loop."""
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    cfg = ckpt.get("premise_gnn_config", {})
+    
+    # FIX: Added num_tactics parameter (required by PremiseGNN)
+    model = PremiseGNN(
+        num_node_labels=len(metadata.node_vocab),
+        num_tactics=len(metadata.tactic_vocab),  # ← FIXED: Added missing parameter
+        hidden_dim=cfg.get("hidden_dim", 128),
+        num_layers=cfg.get("num_layers", 3),
+        heads=cfg.get("heads", 4),
+        dropout=cfg.get("dropout", 0.1),
+        backbone=cfg.get("backbone", "gatv2"),
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    return model
+
+
 def build_index(
     *,
     corpus_path: Path,
@@ -94,6 +119,7 @@ def build_index(
     prepared_root: Path,
     checkpoint_path: Path,
     config_path: Path | None,
+    premise_gnn_checkpoint: Path | None,
     device_name: str,
     edge_mode: str,
     batch_size: int,
@@ -110,13 +136,18 @@ def build_index(
     manifest_path = output_dir / "manifest.json"
 
     metadata = load_prepared_metadata(prepared_root)
-    config = _load_config_from_checkpoint(checkpoint_path, config_path=config_path)
     device = resolve_device(device_name)
 
-    model = build_baseline_model(metadata, config).to(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
+    if premise_gnn_checkpoint is not None:
+        encoder = _load_premise_gnn(premise_gnn_checkpoint, device, metadata)
+        hidden_dim = encoder.hidden_dim
+    else:
+        config = _load_config_from_checkpoint(checkpoint_path, config_path=config_path)
+        encoder = build_baseline_model(metadata, config).to(device)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        encoder.load_state_dict(checkpoint["model_state_dict"])
+        encoder.eval()
+        hidden_dim = config.model.hidden_dim
 
     records = load_lemma_corpus(corpus_path)
     if limit is not None:
@@ -151,8 +182,8 @@ def build_index(
 
         batch_data = Batch.from_data_list(data_list).to(device)
         with torch.no_grad():
-            node_embeddings = model.encode_nodes(batch_data)
-            state_emb = model.readout(node_embeddings, batch_data)
+            node_embeddings = encoder.encode_nodes(batch_data)
+            state_emb = encoder.readout(node_embeddings, batch_data)
         vectors = state_emb.detach().cpu().numpy().astype(np.float32)
 
         lemma_ids.extend(batch_ids)
@@ -161,7 +192,7 @@ def build_index(
     if lemma_vectors:
         lemma_vectors_np = np.concatenate(lemma_vectors, axis=0)
     else:
-        lemma_vectors_np = np.zeros((0, config.model.hidden_dim), dtype=np.float32)
+        lemma_vectors_np = np.zeros((0, hidden_dim), dtype=np.float32)
 
     if normalize and lemma_vectors_np.size > 0:
         lemma_vectors_np = _normalize_rows(lemma_vectors_np)
@@ -183,7 +214,8 @@ def build_index(
     manifest = {
         "corpus_path": str(corpus_path),
         "prepared_root": str(prepared_root),
-        "checkpoint_path": str(checkpoint_path),
+        "encoder": "premise_gnn" if premise_gnn_checkpoint is not None else "baseline",
+        "checkpoint_path": str(premise_gnn_checkpoint) if premise_gnn_checkpoint is not None else str(checkpoint_path),
         "config_path": None if config_path is None else str(config_path),
         "edge_mode": edge_mode,
         "batch_size": batch_size,
@@ -206,8 +238,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--corpus-path", type=str, required=True, help="Path to lemmas.jsonl")
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR), help="Output directory")
     parser.add_argument("--prepared-root", type=str, required=True, help="Prepared dataset root")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Model checkpoint path")
+    
+    # FIX: Updated help text to clarify checkpoint requirement
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Baseline model checkpoint path (still required even when using --premise-gnn-checkpoint)"
+    )
     parser.add_argument("--config", type=str, default=None, help="Optional baseline config path")
+    
+    # FIX: Updated help text to clarify PremiseGNN usage
+    parser.add_argument(
+        "--premise-gnn-checkpoint",
+        type=str,
+        default=None,
+        help="PremiseGNN checkpoint (overrides baseline encoder). Use this instead of the baseline encoder."
+    )
+    
     parser.add_argument("--device", type=str, default="auto", help="auto, cpu, or cuda")
     parser.add_argument("--edge-mode", type=str, default="bidirectional", help="forward or bidirectional")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size for embedding")
@@ -227,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
             prepared_root=Path(args.prepared_root),
             checkpoint_path=Path(args.checkpoint),
             config_path=None if args.config is None else Path(args.config),
+            premise_gnn_checkpoint=None if args.premise_gnn_checkpoint is None else Path(args.premise_gnn_checkpoint),
             device_name=str(args.device),
             edge_mode=str(args.edge_mode),
             batch_size=int(args.batch_size),

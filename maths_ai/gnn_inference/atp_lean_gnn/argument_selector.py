@@ -1,12 +1,18 @@
 """Pointer-network argument selector for tactic argument prediction.
 
-This module is additive — the existing ``GraphSAGEStateClassifier`` in
-``model.py`` is used as a backbone and remains untouched.
+.. deprecated::
+    ``ArgumentSelector`` and ``TacticWithArgsClassifier`` are superseded by
+    ``PremiseGNN`` + ``PremiseScorer``.  The unified candidate pool scored by
+    ``PremiseScorer.select_arguments()`` covers both local nodes and library
+    lemmas in one pass, making the standalone pointer network redundant.
+    These classes are kept for checkpoint compatibility only and will be
+    removed once the PremiseGNN training pipeline is validated.
 """
 
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -26,11 +32,8 @@ from .pyg import NODE_TYPE_TO_ID
 class ArgumentSelector(nn.Module):
     """Score every node in the DAG as a candidate tactic argument.
 
-    **Query** = concat(state_embedding, tactic_embedding) projected to key-space.
-    **Keys**  = node_embeddings from the GNN encoder.
-
-    After selecting argument *k*, the selected node's embedding is fused into
-    the query before selecting argument *k + 1* (autoregressive).
+    .. deprecated::
+        Use ``PremiseScorer.select_arguments()`` instead.
     """
 
     def __init__(self, hidden_dim: int) -> None:
@@ -133,10 +136,9 @@ class TacticWithArgsConfig:
 class TacticWithArgsClassifier(nn.Module):
     """Tactic family prediction + pointer-based argument selection.
 
-    The GNN backbone (``GraphSAGEStateClassifier``) is instantiated internally
-    and its ``encode_nodes`` / ``readout`` methods are reused.  The tactic
-    classification head is inherited from the backbone.  A new
-    ``ArgumentSelector`` pointer head is added on top.
+    .. deprecated::
+        The argument selection role of this class is superseded by
+        ``PremiseGNN`` + ``PremiseScorer``.  Kept for checkpoint compatibility.
     """
 
     def __init__(
@@ -152,6 +154,12 @@ class TacticWithArgsClassifier(nn.Module):
         max_args: int = 3,
     ) -> None:
         super().__init__()
+        warnings.warn(
+            "TacticWithArgsClassifier is deprecated. "
+            "Use PremiseGNN + PremiseScorer for argument selection.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
         # Backbone — shared encoder + tactic head
         self.backbone = GraphSAGEStateClassifier(
