@@ -465,6 +465,7 @@ async def run_rl_training(
         from maths_ai.hybrid_reasoner.joint_inference import PantographExecutor
 
         server = await Server.create()
+        server_kwargs = {}  # extend with project_path/imports if Mathlib is needed
         executor = PantographExecutor(server)
         reasoner = RLHybridReasoner(
             model=model,
@@ -477,6 +478,7 @@ async def run_rl_training(
             max_depth=cfg.max_depth,
             max_nodes=cfg.max_nodes,
             use_pln=cfg.use_pln,
+            server_kwargs=server_kwargs,
         )
     else:
         reasoner = reasoner_factory(model, node_vocab, tactic_vocab, cfg)
@@ -636,11 +638,13 @@ def driver_main(argv: list[str] | None = None) -> int:
             from maths_ai.hybrid_reasoner.joint_inference import PantographExecutor
 
             server = await Server.create()
+            server_kwargs = {}  # extend with project_path/imports if Mathlib is needed
             reasoner = RLHybridReasoner(
                 model=model, node_vocab=node_vocab, tactic_vocab=tactic_vocab,
                 executor=PantographExecutor(server), device=device,
                 top_k_tactics=cfg.top_k_tactics, top_k_subgoals=cfg.top_k_subgoals,
                 max_depth=cfg.max_depth, max_nodes=cfg.max_nodes,
+                server_kwargs=server_kwargs,
             )
             pool = build_theorem_pool(cfg)
             stats = await evaluate_proof_rate(reasoner, pool.eval_items, timeout_s=cfg.theorem_timeout_s)

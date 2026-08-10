@@ -9,7 +9,7 @@ except ImportError:
     Digraph = None
 from pathlib import Path
 from typing import Dict, List, Optional
-from pantograph.server import Server, GoalState
+from pantograph.server import Server, GoalState, ServerError, ParseError
 
 from maths_ai.data_models.proof_components import Goal, RankedSubgoal, STV, TacticCandidate
 from maths_ai.gnn_inference.inference_engine import GNNModelEngine
@@ -156,8 +156,10 @@ class HybridReasoner:
         dts_c: float = None,
         dts_random_seed: Optional[int] = None,
         use_pln: bool = True,
+        server_kwargs: dict | None = None,
     ) -> None:
         self.use_pln = use_pln
+        self._server_kwargs = server_kwargs or {}
         self.gnn_engine = self._build_gnn_engine(
             config_path=config_path,
             tactic_model_path=tactic_model_path,
@@ -394,6 +396,22 @@ class HybridReasoner:
 
         return graph
 
+    async def _restart_server(self) -> None:
+        """Close the current pantograph subprocess and spawn a fresh one.
+
+        Called when goal_start_async or goal_tactic_async raises a
+        broken-pipe or EOF exception, which means the pantograph-repl
+        process has crashed. Updates self.server and self.executor.server
+        so all subsequent calls go to the new process.
+        """
+        try:
+            await self.server.close()
+        except Exception:
+            pass
+        self.server = await Server.create(**self._server_kwargs)
+        self.executor.server = self.server
+        console_print("  [Server] pantograph restarted after crash")
+
     async def _start_state(self, goal: Goal) -> GoalState:
         """Reconstruct a Lean goal state for ``goal``, including its local
         hypotheses.
@@ -411,10 +429,17 @@ class HybridReasoner:
         for hypothesis in reversed(goal.hypotheses):
             expression = f"∀ ({hypothesis}), {expression}"
 
-        state = await self.server.goal_start_async(expression)
-        if goal.hypotheses:
-            names = " ".join(hypothesis.split(":", 1)[0].strip() for hypothesis in goal.hypotheses)
-            state = await self.server.goal_tactic_async(state, f"intro {names}")
+        try:
+            state = await self.server.goal_start_async(expression)
+            if goal.hypotheses:
+                names = " ".join(hypothesis.split(":", 1)[0].strip() for hypothesis in goal.hypotheses)
+                state = await self.server.goal_tactic_async(state, f"intro {names}")
+        except (BrokenPipeError, ConnectionResetError, EOFError):
+            await self._restart_server()
+            state = await self.server.goal_start_async(expression)
+            if goal.hypotheses:
+                names = " ".join(hypothesis.split(":", 1)[0].strip() for hypothesis in goal.hypotheses)
+                state = await self.server.goal_tactic_async(state, f"intro {names}")
         return state
 
     def _link(
@@ -451,7 +476,12 @@ class HybridReasoner:
             graph.mark_node_exhausted(node.id, note="GNN returned no viable tactic")
             return
 
-        state = await self._start_state(node.goal)
+        try:
+            state = await self._start_state(node.goal)
+        except (ServerError, ParseError) as exc:
+            console_print(f"  [Node {node.id} SKIP] goal elaboration failed: {exc}")
+            graph.mark_node_exhausted(node.id, note=f"elaboration error: {exc}")
+            return
         any_applied = False
 
         for tactic in candidates:
