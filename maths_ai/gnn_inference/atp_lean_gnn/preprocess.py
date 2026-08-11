@@ -243,7 +243,12 @@ def scan_train_split(
         require_complete=selection_manifest is not None,
     )
 
-    for row in rows:
+    total_rows = len(rows)
+    for position, row in enumerate(rows, start=1):
+        if position == 1 or position % 1_000 == 0 or position == total_rows:
+            console_print(
+                f"    Train vocabulary scan: {position}/{total_rows} rows"
+            )
         try:
             sd = sexpr_map.get(row.row_index)
             example = prepare_example(
@@ -335,7 +340,12 @@ def process_split(
         require_complete=selection_manifest is not None,
     )
 
-    for row in rows:
+    total_rows = len(rows)
+    for position, row in enumerate(rows, start=1):
+        if position == 1 or position % 1_000 == 0 or position == total_rows:
+            console_print(
+                f"    {split} artifacts: {position}/{total_rows} rows"
+            )
         try:
             sd = sexpr_map.get(row.row_index)
             example = prepare_example(

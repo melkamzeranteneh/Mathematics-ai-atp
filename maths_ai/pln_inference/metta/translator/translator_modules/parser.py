@@ -47,16 +47,19 @@ def literal_to_concept(value: Any) -> str:
 
 def parse_sexp_string(s: str) -> Any:
     tokens = re.findall(r"\(|\)|:[^\s()]+|[^\s()]+", s)
+    position = 0
 
     def read() -> Any:
-        if not tokens:
+        nonlocal position
+        if position >= len(tokens):
             raise ValueError("Unexpected end of S-expression")
-        tok = tokens.pop(0)
+        tok = tokens[position]
+        position += 1
         if tok == "(":
             out = []
-            while tokens:
-                if tokens[0] == ")":
-                    tokens.pop(0)
+            while position < len(tokens):
+                if tokens[position] == ")":
+                    position += 1
                     return out
                 out.append(read())
             raise ValueError("Unclosed '(' in S-expression")
@@ -65,8 +68,10 @@ def parse_sexp_string(s: str) -> Any:
         return tok
 
     out = read()
-    if tokens:
-        raise ValueError(f"Extra tokens after S-expression: {tokens[:5]}")
+    if position < len(tokens):
+        raise ValueError(
+            f"Extra tokens after S-expression: {tokens[position:position + 5]}"
+        )
     return out
 
 
