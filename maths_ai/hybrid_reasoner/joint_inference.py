@@ -8,6 +8,7 @@ try:
 except ImportError:
     Digraph = None
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, List, Optional
 from pantograph.server import Server, GoalState, ServerError, ParseError
 
@@ -17,10 +18,70 @@ from maths_ai.pln_inference.model import PLNInference
 from maths_ai.pln_inference.metta.translator.translator_modules.runner import DynamicThompsonSampler
 
 from maths_ai.hybrid_reasoner.hypergraph import ProofHypergraph, ProofNode, TacticExecutor, TacticOutcome
+from maths_ai.hybrid_reasoner.pantograph_env import PantographEnv
 from maths_ai.core.config import settings
 from maths_ai.gnn_inference.atp_lean_gnn.reporting import console_print
 
 _INACCESSIBLE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*✝[⁰-⁹¹²³]*")
+
+# A Lean identifier usable as a rewrite rule or simp lemma: hypothesis names and
+# dotted lemma names, but not terms like `↑13` or `?m.2235`.
+_LEAN_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_'.!?]*$")
+
+# Tactics whose arguments must be a bracketed list. `rw h` is a parse error at the
+# column where `[` was expected; the rule list is `rw [h]`. With no arguments these
+# tactics have nothing to rewrite with and are unplayable.
+_BRACKET_REQUIRED_TACTICS = frozenset({
+    "rw", "rwa", "rewrite", "simp_rw", "simp only", "erw",
+})
+
+# Tactics that run bare but take a bracketed list when given lemmas.
+_BRACKET_OPTIONAL_TACTICS = frozenset({
+    "simp", "simpa", "field_simp", "norm_num", "linarith", "nlinarith", "aesop",
+})
+
+
+def _server_is_dead(server: Server) -> bool:
+    """True when the REPL subprocess behind ``server`` is gone.
+
+    ``Server.run_async`` calls ``_close()`` — which sets ``proc = None`` — before
+    raising on a timeout, a decode failure, or an empty read, and an empty read is
+    exactly what a panicked REPL produces. Checking ``proc`` therefore separates a
+    crashed server from a live one that merely rejected a goal, without matching on
+    exception message text.
+    """
+    return getattr(server, "proc", None) is None
+
+
+def render_tactic_command(tactic: TacticCandidate) -> Optional[str]:
+    """Render a tactic and its arguments as Lean surface syntax.
+
+    Argument shape is per tactic, not uniform: ``rw`` needs ``rw [h]`` while
+    ``apply`` needs ``apply h``. Rendering everything as space-separated arguments
+    makes every ``rw`` draw a parse error before any rewriting is attempted.
+
+    Returns ``None`` when the tactic cannot be rendered into a playable command —
+    a bracket-requiring tactic with no usable rule names — so the caller can drop
+    the candidate instead of sending Lean something it will certainly reject.
+    """
+    name = tactic.tactic_name.strip()
+    arguments = [arg.rstrip(":").strip() for arg in tactic.arguments]
+    arguments = [arg for arg in arguments if arg]
+
+    if name in _BRACKET_REQUIRED_TACTICS or name in _BRACKET_OPTIONAL_TACTICS:
+        # A rewrite rule must be a name Lean can look up. The policy samples nodes
+        # from the goal's own graph, so a draw can land on a term like `↑13`, which
+        # is a valid expression but not a rule.
+        rules = [arg for arg in arguments if _LEAN_IDENT_RE.match(arg)]
+        if rules:
+            return f"{name} [{', '.join(rules)}]"
+        if name in _BRACKET_REQUIRED_TACTICS:
+            return None
+        return name
+
+    if not arguments:
+        return name
+    return " ".join([name, *arguments])
 
 
 def _sanitize_inaccessible_names(goal: Goal) -> Goal:
@@ -105,8 +166,16 @@ class PantographExecutor(TacticExecutor):
             On a Lean-side error (the tactic doesn't apply), returns
             ``TacticOutcome(success=False, error=...)``.
         """
-        arguments = " ".join(arg.rstrip(":") for arg in tactic.arguments)
-        tactic_cmd = " ".join([tactic.tactic_name, arguments]).strip()
+        tactic_cmd = render_tactic_command(tactic)
+        if tactic_cmd is None:
+            return TacticOutcome(
+                success=False,
+                subgoals=[],
+                error=(
+                    f"{tactic.tactic_name} requires a bracketed rule list and none of "
+                    f"its sampled arguments {tactic.arguments} is a usable name"
+                ),
+            )
 
         try:
             new_state = await server.goal_tactic_async(state, tactic_cmd)
@@ -156,10 +225,13 @@ class HybridReasoner:
         dts_c: float = None,
         dts_random_seed: Optional[int] = None,
         use_pln: bool = True,
-        server_kwargs: dict | None = None,
+        env: PantographEnv | None = None,
     ) -> None:
         self.use_pln = use_pln
-        self._server_kwargs = server_kwargs or {}
+        # The environment the server runs in, kept so a post-crash restart lands in
+        # the SAME environment the initial server was started in. An all-default
+        # PantographEnv reproduces a bare `Server.create()`.
+        self._env = env or PantographEnv()
         self.gnn_engine = self._build_gnn_engine(
             config_path=config_path,
             tactic_model_path=tactic_model_path,
@@ -397,20 +469,26 @@ class HybridReasoner:
         return graph
 
     async def _restart_server(self) -> None:
-        """Close the current pantograph subprocess and spawn a fresh one.
+        """Reap the current pantograph subprocess and spawn a fresh one.
 
-        Called when goal_start_async or goal_tactic_async raises a
-        broken-pipe or EOF exception, which means the pantograph-repl
-        process has crashed. Updates self.server and self.executor.server
-        so all subsequent calls go to the new process.
+        Called when a goal or tactic call finds the REPL dead. Lean 4.29.1 panics
+        in ``Meta.Tactic.TryThis.getIndentAndColumn`` while building an
+        "unknown identifier" hint for a name containing multi-byte characters,
+        which hard-kills the process, so a long run has to survive crashes rather
+        than only avoid them.
+
+        Reinstalls the new server on both ``self`` and ``self.executor`` so every
+        subsequent call reaches the live process, and restarts in the same
+        environment the run was configured with.
         """
-        try:
-            await self.server.close()
-        except Exception:
-            pass
-        self.server = await Server.create(**self._server_kwargs)
+        self.server._close()
+        elapsed = perf_counter()
+        self.server = await self._env.create_server()
         self.executor.server = self.server
-        console_print("  [Server] pantograph restarted after crash")
+        console_print(
+            f"  [Server] pantograph restarted after crash "
+            f"in {perf_counter() - elapsed:.1f}s ({self._env.describe()})"
+        )
 
     async def _start_state(self, goal: Goal) -> GoalState:
         """Reconstruct a Lean goal state for ``goal``, including its local
@@ -430,16 +508,32 @@ class HybridReasoner:
             expression = f"∀ ({hypothesis}), {expression}"
 
         try:
-            state = await self.server.goal_start_async(expression)
-            if goal.hypotheses:
-                names = " ".join(hypothesis.split(":", 1)[0].strip() for hypothesis in goal.hypotheses)
-                state = await self.server.goal_tactic_async(state, f"intro {names}")
+            return await self._goal_state_for(expression, goal)
         except (BrokenPipeError, ConnectionResetError, EOFError):
+            # The pipe itself broke on the write side.
             await self._restart_server()
-            state = await self.server.goal_start_async(expression)
-            if goal.hypotheses:
-                names = " ".join(hypothesis.split(":", 1)[0].strip() for hypothesis in goal.hypotheses)
-                state = await self.server.goal_tactic_async(state, f"intro {names}")
+        except AssertionError:
+            # `run_async` asserts `self.proc` — raised by every call made after an
+            # earlier failure already reaped the subprocess.
+            await self._restart_server()
+        except ServerError:
+            # A ServerError means either a dead REPL (the decode of an empty read
+            # failed, and `run_async` closed the process before raising) or a live
+            # server rejecting this goal — an elaboration or parse error. Only the
+            # first is worth a restart; re-raising the second lets `_expand` mark
+            # the node exhausted and move on.
+            if not _server_is_dead(self.server):
+                raise
+            await self._restart_server()
+
+        return await self._goal_state_for(expression, goal)
+
+    async def _goal_state_for(self, expression: str, goal: Goal) -> GoalState:
+        """Start ``expression`` and re-``intro`` ``goal``'s hypotheses."""
+        state = await self.server.goal_start_async(expression)
+        if goal.hypotheses:
+            names = " ".join(hypothesis.split(":", 1)[0].strip() for hypothesis in goal.hypotheses)
+            state = await self.server.goal_tactic_async(state, f"intro {names}")
         return state
 
     def _link(
@@ -570,18 +664,23 @@ async def main(
     top_k_subgoals: int = 3,
 
 ) -> None:
-    # Use Mathlib project if available
+    # Use the Mathlib project if one exists, so the server can elaborate goals
+    # that mention Mathlib notation and lemmas. Falling back to a bare environment
+    # keeps core-only runs working.
+    env = PantographEnv()
     mathlib_project = settings.root_dir / "lean_mathlib"
-    server_kwargs = {}
     if (mathlib_project / "lakefile.lean").exists():
-        server_kwargs["project_path"] = str(mathlib_project)
-        server_kwargs["imports"] = ["Init", "Mathlib"]
+        env = PantographEnv(
+            source_root=mathlib_project,
+            imports=("Init", "Mathlib"),
+        )
         console_print(f"  Using Mathlib project: {mathlib_project}")
     else:
         console_print("  No Mathlib project found. Only core Lean theorems supported.")
         console_print(f"  To enable Mathlib: cd {mathlib_project} && lake update && lake build")
-    
-    server = await Server.create(**server_kwargs)
+    env.verify()
+
+    server = await env.create_server()
     
     # Auto-load DTS state from default location if not specified
     if dts_state_input is None and settings.dts_state_file.exists():

@@ -5,6 +5,11 @@
   "device": "auto",
   "seed": 42,
 
+  "source_root": null,
+  "pantograph_repl": null,
+  "pantograph_imports": null,
+  "server_timeout_s": 120,
+
   "data_source": "dataset",
   "theorem_file": null,
   "leandojo_split": "train",
@@ -26,6 +31,7 @@
   "theorem_timeout_s": 120.0,
   "checkpoint_every": 20,
   "eval_every": 25,
+  "max_dead_rounds": 3,
 
   "top_k_tactics": 4,
   "top_k_subgoals": 3,

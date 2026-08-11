@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,7 @@ import torch
 from torch.optim import AdamW
 
 from maths_ai.data_models.proof_components import Goal
+from maths_ai.hybrid_reasoner.pantograph_env import PantographEnv
 
 from .actor_critic import ActorCriticWithArgsClassifier
 from .dataset import iter_dataset_rows
@@ -80,6 +82,10 @@ class RLTrainingConfig:
     theorem_timeout_s: float = 120.0
     checkpoint_every: int = 20
     eval_every: int = 25
+    # Stop the run when this many consecutive rounds harvest no transitions. A loop
+    # that collects nothing is misconfigured — most often a Lean environment that
+    # cannot elaborate the pool — and annealing quietly for hours hides it.
+    max_dead_rounds: int = 3
 
     # Search budgets (RLHybridReasoner).
     top_k_tactics: int = 4
@@ -114,7 +120,18 @@ class RLTrainingConfig:
     run_root: Path = Path("runs/rl_actor_critic")
     device: str = "auto"
 
-    _PATH_FIELDS = ("warmstart_checkpoint", "prepared_root", "theorem_file", "run_root")
+    # Lean environment the Pantograph server runs in. `source_root` is the Lake
+    # project whose compiled artifacts the REPL should see; leaving it None starts a
+    # core-Lean server that cannot elaborate Mathlib notation such as `ℕ` or `⌊…⌋₊`.
+    source_root: Path | None = None
+    pantograph_repl: Path | None = None
+    pantograph_imports: list[str] | None = None  # None → resolved from source_root
+    server_timeout_s: int = 120
+
+    _PATH_FIELDS = (
+        "warmstart_checkpoint", "prepared_root", "theorem_file", "run_root",
+        "source_root", "pantograph_repl",
+    )
 
     @classmethod
     def from_json(cls, path: str | Path) -> "RLTrainingConfig":
@@ -138,6 +155,38 @@ class RLTrainingConfig:
 
 
 # ---------------------------------------------------------------------------
+# Lean environment
+# ---------------------------------------------------------------------------
+
+
+def pantograph_env(cfg: RLTrainingConfig) -> PantographEnv:
+    """Resolve the config's Lean-environment fields into one ``PantographEnv``.
+
+    Both the training loop and the standalone evaluation path call this, so the
+    server they start and the server a post-crash restart re-starts are described
+    by the same value.
+
+    ``imports`` defaults by ``source_root``: a run pointed at a Mathlib project
+    wants ``Mathlib`` on the import line, and a run with no project cannot have it
+    — importing a module outside ``LEAN_PATH`` makes the REPL fail at startup
+    rather than degrade. ``pantograph_imports`` overrides the default when a
+    project exports a different top-level module.
+    """
+    if cfg.pantograph_imports is not None:
+        imports = tuple(cfg.pantograph_imports)
+    elif cfg.source_root is not None:
+        imports = ("Init", "Mathlib")
+    else:
+        imports = ("Init",)
+    return PantographEnv(
+        source_root=cfg.source_root,
+        pantograph_repl=cfg.pantograph_repl,
+        imports=imports,
+        timeout=cfg.server_timeout_s,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Theorem pool + curriculum
 # ---------------------------------------------------------------------------
 
@@ -147,6 +196,20 @@ class TheoremItem:
     goal: Goal
     tactic_label: str  # ground-truth tactic from the dataset row ("" in file mode)
     size: int
+
+
+# `?m.4519` is Lean's pretty-printed form of an unassigned metavariable — a hole the
+# elaborator had not yet solved when the dataset row was captured mid-proof. Such a
+# state is not a theorem statement: `goal_start` has no assignment to give the hole,
+# so it fails to elaborate and the rollout is wasted before its first tactic.
+_METAVARIABLE_RE = re.compile(r"\?m\.\d+|\?[a-zA-Z_][a-zA-Z0-9_]*\b")
+
+
+def _has_metavariable(goal: Goal) -> bool:
+    """True when the goal or any hypothesis mentions an unassigned metavariable."""
+    if _METAVARIABLE_RE.search(goal.expression):
+        return True
+    return any(_METAVARIABLE_RE.search(hypothesis) for hypothesis in goal.hypotheses)
 
 
 def _row_state_to_goal(state_str: str) -> Goal:
@@ -212,6 +275,9 @@ def build_theorem_pool(cfg: RLTrainingConfig) -> TheoremPool:
                 if size > cfg.max_state_chars:
                     dropped += 1
                     continue
+                if _has_metavariable(goal):
+                    dropped += 1
+                    continue
                 items.append(TheoremItem(goal=goal, tactic_label=row.get("tactic", ""), size=size))
                 if len(items) >= cfg.max_pool_size:
                     break
@@ -227,6 +293,9 @@ def build_theorem_pool(cfg: RLTrainingConfig) -> TheoremPool:
                 dropped += 1
                 continue
             if not goal.expression:
+                dropped += 1
+                continue
+            if _has_metavariable(goal):
                 dropped += 1
                 continue
             items.append(TheoremItem(goal=goal, tactic_label=row.tactic or "", size=len(state_str)))
@@ -251,7 +320,14 @@ def build_theorem_pool(cfg: RLTrainingConfig) -> TheoremPool:
 
 def bc_weight_at_round(round_idx: int, cfg: RLTrainingConfig) -> float:
     """Linear anneal from ``bc_anneal_start`` to ``bc_anneal_end`` over
-    ``bc_anneal_rounds``; constant at the end value afterwards."""
+    ``bc_anneal_rounds``; constant at the end value afterwards.
+
+    ``round_idx`` counts rounds that produced an optimizer step, not loop
+    iterations. The anneal exists to hand control from the supervised anchor to
+    the policy gradient as the policy improves, and a round that collected no
+    transitions took no step, so the policy did not change and the anchor must
+    not be weakened for it.
+    """
     if cfg.bc_anneal_rounds <= 0 or round_idx >= cfg.bc_anneal_rounds:
         return cfg.bc_anneal_end
     t = round_idx / cfg.bc_anneal_rounds
@@ -315,6 +391,8 @@ def save_checkpoint(
     curriculum_size: int,
     best_proof_rate: float,
     path: Path,
+    *,
+    anneal_rounds_done: int = 0,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -324,6 +402,9 @@ def save_checkpoint(
             "round": round_idx,
             "curriculum_size": curriculum_size,
             "best_proof_rate": best_proof_rate,
+            # The BC-anneal clock counts optimizer steps, not loop iterations, so it
+            # cannot be recomputed from `round` on resume.
+            "anneal_rounds_done": anneal_rounds_done,
             "torch_rng_state": torch.get_rng_state(),
         },
         path,
@@ -435,6 +516,7 @@ async def run_rl_training(
     start_round = 0
     best_proof_rate = -1.0
     curriculum_size_override: Optional[int] = None
+    anneal_rounds_done = 0  # rounds with an optimizer step; the BC-anneal clock
     if resume_run_dir is not None:
         run_dir = Path(resume_run_dir)
         last_path = run_dir / "last.pt"
@@ -447,6 +529,7 @@ async def run_rl_training(
         start_round = int(state["round"]) + 1
         best_proof_rate = float(state.get("best_proof_rate", -1.0))
         curriculum_size_override = int(state.get("curriculum_size", 0)) or None
+        anneal_rounds_done = int(state.get("anneal_rounds_done", 0)) or 0
         console_print(f"Resumed {run_dir} at round {start_round} (best proof rate {best_proof_rate:.3f})")
     else:
         run_dir = _create_run_dir(cfg.run_root)
@@ -460,12 +543,12 @@ async def run_rl_training(
 
     # Reasoner (live Pantograph unless a factory is injected).
     if reasoner_factory is None:
-        from pantograph.server import Server
-
         from maths_ai.hybrid_reasoner.joint_inference import PantographExecutor
 
-        server = await Server.create()
-        server_kwargs = {}  # extend with project_path/imports if Mathlib is needed
+        env = pantograph_env(cfg)
+        env.verify()
+        console_print(f"Pantograph environment: {env.describe()}")
+        server = await env.create_server()
         executor = PantographExecutor(server)
         reasoner = RLHybridReasoner(
             model=model,
@@ -478,7 +561,7 @@ async def run_rl_training(
             max_depth=cfg.max_depth,
             max_nodes=cfg.max_nodes,
             use_pln=cfg.use_pln,
-            server_kwargs=server_kwargs,
+            env=env,
         )
     else:
         reasoner = reasoner_factory(model, node_vocab, tactic_vocab, cfg)
@@ -502,6 +585,7 @@ async def run_rl_training(
 
     recent_solve_rates: list[float] = []
     last_metrics: dict[str, float] = {}
+    dead_rounds = 0  # consecutive rounds that harvested no transitions
 
     for round_idx in range(start_round, cfg.num_rounds):
         round_start = time.time()
@@ -514,7 +598,23 @@ async def run_rl_training(
             reasoner, batch, timeout_s=cfg.theorem_timeout_s
         )
 
-        bc_weight = bc_weight_at_round(round_idx, cfg)
+        # A round that collects nothing took no optimizer step, so it must not
+        # weaken the BC anchor (Issue 4) — and enough of them in a row means the
+        # Lean environment cannot elaborate the pool at all, in which case the
+        # run is looping on a misconfiguration. Stop loudly instead of annealing
+        # quietly for hours.
+        dead_rounds = dead_rounds + 1 if not results else 0
+        if dead_rounds >= cfg.max_dead_rounds:
+            raise RuntimeError(
+                f"Round {round_idx}: {dead_rounds} consecutive rounds produced no "
+                f"transitions ({collect_stats['searches_failed']:.0f} searches "
+                f"failed). Check that --source-root points at the compiled "
+                f"mathlib_lean project and that the toolchains match."
+            )
+
+        # Indexed by optimizer steps taken, not loop iterations: a dead round leaves
+        # the policy unchanged, so the anchor it needs is unchanged too.
+        bc_weight = bc_weight_at_round(anneal_rounds_done, cfg)
         if results:
             # Exactly ONE optimizer step per collect round (on-policy invariant).
             metrics = train_step_onpolicy(
@@ -530,6 +630,7 @@ async def run_rl_training(
                 arg_loss_weight=cfg.arg_loss_weight,
                 bc_weight=bc_weight,
             )
+            anneal_rounds_done += 1
         else:
             metrics = {"num_transitions": 0.0, "num_failures": 0.0}
 
@@ -551,6 +652,7 @@ async def run_rl_training(
         row = {
             "round": round_idx,
             "bc_weight": bc_weight,
+            "anneal_rounds_done": anneal_rounds_done,
             "curriculum_size": pool.curriculum_size,
             "wall_clock_s": time.time() - round_start,
             **collect_stats,
@@ -558,9 +660,16 @@ async def run_rl_training(
         }
         with open(metrics_path, "a") as f:
             f.write(json.dumps(row) + "\n")
+        # Two distinct failure counts, both on the line (Issue 3): `rej` counts
+        # tactics the executor refused inside searches that ran, `err` counts whole
+        # searches that raised or timed out and contributed no transitions. A run
+        # whose environment is broken shows rej 0 with err equal to the batch size,
+        # which the old line rendered as `fail 0`.
         console_print(
             f"Round {round_idx}: solved {collect_stats['solved']:.0f}/{collect_stats['attempted']:.0f}, "
-            f"trans {metrics.get('num_transitions', 0):.0f}, fail {metrics.get('num_failures', 0):.0f}, "
+            f"trans {metrics.get('num_transitions', 0):.0f}, "
+            f"rej {metrics.get('num_failures', 0):.0f}, "
+            f"err {collect_stats['searches_failed']:.0f}, "
             f"return {metrics.get('mean_return', 0.0):.3f}, loss {metrics.get('total_loss', 0.0):.3f}, "
             f"bc {bc_weight:.3f}, {row['wall_clock_s']:.1f}s"
         )
@@ -569,7 +678,7 @@ async def run_rl_training(
         if (round_idx + 1) % cfg.checkpoint_every == 0:
             save_checkpoint(
                 model, optimizer, round_idx, pool.curriculum_size, best_proof_rate,
-                run_dir / "last.pt",
+                run_dir / "last.pt", anneal_rounds_done=anneal_rounds_done,
             )
 
         if cfg.eval_every > 0 and (round_idx + 1) % cfg.eval_every == 0 and pool.eval_items:
@@ -583,14 +692,14 @@ async def run_rl_training(
                 best_proof_rate = eval_stats["proof_rate"]
                 save_checkpoint(
                     model, optimizer, round_idx, pool.curriculum_size, best_proof_rate,
-                    run_dir / "best.pt",
+                    run_dir / "best.pt", anneal_rounds_done=anneal_rounds_done,
                 )
                 console_print(f"  New best proof rate {best_proof_rate:.3f} → best.pt")
 
     # Final checkpoint so the run is always resumable from its end state.
     save_checkpoint(
         model, optimizer, cfg.num_rounds - 1, pool.curriculum_size, best_proof_rate,
-        run_dir / "last.pt",
+        run_dir / "last.pt", anneal_rounds_done=anneal_rounds_done,
     )
     return last_metrics
 
@@ -609,9 +718,30 @@ def driver_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--eval-only", action="store_true", help="Only run the greedy proof-rate evaluation")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Checkpoint override for --eval-only (defaults to warmstart_checkpoint)")
+    parser.add_argument("--source-root", type=str, default=None,
+                        help="Lake project root whose compiled .olean artifacts the Pantograph "
+                             "REPL should see. Without it the REPL runs on core Lean only and "
+                             "cannot elaborate Mathlib notation such as ℕ.")
+    parser.add_argument("--pantograph-repl", type=str, default=None,
+                        help="Pantograph REPL binary to run instead of the bundled one. Its Lean "
+                             "toolchain must match --source-root's.")
+    parser.add_argument("--pantograph-imports", type=str, default=None,
+                        help="Comma-separated modules the server imports at startup "
+                             "(default: Init,Mathlib when --source-root is set, else Init)")
+    parser.add_argument("--server-timeout", type=int, default=None,
+                        help="Per-request Pantograph timeout in seconds")
     args = parser.parse_args(argv)
 
     cfg = RLTrainingConfig.from_json(args.config)
+    # Applied only when given, so a flag never overwrites a configured value with a default.
+    if args.source_root:
+        cfg.source_root = Path(args.source_root)
+    if args.pantograph_repl:
+        cfg.pantograph_repl = Path(args.pantograph_repl)
+    if args.pantograph_imports:
+        cfg.pantograph_imports = [m.strip() for m in args.pantograph_imports.split(",") if m.strip()]
+    if args.server_timeout is not None:
+        cfg.server_timeout_s = args.server_timeout
     if args.eval_only:
         if args.checkpoint:
             cfg.warmstart_checkpoint = Path(args.checkpoint)
@@ -619,6 +749,13 @@ def driver_main(argv: list[str] | None = None) -> int:
         cfg.eval_every = 0
 
         async def _eval() -> None:
+            # Verify the Lean environment before the checkpoint load: a wrong
+            # --source-root then fails in under a second rather than after several
+            # minutes of model construction.
+            env = pantograph_env(cfg)
+            env.verify()
+            console_print(f"Pantograph environment: {env.describe()}")
+
             device = _resolve_device(cfg.device)
             node_vocab, tactic_vocab = _load_vocabs(cfg.prepared_root)
             model = ActorCriticWithArgsClassifier(
@@ -633,18 +770,15 @@ def driver_main(argv: list[str] | None = None) -> int:
             checkpoint = torch.load(cfg.warmstart_checkpoint, map_location=device, weights_only=False)
             model.load_state_dict(checkpoint.get("model_state_dict", checkpoint), strict=True)
 
-            from pantograph.server import Server
-
             from maths_ai.hybrid_reasoner.joint_inference import PantographExecutor
 
-            server = await Server.create()
-            server_kwargs = {}  # extend with project_path/imports if Mathlib is needed
+            server = await env.create_server()
             reasoner = RLHybridReasoner(
                 model=model, node_vocab=node_vocab, tactic_vocab=tactic_vocab,
                 executor=PantographExecutor(server), device=device,
                 top_k_tactics=cfg.top_k_tactics, top_k_subgoals=cfg.top_k_subgoals,
                 max_depth=cfg.max_depth, max_nodes=cfg.max_nodes,
-                server_kwargs=server_kwargs,
+                env=env,
             )
             pool = build_theorem_pool(cfg)
             stats = await evaluate_proof_rate(reasoner, pool.eval_items, timeout_s=cfg.theorem_timeout_s)

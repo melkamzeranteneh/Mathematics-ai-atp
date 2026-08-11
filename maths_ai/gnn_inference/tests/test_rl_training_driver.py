@@ -26,6 +26,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.rl_training_driver import (
     build_theorem_pool,
     collect_round,
     evaluate_proof_rate,
+    pantograph_env,
     run_rl_training,
     save_checkpoint,
 )
@@ -84,6 +85,31 @@ class _RaisingReasoner:
         self._calls += 1
         if idx in self._raise_on:
             raise RuntimeError("simulated Lean transport failure")
+        return await self._inner.prove(goal, hypotheses=hypotheses, greedy=greedy)
+
+
+class _DeadServerReasoner:
+    """prove() raises on every call except a listed set of call indices.
+
+    Reproduces the failure the log snippet recorded: `goal_start_async` raised for
+    every theorem, so `collect_round` returned no results at all and there was
+    nothing to take a gradient step on. Distinct from `_RejectExecutor`, whose
+    searches DO complete — their rejections are failure records, which are
+    training signal.
+    """
+
+    def __init__(self, inner, *, succeed_on: set[int] | None = None):
+        self._inner = inner
+        self._succeed_on = succeed_on or set()
+        self._calls = 0
+        self.model = inner.model
+        self.dag_featurize_data = inner.dag_featurize_data
+
+    async def prove(self, goal, *, hypotheses=None, greedy=False):
+        idx = self._calls
+        self._calls += 1
+        if idx not in self._succeed_on:
+            raise RuntimeError("Unknown identifier ℕ")  # what a core-only REPL says
         return await self._inner.prove(goal, hypotheses=hypotheses, greedy=greedy)
 
 
@@ -182,6 +208,20 @@ def _reject_factory(model, node_vocab, tactic_vocab, cfg):
     return _make_reasoner(model, node_vocab, _RejectExecutor(), top_k=cfg.top_k_tactics)
 
 
+def _dead_server_factory(succeed_on: set[int] | None = None):
+    """Reasoner factory whose searches all raise, except on listed call indices.
+
+    `theorems_per_round` prove calls make up one round, so call indices
+    {2n, 2n+1} are round n when `theorems_per_round=2`.
+    """
+
+    def factory(model, node_vocab, tactic_vocab, cfg):
+        inner = _make_reasoner(model, node_vocab, _QEDExecutor(), top_k=cfg.top_k_tactics)
+        return _DeadServerReasoner(inner, succeed_on=succeed_on)
+
+    return factory
+
+
 class ConfigTests(unittest.TestCase):
     def test_config_json_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -225,6 +265,31 @@ class PoolTests(unittest.TestCase):
             self.assertEqual(total, 2)  # oversized row dropped
             self.assertEqual(pool.train_items[0].goal.expression, "p → p")  # size-sorted
             self.assertEqual(pool.train_items[0].tactic_label, "intro")
+
+    def test_metavariable_rows_are_dropped_from_the_pool(self):
+        """Unassigned holes (?m.4519) cannot be elaborated by goal_start, so a
+        pool row carrying one would fail before its first tactic. It must count
+        as dropped, never as a rollout root."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            theorem_file = tmp / "theorems.jsonl"
+            rows = [
+                {"goal": "p → p", "hypotheses": ["p : Prop"], "tactic": "intro"},
+                {"goal": "?m.4519 = ?m.4519", "hypotheses": []},  # hole in the target
+                {"goal": "p → p", "hypotheses": ["h : ?m.2235"], "tactic": "intro"},  # hole in a hyp
+                {"goal": "q ∨ p", "hypotheses": ["p : Prop", "q : Prop", "h : p ∨ q"]},
+            ]
+            with open(theorem_file, "w") as f:
+                for r in rows:
+                    f.write(json.dumps(r) + "\n")
+            cfg = _write_config(
+                tmp, data_source="file", theorem_file=theorem_file,
+                max_state_chars=400, eval_pool_size=0,
+            )
+            pool = build_theorem_pool(cfg)
+            total = len(pool.train_items) + len(pool.eval_items)
+            self.assertEqual(total, 2)  # both metavariable rows dropped
+            self.assertEqual(pool.train_items[0].goal.expression, "p → p")  # size-sorted
 
     def test_curriculum_window_and_growth(self):
         pool = _pool(n_items=10)
@@ -361,6 +426,129 @@ class EvalTests(unittest.TestCase):
             # written once (first eval), but records rate 0.
             state = torch.load(run_dir / "best.pt", weights_only=False)
             self.assertEqual(state["best_proof_rate"], 0.0)
+
+
+class DeadRoundTests(unittest.TestCase):
+    """Issue 4: rounds that collect no transitions (every search raised — a
+    broken environment) must not weaken the BC anchor, and enough of them in a
+    row means the run is looping on a misconfiguration, not slowly improving."""
+
+    def test_all_dead_rounds_keep_the_anchor_fully_weighted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, num_rounds=2, bc_anneal_rounds=10)
+            torch.manual_seed(0)
+            asyncio.run(run_rl_training(cfg, reasoner_factory=_dead_server_factory(), pool=_pool()))
+            run_dir = next((tmp / "runs").iterdir())
+            rows = [json.loads(l) for l in (run_dir / "metrics.jsonl").read_text().splitlines()]
+            self.assertEqual([r["bc_weight"] for r in rows], [0.5, 0.5])
+            self.assertEqual([r["anneal_rounds_done"] for r in rows], [0, 0])
+
+    def test_gradient_rounds_advance_the_anneal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, num_rounds=2, bc_anneal_rounds=10)
+            torch.manual_seed(0)
+            asyncio.run(run_rl_training(cfg, reasoner_factory=_qed_factory, pool=_pool()))
+            run_dir = next((tmp / "runs").iterdir())
+            rows = [json.loads(l) for l in (run_dir / "metrics.jsonl").read_text().splitlines()]
+            self.assertEqual([r["anneal_rounds_done"] for r in rows], [1, 2])
+            self.assertLess(rows[1]["bc_weight"], rows[0]["bc_weight"])
+
+    def test_consecutive_dead_rounds_halt_with_a_named_error(self):
+        """max_dead_rounds reached ⇒ RuntimeError naming the environment, not a
+        silent forever-loop of zero-transition rounds."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, num_rounds=50, max_dead_rounds=3)
+            with self.assertRaisesRegex(RuntimeError, "source-root"):
+                asyncio.run(run_rl_training(cfg, reasoner_factory=_dead_server_factory(), pool=_pool()))
+
+    def test_interleaved_gradient_round_resets_the_dead_counter(self):
+        """One successful round between dead ones must restart the countdown."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, num_rounds=6, max_dead_rounds=3)
+            torch.manual_seed(0)
+            # Rounds 0-1 dead, round 2 gradient (counter resets), rounds 3-4 dead,
+            # round 5 gradient — never three in a row, so the run completes.
+            factory = _dead_server_factory(succeed_on={4, 5, 10, 11})
+            asyncio.run(run_rl_training(cfg, reasoner_factory=factory, pool=_pool()))
+            run_dir = next((tmp / "runs").iterdir())
+            rows = [json.loads(l) for l in (run_dir / "metrics.jsonl").read_text().splitlines()]
+            # Which rounds took a gradient step, not how many transitions each
+            # harvested — the count depends on the sampler, the gating does not.
+            self.assertEqual(
+                [r["num_transitions"] > 0 for r in rows],
+                [False, False, True, False, False, True],
+            )
+            self.assertEqual([r["anneal_rounds_done"] for r in rows], [0, 0, 1, 1, 1, 2])
+
+    def test_round_line_reports_both_failure_counts(self):
+        """Issue 3: the round line must print both `rej` (tactics refused inside
+        a search that ran) and `err` (whole searches that raised or timed out).
+        The old line printed only the former, rendering a broken environment as
+        `fail 0` while eight theorems silently failed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, num_rounds=1, bc_anneal_rounds=10)
+            torch.manual_seed(0)
+            asyncio.run(run_rl_training(cfg, reasoner_factory=_reject_factory, pool=_pool()))
+            run_dir = next((tmp / "runs").iterdir())
+            rows = [json.loads(l) for l in (run_dir / "metrics.jsonl").read_text().splitlines()]
+            # `num_failures` counts rejections inside searches; `searches_failed`
+            # counts whole searches that raised. Both must be present in metrics.
+            self.assertIn("num_failures", rows[0])
+            self.assertIn("searches_failed", rows[0])
+            self.assertEqual(rows[0]["searches_failed"], 0.0)
+
+
+class PantographEnvResolverTests(unittest.TestCase):
+    """Issue 1: the config's Lean-environment fields resolve to one value the
+    initial server and every post-crash restart both use."""
+
+    def test_no_source_root_gives_core_lean_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _write_config(Path(tmp))
+            env = pantograph_env(cfg)
+            self.assertIsNone(env.source_root)
+            self.assertEqual(env.imports, ("Init",))
+
+    def test_source_root_adds_mathlib_to_the_import_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, source_root=tmp / "mathlib")
+            env = pantograph_env(cfg)
+            self.assertEqual(env.source_root, tmp / "mathlib")
+            self.assertEqual(env.imports, ("Init", "Mathlib"))
+
+    def test_explicit_imports_override_the_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(
+                tmp, source_root=tmp / "proj", pantograph_imports=["Init", "MyProject"]
+            )
+            self.assertEqual(pantograph_env(cfg).imports, ("Init", "MyProject"))
+
+    def test_repl_and_timeout_are_carried_through(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, pantograph_repl=tmp / "repl", server_timeout_s=300)
+            env = pantograph_env(cfg)
+            self.assertEqual(env.pantograph_repl, tmp / "repl")
+            self.assertEqual(env.timeout, 300)
+
+    def test_env_fields_survive_config_roundtrip_as_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, source_root=tmp / "mathlib", pantograph_repl=tmp / "repl")
+            path = tmp / "cfg.json"
+            with open(path, "w") as f:
+                json.dump(cfg.to_dict(), f)
+            loaded = RLTrainingConfig.from_json(path)
+            self.assertIsInstance(loaded.source_root, Path)
+            self.assertIsInstance(loaded.pantograph_repl, Path)
+            self.assertEqual(loaded.source_root, tmp / "mathlib")
 
 
 class PLNKillSwitchConfigTests(unittest.TestCase):
