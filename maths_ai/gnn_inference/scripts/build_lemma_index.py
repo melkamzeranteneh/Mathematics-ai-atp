@@ -24,8 +24,9 @@ from maths_ai.gnn_inference.atp_lean_gnn.lemma_corpus import load_lemma_corpus
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import dag_to_pyg
 from maths_ai.gnn_inference.atp_lean_gnn.training import (
     BaselineConfig,
+    PointerConfig,
     build_baseline_model,
-    load_baseline_config,
+    build_pointer_model,
     load_prepared_metadata,
     resolve_device,
     transform_edge_index,
@@ -52,17 +53,26 @@ def _load_config_from_checkpoint(
     checkpoint_path: Path,
     *,
     config_path: Path | None,
-) -> BaselineConfig:
+) -> BaselineConfig | PointerConfig:
     if config_path is not None:
-        return load_baseline_config(config_path)
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        if "max_args" in payload or payload.get("model_type") == "pointer":
+            return PointerConfig.from_dict(payload)
+        return BaselineConfig.from_dict(payload)
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if "config" in checkpoint:
-        return BaselineConfig.from_dict(checkpoint["config"])
+        payload = checkpoint["config"]
+        if "max_args" in payload or payload.get("model_type") == "pointer":
+            return PointerConfig.from_dict(payload)
+        return BaselineConfig.from_dict(payload)
 
     candidate = checkpoint_path.parent / "config.json"
     if candidate.exists():
-        return load_baseline_config(candidate)
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+        if "max_args" in payload or payload.get("model_type") == "pointer":
+            return PointerConfig.from_dict(payload)
+        return BaselineConfig.from_dict(payload)
 
     raise FileNotFoundError(
         "Unable to infer model config. Provide --config or place config.json next to the checkpoint."
@@ -113,9 +123,14 @@ def build_index(
     config = _load_config_from_checkpoint(checkpoint_path, config_path=config_path)
     device = resolve_device(device_name)
 
-    model = build_baseline_model(metadata, config).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    if isinstance(config, PointerConfig):
+        pointer_model = build_pointer_model(metadata, config).to(device)
+        pointer_model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        model = pointer_model.backbone
+    else:
+        model = build_baseline_model(metadata, config).to(device)
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.eval()
 
     records = load_lemma_corpus(corpus_path)

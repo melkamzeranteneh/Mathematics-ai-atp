@@ -32,6 +32,7 @@ from maths_ai.gnn_inference.scripts.run_training import (
 )
 from maths_ai.gnn_inference.atp_lean_gnn.training import GraphBudgetBatchSampler, build_baseline_model
 from maths_ai.gnn_inference.scripts.pack_prepared_dataset import pack_prepared_dataset
+from maths_ai.gnn_inference.scripts.build_lemma_index import _load_config_from_checkpoint
 
 
 class GraphBudgetBatchSamplerTests(unittest.TestCase):
@@ -401,6 +402,25 @@ class TrainingPipelineTests(unittest.TestCase):
 
         with self.assertRaises(ValueError, msg="same epoch target must not silently no-op"):
             train_baseline(resumed_config, resume_run_dir=run_dir)
+
+    def test_lemma_index_detects_pointer_config(self) -> None:
+        config_path = self.run_root / "pointer_config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({
+            "model_type": "pointer",
+            "prepared_root": str(self.prepared_root),
+            "run_root": str(self.run_root),
+            "device": "cpu",
+            "gnn_type": "sage",
+            "max_args": 3,
+            "model": {"hidden_dim": 16, "num_layers": 2, "dropout": 0.1},
+            "training": {"batch_size": 2, "epochs": 1},
+        }), encoding="utf-8")
+        loaded = _load_config_from_checkpoint(
+            self.run_root / "unused.pt", config_path=config_path
+        )
+        self.assertEqual(loaded.__class__.__name__, "PointerConfig")
+        self.assertEqual(loaded.max_args, 3)
 
     def test_pipeline_parser_exposes_pointer_and_scorer_budgets(self) -> None:
         args = build_pipeline_parser().parse_args([
