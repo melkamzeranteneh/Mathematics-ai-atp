@@ -32,18 +32,35 @@ def _reset_output_root(root: Path, *, force: bool) -> Path:
     return root
 
 
-def prepare_output_root(output_root: str | Path, *, splits: list[str], force: bool) -> Path:
+def prepare_output_root(
+    output_root: str | Path,
+    *,
+    splits: list[str],
+    force: bool,
+    resume: bool = False,
+    write_json_artifacts: bool = True,
+) -> Path:
     root = Path(output_root)
-    _reset_output_root(root, force=force)
+    if force and resume:
+        raise ValueError("force and resume cannot both be enabled.")
+    if resume:
+        root.mkdir(parents=True, exist_ok=True)
+    else:
+        _reset_output_root(root, force=force)
 
     for split in splits:
-        (root / split / "json").mkdir(parents=True, exist_ok=True)
+        if write_json_artifacts:
+            (root / split / "json").mkdir(parents=True, exist_ok=True)
         (root / split / "pyg").mkdir(parents=True, exist_ok=True)
 
     for dirname in ("failures", "manifests", "reports", "vocab"):
         (root / dirname).mkdir(parents=True, exist_ok=True)
     for split in splits:
-        (root / "failures" / f"{split}.jsonl").touch()
+        failure_log = root / "failures" / f"{split}.jsonl"
+        if resume:
+            failure_log.write_text("", encoding="utf-8")
+        else:
+            failure_log.touch()
 
     return root
 
@@ -91,7 +108,16 @@ def write_pyg_artifact(output_root: str | Path, *, split: str, row_index: int, d
     root = Path(output_root)
     path = root / split / "pyg" / f"{example_stem(row_index)}.pt"
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(data, path)
+    temporary = path.with_suffix(".pt.tmp")
+    try:
+        torch.save(data, temporary)
+        temporary.replace(path)
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -285,6 +311,22 @@ class SplitReport:
         self.node_counts.append(dag.num_nodes)
         self.edge_counts.append(dag.num_edges)
         self.reused_node_counts.append(len(dag.reused_nodes()))
+        self.tactic_counts[tactic_name] += 1
+
+    def record_cached_success(
+        self,
+        *,
+        node_count: int,
+        edge_count: int,
+        tactic_name: str,
+        reused_node_count: int = 0,
+    ) -> None:
+        """Record a validated artifact reused by resumable preprocessing."""
+        self.attempted_count += 1
+        self.success_count += 1
+        self.node_counts.append(node_count)
+        self.edge_counts.append(edge_count)
+        self.reused_node_counts.append(reused_node_count)
         self.tactic_counts[tactic_name] += 1
 
     def record_failure(

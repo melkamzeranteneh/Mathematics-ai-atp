@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,7 +35,7 @@ from .preparation import (
     SExprCache,
 )
 from .pilot_sampling import load_selection_manifest, selected_row_indices
-from .labels import build_tactic_vocab, encode_tactic_name
+from .labels import build_tactic_vocab, encode_tactic_name, label_example
 from .lemma_corpus import load_lemma_name_index
 from .pyg import build_vocab_from_labels, dag_to_pyg
 from .reporting import console_print
@@ -51,6 +52,8 @@ class PreprocessConfig:
     sample_per_split: int | None = None
     lemma_corpus_path: Path | None = None
     force: bool = False
+    resume: bool = False
+    write_json_artifacts: bool = True
     use_sexpr: bool = False
     sexpr_cache_root: Path | None = None
     sexpr_variant: str = "raw"
@@ -303,6 +306,52 @@ def _resolve_arg_lemma_ids(
     return [lemma_name_index.get(token, -1) for token in arg_tokens]
 
 
+def _load_resumable_artifact(
+    path: Path,
+    *,
+    row: DatasetRow,
+    split: str,
+    node_vocab: dict[str, int],
+    tactic_vocab: dict[str, int],
+):
+    """Load an existing PyG artifact only when it matches this exact run."""
+    import torch
+
+    try:
+        data = torch.load(path, map_location="cpu", weights_only=False)
+        tactic_name = str(label_example(row)["tactic_name"])
+        expected_y = encode_tactic_name(tactic_name, tactic_vocab)
+        if (
+            getattr(data, "dataset_name", None) != row.dataset_name
+            or getattr(data, "split", None) != split
+            or getattr(data, "row_index", None) != row.row_index
+            or getattr(data, "theorem", None) != row.theorem
+            or getattr(data, "tactic_raw", None) != row.tactic
+            or getattr(data, "tactic_name", None) != tactic_name
+            or not hasattr(data, "x")
+            or not hasattr(data, "edge_index")
+            or not hasattr(data, "y")
+            or data.x.numel() == 0
+            or int(data.x.min().item()) < 0
+            or int(data.x.max().item()) >= len(node_vocab)
+            or data.y.numel() != 1
+            or int(data.y.item()) != expected_y
+            or data.edge_index.dim() != 2
+            or data.edge_index.size(0) != 2
+        ):
+            return None
+        node_count = int(data.num_nodes)
+        edge_count = int(data.edge_index.size(1))
+        if data.edge_index.numel() and (
+            int(data.edge_index.min().item()) < 0
+            or int(data.edge_index.max().item()) >= node_count
+        ):
+            return None
+        return data, tactic_name
+    except Exception:
+        return None
+
+
 def process_split(
     *,
     dataset_name: str,
@@ -318,6 +367,8 @@ def process_split(
     sexpr_variant: str = "raw",
     selection_manifest: Path | None = None,
     rows: list[DatasetRow] | None = None,
+    resume: bool = False,
+    write_json_artifacts: bool = True,
 ) -> tuple[SplitReport, dict[str, object]]:
     import torch
 
@@ -325,6 +376,7 @@ def process_split(
     from .pyg import build_premise_mask
 
     report = SplitReport(split=split)
+    resumed_artifact_count = 0
 
     if rows is None:
         rows = _load_rows(
@@ -346,6 +398,40 @@ def process_split(
             console_print(
                 f"    {split} artifacts: {position}/{total_rows} rows"
             )
+        pyg_path = (
+            output_root / split / "pyg" / f"{row.row_index:09d}.pt"
+        )
+        json_path = (
+            output_root / split / "json" / f"{row.row_index:09d}.json"
+        )
+        if resume and pyg_path.exists() and (
+            not write_json_artifacts or json_path.exists()
+        ):
+            cached = _load_resumable_artifact(
+                pyg_path,
+                row=row,
+                split=split,
+                node_vocab=node_vocab,
+                tactic_vocab=tactic_vocab,
+            )
+            if cached is not None:
+                data, tactic_name = cached
+                resumed_artifact_count += 1
+                report.record_cached_success(
+                    node_count=int(data.num_nodes),
+                    edge_count=int(data.edge_index.size(1)),
+                    reused_node_count=int(
+                        (
+                            torch.bincount(
+                                data.edge_index[0], minlength=int(data.num_nodes)
+                            )
+                            > 1
+                        ).sum().item()
+                    ),
+                    tactic_name=tactic_name,
+                )
+                continue
+
         try:
             sd = sexpr_map.get(row.row_index)
             example = prepare_example(
@@ -363,18 +449,19 @@ def process_split(
             )
             continue
 
-        json_payload = build_json_payload(
-            row,
-            parsed_state=example.parsed_state,
-            dag=example.dag,
-            tactic_name=example.tactic_name,
-        )
-        write_json_artifact(
-            output_root,
-            split=split,
-            row_index=row.row_index,
-            payload=json_payload,
-        )
+        if write_json_artifacts:
+            json_payload = build_json_payload(
+                row,
+                parsed_state=example.parsed_state,
+                dag=example.dag,
+                tactic_name=example.tactic_name,
+            )
+            write_json_artifact(
+                output_root,
+                split=split,
+                row_index=row.row_index,
+                payload=json_payload,
+            )
 
         dag = example.dag
         tactic_name = example.tactic_name
@@ -434,6 +521,10 @@ def process_split(
         vocab_source="train",
         sample_limit=sample_per_split,
     )
+    manifest["json_artifacts_enabled"] = write_json_artifacts
+    manifest["resume_enabled"] = resume
+    manifest["resumed_artifact_count"] = resumed_artifact_count
+
     if selection_manifest is not None:
         manifest["selection_manifest"] = str(selection_manifest)
     write_manifest(output_root, split=split, manifest=manifest)
@@ -442,9 +533,12 @@ def process_split(
 
 def run_preprocessing(config: PreprocessConfig) -> dict[str, object]:
     output_root = Path(config.output_root)
-    if output_root.exists() and not config.force:
+    if config.force and config.resume:
+        raise ValueError("--force and --resume cannot be combined.")
+    if output_root.exists() and not config.force and not config.resume:
         raise FileExistsError(
-            f"Output root '{output_root}' already exists. Re-run with --force to overwrite it."
+            f"Output root '{output_root}' already exists. "
+            "Re-run with --force to overwrite or --resume to reuse valid PyG artifacts."
         )
 
     sexpr_cache = None
@@ -481,30 +575,71 @@ def run_preprocessing(config: PreprocessConfig) -> dict[str, object]:
             )
         )
 
-    console_print(
-        f"\n  Scanning train split from {config.dataset_name} to build train-only vocabularies..."
-    )
-    node_vocab, tactic_vocab, train_scan = scan_train_split(
-        dataset_name=config.dataset_name,
-        sample_per_split=config.sample_per_split,
-        output_root=config.output_root,
-        sexpr_cache=sexpr_cache,
-        project_path=config.project_path,
-        use_sexpr=config.use_sexpr,
-        sexpr_variant=config.sexpr_variant,
-        selection_manifest=config.selection_manifest,
-        rows=None if selected_rows is None else selected_rows["train"],
-    )
-    console_print(
-        f"  Train scan complete: attempted={train_scan.attempted_count}, "
-        f"success={train_scan.success_count}, failure={train_scan.failure_count}"
-    )
+    existing_node_vocab = output_root / "vocab" / "node_vocab.json"
+    existing_tactic_vocab = output_root / "vocab" / "tactic_vocab.json"
+    if config.resume and existing_node_vocab.exists() and existing_tactic_vocab.exists():
+        console_print("\n  Resume: loading existing train vocabularies...")
+        try:
+            node_vocab = json.loads(existing_node_vocab.read_text(encoding="utf-8"))
+            tactic_vocab = json.loads(
+                existing_tactic_vocab.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Cannot resume with unreadable vocabularies.") from exc
+        for name, vocab in (
+            ("node_vocab.json", node_vocab),
+            ("tactic_vocab.json", tactic_vocab),
+        ):
+            if (
+                not isinstance(vocab, dict)
+                or not vocab
+                or not all(
+                    isinstance(label, str)
+                    and isinstance(index, int)
+                    and index >= 0
+                    for label, index in vocab.items()
+                )
+                or len(set(vocab.values())) != len(vocab)
+            ):
+                raise RuntimeError(
+                    f"Cannot resume with invalid vocabulary: {name}"
+                )
+        console_print(
+            f"  Resume vocabularies: nodes={len(node_vocab)}, "
+            f"tactics={len(tactic_vocab)}"
+        )
+    else:
+        console_print(
+            f"\n  Scanning train split from {config.dataset_name} "
+            "to build train-only vocabularies..."
+        )
+        node_vocab, tactic_vocab, train_scan = scan_train_split(
+            dataset_name=config.dataset_name,
+            sample_per_split=config.sample_per_split,
+            output_root=config.output_root,
+            sexpr_cache=sexpr_cache,
+            project_path=config.project_path,
+            use_sexpr=config.use_sexpr,
+            sexpr_variant=config.sexpr_variant,
+            selection_manifest=config.selection_manifest,
+            rows=None if selected_rows is None else selected_rows["train"],
+        )
+        console_print(
+            f"  Train scan complete: attempted={train_scan.attempted_count}, "
+            f"success={train_scan.success_count}, failure={train_scan.failure_count}"
+        )
 
     lemma_name_index = None
     if config.lemma_corpus_path is not None:
         lemma_name_index = load_lemma_name_index(config.lemma_corpus_path)
 
-    prepare_output_root(output_root, splits=list(config.splits), force=config.force)
+    prepare_output_root(
+        output_root,
+        splits=list(config.splits),
+        force=config.force,
+        resume=config.resume,
+        write_json_artifacts=config.write_json_artifacts,
+    )
     write_vocab(output_root, name="node_vocab.json", vocab=node_vocab)
     write_vocab(output_root, name="tactic_vocab.json", vocab=tactic_vocab)
 
@@ -526,6 +661,8 @@ def run_preprocessing(config: PreprocessConfig) -> dict[str, object]:
             sexpr_variant=config.sexpr_variant,
             selection_manifest=config.selection_manifest,
             rows=None if selected_rows is None else selected_rows[split],
+            resume=config.resume,
+            write_json_artifacts=config.write_json_artifacts,
         )
         split_reports[split] = report
         manifests[split] = manifest
@@ -569,6 +706,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lemma-corpus", type=str, default=None, help="Optional lemma corpus JSONL for library premise labels")
     parser.add_argument("--force", action="store_true", help="Overwrite the output root if it already exists")
     parser.add_argument("--use-sexpr", action="store_true", default=False, help="Use S-expressions from Pantograph (default: False, text parser only for training)")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse validated PyG artifacts already present under --output-root.",
+    )
+    parser.add_argument(
+        "--no-json-artifacts",
+        action="store_false",
+        dest="write_json_artifacts",
+        help="Skip large diagnostic JSON graphs and write training PyG artifacts only.",
+    )
     parser.add_argument("--no-sexpr", action="store_false", dest="use_sexpr", help="Disable S-expressions, use text parser only")
     parser.add_argument("--project-path", type=str, default="maths_ai/lean_mathlib", help="Path to Lean project for Pantograph")
     parser.add_argument("--sexpr-cache-root", type=str, default=None, help="Validated cache root produced by generate_sexprs")
@@ -593,6 +741,8 @@ def main(argv: list[str] | None = None) -> int:
             sample_per_split=args.sample_per_split,
             lemma_corpus_path=None if args.lemma_corpus is None else Path(args.lemma_corpus),
             force=args.force,
+            resume=args.resume,
+            write_json_artifacts=args.write_json_artifacts,
             use_sexpr=args.use_sexpr,
             sexpr_cache_root=None if args.sexpr_cache_root is None else Path(args.sexpr_cache_root),
             project_path=args.project_path,

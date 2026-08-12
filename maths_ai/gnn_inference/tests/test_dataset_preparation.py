@@ -195,6 +195,61 @@ class DatasetPreparationTests(unittest.TestCase):
         self.assertEqual(summary_json["splits_summary"]["train"]["success_count"], 2)
 
     @patch("maths_ai.gnn_inference.atp_lean_gnn.preprocess.iter_dataset_rows")
+    def test_compact_preprocessing_resumes_valid_pyg_artifacts(
+        self, mock_iter_dataset_rows
+    ) -> None:
+        def fake_iter_dataset_rows(
+            *, dataset_name: str, split: str, sample_limit: int | None = None
+        ):
+            rows = [
+                DatasetRow(
+                    state="n : Nat\n|- n = n",
+                    theorem="demo.train",
+                    tactic="simp",
+                    split=split,
+                    row_index=0,
+                    dataset_name=dataset_name,
+                )
+            ]
+            return iter(rows)
+
+        mock_iter_dataset_rows.side_effect = fake_iter_dataset_rows
+        first = run_preprocessing(
+            PreprocessConfig(
+                dataset_name="fake/dataset",
+                splits=("train",),
+                output_root=self.output_root,
+                force=True,
+                write_json_artifacts=False,
+            )
+        )
+        artifact = self.output_root / "train" / "pyg" / "000000000.pt"
+        original_mtime = artifact.stat().st_mtime_ns
+        self.assertFalse((self.output_root / "train" / "json").exists())
+        self.assertEqual(first["overall"]["success_count"], 1)
+
+        second = run_preprocessing(
+            PreprocessConfig(
+                dataset_name="fake/dataset",
+                splits=("train",),
+                output_root=self.output_root,
+                resume=True,
+                write_json_artifacts=False,
+            )
+        )
+        self.assertEqual(artifact.stat().st_mtime_ns, original_mtime)
+        self.assertEqual(second["overall"]["success_count"], 1)
+        manifest = json.loads(
+            (self.output_root / "manifests" / "train.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertFalse(manifest["json_artifacts_enabled"])
+        self.assertTrue(manifest["resume_enabled"])
+        self.assertEqual(manifest["resumed_artifact_count"], 1)
+
+
+    @patch("maths_ai.gnn_inference.atp_lean_gnn.preprocess.iter_dataset_rows")
     def test_cli_refuses_to_overwrite_without_force(self, mock_iter_dataset_rows) -> None:
         mock_iter_dataset_rows.return_value = iter(())
         self.output_root.mkdir(parents=True, exist_ok=True)
