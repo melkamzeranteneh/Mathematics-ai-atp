@@ -25,7 +25,10 @@ from maths_ai.gnn_inference.atp_lean_gnn import (
 from maths_ai.gnn_inference.atp_lean_gnn.cache import SplitReport, prepare_output_root, write_manifest, write_pyg_artifact, write_vocab
 from maths_ai.gnn_inference.atp_lean_gnn.graph import proof_state_to_dag
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import build_vocab_from_labels, dag_to_pyg
-from maths_ai.gnn_inference.scripts.run_training import build_parser as build_pipeline_parser
+from maths_ai.gnn_inference.scripts.run_training import (
+    _apply_cli_override,
+    build_parser as build_pipeline_parser,
+)
 from maths_ai.gnn_inference.atp_lean_gnn.training import build_baseline_model
 from maths_ai.gnn_inference.scripts.pack_prepared_dataset import pack_prepared_dataset
 
@@ -357,6 +360,22 @@ class TrainingPipelineTests(unittest.TestCase):
 
         self.assertEqual(args.resume_run_dir, "runs/example/run_1")
         self.assertEqual(args.epochs, 30)
+
+    def test_pipeline_cli_override_updates_nested_preset_training(self) -> None:
+        config = {
+            "baseline": {
+                "batch_size": 256,
+                "training": {"batch_size": 256, "epochs": 20},
+                "model": {"hidden_dim": 128},
+            }
+        }
+
+        _apply_cli_override(config, "baseline.batch_size", "32")
+        _apply_cli_override(config, "baseline.hidden_dim", "64")
+
+        self.assertEqual(config["baseline"]["batch_size"], 32)
+        self.assertEqual(config["baseline"]["training"]["batch_size"], 32)
+        self.assertEqual(config["baseline"]["model"]["hidden_dim"], 64)
 
 
 if __name__ == "__main__":

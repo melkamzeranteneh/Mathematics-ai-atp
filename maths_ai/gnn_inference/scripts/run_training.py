@@ -646,6 +646,22 @@ def _set_nested(d: dict, key: str, value: Any) -> None:
         d[parts[-1]] = value
 
 
+def _apply_cli_override(config: dict[str, Any], key: str, value: str) -> None:
+    """Apply an inline stage override to its authoritative nested preset too."""
+    _set_nested(config, key, value)
+    parts = key.split(".")
+    if len(parts) != 2:
+        return
+    stage, field = parts
+    stage_config = config.get(stage)
+    if not isinstance(stage_config, dict):
+        return
+    for section in ("model", "training"):
+        nested = stage_config.get(section)
+        if isinstance(nested, dict) and field in nested:
+            _set_nested(config, f"{stage}.{section}.{field}", value)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Unified training pipeline for GNN tactic prediction",
@@ -773,7 +789,7 @@ def main(argv: list[str] | None = None) -> int:
     # Apply nested overrides
     for key, value in vars(args).items():
         if "." in key and value is not None:
-            _set_nested(config, key, value)
+            _apply_cli_override(config, key, value)
 
     if args.resume_run_dir:
         if args.resume:
