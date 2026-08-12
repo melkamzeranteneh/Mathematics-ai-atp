@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from maths_ai.gnn_inference.atp_lean_gnn.premise_pool import CandidatePool
+from maths_ai.gnn_inference.atp_lean_gnn.premise_training import _local_to_global_arg_targets
 from maths_ai.gnn_inference.atp_lean_gnn.premise_scoring import (
     PremiseScorer,
     PremiseScorerConfig,
@@ -39,6 +40,17 @@ def _make_pool(
     )
 
 
+class TestPremiseTargetIndexing(unittest.TestCase):
+    def test_local_targets_are_shifted_for_pointer_loss(self) -> None:
+        class Batch:
+            ptr = torch.tensor([0, 3, 8], dtype=torch.long)
+
+        local = torch.tensor([[1, -1], [2, 4]], dtype=torch.long)
+        shifted = _local_to_global_arg_targets(local, Batch(), torch.device("cpu"))
+        self.assertTrue(torch.equal(shifted, torch.tensor([[1, -1], [5, 7]])))
+        self.assertTrue(torch.equal(local, torch.tensor([[1, -1], [2, 4]])))
+
+
 class TestPremiseScorerConfig(unittest.TestCase):
     def test_default_config(self) -> None:
         config = PremiseScorerConfig()
@@ -52,6 +64,8 @@ class TestPremiseScorerConfig(unittest.TestCase):
         d = config.to_dict()
         self.assertEqual(d["hidden_dim"], 64)
         self.assertEqual(d["scoring_mode"], "mlp")
+        self.assertEqual(d["k"], 200)
+        self.assertEqual(d["rerank_size"], 50)
 
 
 class TestPremiseScorerDot(unittest.TestCase):

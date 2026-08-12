@@ -452,6 +452,8 @@ def load_pointer_config(
     prepared_root_override: str | Path | None = None,
     run_root_override: str | Path | None = None,
     epochs_override: int | None = None,
+    device_override: str | None = None,
+    training_overrides: dict[str, Any] | None = None,
 ) -> PointerConfig:
     config_file = Path(config_path)
     if not config_file.exists():
@@ -462,6 +464,10 @@ def load_pointer_config(
         payload["prepared_root"] = str(prepared_root_override)
     if run_root_override is not None:
         payload["run_root"] = str(run_root_override)
+    if device_override is not None:
+        payload["device"] = device_override
+    if training_overrides:
+        payload.setdefault("training", {}).update(training_overrides)
     if epochs_override is not None:
         payload.setdefault("training", {})["epochs"] = epochs_override
     return PointerConfig.from_dict(payload)
@@ -1753,7 +1759,14 @@ def train_pointer(
     last_checkpoint_path = run_dir / "last.pt"
 
     model = build_pointer_model(metadata, config)
-    model, device, gpu_ids = maybe_wrap_data_parallel(model, device)
+    # Pointer outputs have replica-dependent padded widths, so PyG DataParallel
+    # cannot gather them safely. Keep pointer training on one explicitly selected GPU.
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda:0")
+        console_print(
+            "  [warn] pointer training is single-GPU; use --device cuda:<index>."
+        )
+    gpu_ids = [device.index or 0] if device.type == "cuda" else []
     model = model.to(device)
     optimizer = AdamW(
         model.parameters(),
@@ -1854,6 +1867,8 @@ def train_pointer(
             "val_arg_loss": float(val_metrics["arg_loss"]),
             "val_combined_loss": float(val_metrics["combined_loss"]),
             "val_tactic_accuracy": float(val_metrics["tactic_top1_accuracy"]),
+            "val_arg_accuracy": float(val_metrics["arg_top1_accuracy"]),
+            "val_arg_valid_count": int(val_metrics["arg_valid_count"]),
             "known_label_eval_count": int(val_metrics["known_label_count"]),
         }
         _append_jsonl(metrics_path, epoch_record)
@@ -1890,6 +1905,7 @@ def train_pointer(
             f"train_loss={epoch_record['train_combined_loss']:.4f} | "
             f"val_loss={epoch_record['val_combined_loss']:.4f} | "
             f"val_tactic_acc={epoch_record['val_tactic_accuracy']:.4f} | "
+            f"val_arg_acc={epoch_record['val_arg_accuracy']:.4f} | "
             f"known={epoch_record['known_label_eval_count']}"
         )
 

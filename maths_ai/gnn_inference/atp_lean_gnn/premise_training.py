@@ -70,6 +70,17 @@ def _extract_arg_targets(
     return targets
 
 
+def _local_to_global_arg_targets(
+    local_targets: torch.Tensor, batch, device: torch.device
+) -> torch.Tensor:
+    """Convert per-graph node ids to indices in the concatenated PyG batch."""
+    global_targets = local_targets.clone()
+    valid = global_targets >= 0
+    offsets = batch.ptr[:-1].to(device=device, dtype=torch.long).unsqueeze(1)
+    global_targets[valid] += offsets.expand_as(global_targets)[valid]
+    return global_targets
+
+
 def _extract_arg_lemma_ids(
     batch, max_args: int, device: torch.device
 ) -> torch.Tensor:
@@ -108,7 +119,8 @@ def train_one_epoch_with_premises(
     total_epochs: int,
     log_every_batches: int,
     use_amp: bool,
-    pin_memory: bool,
+    amp_dtype: torch.dtype | None = None,
+    pin_memory: bool = False,
 ) -> dict[str, float | int]:
     """Train one epoch with combined tactic + argument + premise ranking loss."""
     model.train()
@@ -135,12 +147,15 @@ def train_one_epoch_with_premises(
         targets = batch.y.view(-1)
         tactic_names = _extract_tactic_names(batch)
         arg_targets = _extract_arg_targets(batch, model.max_args, device)
+        pointer_arg_targets = _local_to_global_arg_targets(arg_targets, batch, device)
         arg_lemma_targets = _extract_arg_lemma_ids(batch, model.max_args, device)
         tactic_arities = [get_tactic_arity(n) for n in tactic_names]
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+        with torch.amp.autocast(
+            device_type=device.type, dtype=amp_dtype, enabled=use_amp
+        ):
             # Forward pass through model
             tactic_logits, arg_logits_list = model(
                 batch,
@@ -153,7 +168,7 @@ def train_one_epoch_with_premises(
                 tactic_logits,
                 arg_logits_list,
                 targets,
-                arg_targets,
+                pointer_arg_targets,
                 batch.batch,
                 tactic_arity_per_sample=tactic_arities,
                 arg_loss_weight=arg_loss_weight,
@@ -198,6 +213,12 @@ def train_one_epoch_with_premises(
 
             # Total loss
             total_loss = ta_loss + premise_loss_weight * p_loss
+
+        if not torch.isfinite(total_loss):
+            raise RuntimeError(
+                f"Non-finite premise-aware loss ({float(total_loss):.4g}) "
+                f"at batch {batch_index}."
+            )
 
         grad_scaler.scale(total_loss).backward()
         grad_scaler.unscale_(optimizer)
@@ -252,6 +273,7 @@ def evaluate_model_with_premises(
     split_name: str | None = None,
     log_every_batches: int | None = None,
     use_amp: bool = False,
+    amp_dtype: torch.dtype | None = None,
     pin_memory: bool = False,
 ) -> dict[str, float | int]:
     """Evaluate model with combined tactic + argument + premise metrics."""
@@ -288,10 +310,13 @@ def evaluate_model_with_premises(
         targets = batch.y.view(-1)
         tactic_names = _extract_tactic_names(batch)
         arg_targets = _extract_arg_targets(batch, model.max_args, device)
+        pointer_arg_targets = _local_to_global_arg_targets(arg_targets, batch, device)
         arg_lemma_targets = _extract_arg_lemma_ids(batch, model.max_args, device)
         tactic_arities = [get_tactic_arity(n) for n in tactic_names]
 
-        with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+        with torch.amp.autocast(
+            device_type=device.type, dtype=amp_dtype, enabled=use_amp
+        ):
             tactic_logits, arg_logits_list = model(
                 batch, tactic_names=tactic_names
             )
@@ -299,7 +324,7 @@ def evaluate_model_with_premises(
                 tactic_logits,
                 arg_logits_list,
                 targets,
-                arg_targets,
+                pointer_arg_targets,
                 batch.batch,
                 tactic_arity_per_sample=tactic_arities,
                 arg_loss_weight=arg_loss_weight,

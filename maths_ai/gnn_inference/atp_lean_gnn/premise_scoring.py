@@ -40,6 +40,8 @@ class PremiseScorerConfig:
             "scoring_mode": self.scoring_mode,
             "tactic_conditioning": self.tactic_conditioning,
             "premise_loss_weight": self.premise_loss_weight,
+            "k": self.k,
+            "rerank_size": self.rerank_size,
         }
 
 

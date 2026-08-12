@@ -138,19 +138,17 @@ def train_one_epoch_with_args(
                 node_types=batch.node_type
             )
 
+        if not torch.isfinite(loss):
+            raise RuntimeError(
+                f"Non-finite pointer loss ({float(loss):.4g}) at batch {batch_index}; "
+                f"tactic_loss={metrics['tactic_loss']:.4f}, "
+                f"arg_loss={metrics['arg_loss']:.4f}."
+            )
         grad_scaler.scale(loss).backward()
-        if torch.isfinite(loss):
-            grad_scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            grad_scaler.step(optimizer)
-            grad_scaler.update()
-        else:
-            print(f"  WARNING: Skipping batch {batch_index} due to non-finite loss: {loss.item()}")
-            # Enhanced debug info
-            with torch.no_grad():
-                print(f"    tactic_loss={metrics['tactic_loss']:.4f}, arg_loss={metrics['arg_loss']:.4f}")
-                # Check for NaNs in gradients/weights if needed, but here we just skip the step
-            optimizer.zero_grad(set_to_none=True)
+        grad_scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        grad_scaler.step(optimizer)
+        grad_scaler.update()
 
         batch_size = int(targets.numel())
         total_tactic_loss += metrics["tactic_loss"] * batch_size
@@ -199,6 +197,8 @@ def evaluate_model_with_args(
     top1_correct = 0
     known_count = 0
     total_count = 0
+    arg_top1_correct = 0
+    arg_valid_count = 0
     total_batches = len(loader)
     start_time = time.perf_counter()
 
@@ -236,6 +236,8 @@ def evaluate_model_with_args(
         total_tactic_loss += metrics["tactic_loss"] * bs
         total_arg_loss += metrics["arg_loss"] * bs
         total_combined_loss += metrics["total_loss"] * bs
+        arg_top1_correct += int(metrics.get("arg_top1_correct", 0))
+        arg_valid_count += int(metrics.get("arg_valid_count", 0))
 
         # Tactic top-1 accuracy (excluding UNK)
         known_mask = targets != unknown_tactic_id
@@ -263,6 +265,8 @@ def evaluate_model_with_args(
         "arg_loss": total_arg_loss / n,
         "combined_loss": total_combined_loss / n,
         "tactic_top1_accuracy": top1_correct / max(known_count, 1),
+        "arg_top1_accuracy": arg_top1_correct / max(arg_valid_count, 1),
+        "arg_valid_count": arg_valid_count,
         "known_label_count": known_count,
         "evaluated_count": total_count,
     }

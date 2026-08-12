@@ -337,6 +337,9 @@ def compute_combined_loss(
             "tactic_loss": float(tactic_loss.item()),
             "arg_loss": 0.0,
             "total_loss": float(tactic_loss.item()),
+            "arg_top1_correct": 0,
+            "arg_valid_count": 0,
+            "arg_top1_accuracy": 0.0,
         }
 
     padded_targets = resolve_arg_targets_to_padded(
@@ -344,6 +347,8 @@ def compute_combined_loss(
     )
 
     arg_losses: list[Tensor] = []
+    arg_top1_correct = 0
+    arg_valid_count = 0
     for step_k, arg_logits_k in enumerate(arg_logits_list):
         if step_k >= padded_targets.size(1):
             break
@@ -362,6 +367,9 @@ def compute_combined_loss(
             continue
 
         step_loss = F.cross_entropy(arg_logits_k[valid].clamp(min=-1e4), gt_k[valid])
+        predictions = arg_logits_k[valid].argmax(dim=1)
+        arg_top1_correct += int((predictions == gt_k[valid]).sum().item())
+        arg_valid_count += int(valid.sum().item())
         arg_losses.append(step_loss)
 
     if arg_losses:
@@ -374,5 +382,8 @@ def compute_combined_loss(
         "tactic_loss": float(tactic_loss.item()),
         "arg_loss": float(arg_loss.item()),
         "total_loss": float(total_loss.item()),
+        "arg_top1_correct": arg_top1_correct,
+        "arg_valid_count": arg_valid_count,
+        "arg_top1_accuracy": arg_top1_correct / max(arg_valid_count, 1),
     }
 

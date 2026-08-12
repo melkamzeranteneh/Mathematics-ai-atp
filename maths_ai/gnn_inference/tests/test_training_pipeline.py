@@ -402,6 +402,18 @@ class TrainingPipelineTests(unittest.TestCase):
         with self.assertRaises(ValueError, msg="same epoch target must not silently no-op"):
             train_baseline(resumed_config, resume_run_dir=run_dir)
 
+    def test_pipeline_parser_exposes_pointer_and_scorer_budgets(self) -> None:
+        args = build_pipeline_parser().parse_args([
+            "--pointer.max_batch_nodes", "12000",
+            "--pointer.oversize_graph_policy", "skip",
+            "--scorer.max_batch_edges", "50000",
+            "--scorer.cache_in_memory", "true",
+        ])
+        self.assertEqual(getattr(args, "pointer.max_batch_nodes"), "12000")
+        self.assertEqual(getattr(args, "pointer.oversize_graph_policy"), "skip")
+        self.assertEqual(getattr(args, "scorer.max_batch_edges"), "50000")
+        self.assertEqual(getattr(args, "scorer.cache_in_memory"), "true")
+
     def test_pipeline_parser_accepts_explicit_finished_run_extension(self) -> None:
         args = build_pipeline_parser().parse_args(
             ["--resume-run-dir", "runs/example/run_1", "--epochs", "30"]
