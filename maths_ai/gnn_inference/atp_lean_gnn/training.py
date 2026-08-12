@@ -425,6 +425,8 @@ def load_baseline_config(
     prepared_root_override: str | Path | None = None,
     run_root_override: str | Path | None = None,
     epochs_override: int | None = None,
+    device_override: str | None = None,
+    training_overrides: dict[str, Any] | None = None,
 ) -> BaselineConfig:
     config_file = Path(config_path)
     if not config_file.exists():
@@ -435,6 +437,10 @@ def load_baseline_config(
         payload["prepared_root"] = str(prepared_root_override)
     if run_root_override is not None:
         payload["run_root"] = str(run_root_override)
+    if device_override is not None:
+        payload["device"] = device_override
+    if training_overrides:
+        payload.setdefault("training", {}).update(training_overrides)
     if epochs_override is not None:
         payload.setdefault("training", {})["epochs"] = epochs_override
     return BaselineConfig.from_dict(payload)

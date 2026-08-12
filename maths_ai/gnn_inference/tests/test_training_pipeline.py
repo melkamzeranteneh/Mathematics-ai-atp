@@ -19,6 +19,7 @@ from maths_ai.gnn_inference.atp_lean_gnn import (
     encode_tactic_name,
     evaluate_baseline_run,
     label_example,
+    load_baseline_config,
     load_prepared_metadata,
     train_baseline,
 )
@@ -408,6 +409,31 @@ class TrainingPipelineTests(unittest.TestCase):
 
         self.assertEqual(args.resume_run_dir, "runs/example/run_1")
         self.assertEqual(args.epochs, 30)
+
+    def test_resume_config_accepts_runtime_training_overrides(self) -> None:
+        config_path = self.run_root / "resume_config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._tiny_config().to_dict()
+        payload["training"]["early_stopping_patience"] = 7
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        resumed = load_baseline_config(
+            config_path,
+            device_override="cpu",
+            epochs_override=35,
+            training_overrides={
+                "early_stopping_patience": 0,
+                "max_batch_nodes": 30000,
+                "max_batch_edges": 150000,
+                "oversize_graph_policy": "skip",
+            },
+        )
+
+        self.assertEqual(resumed.training.early_stopping_patience, 0)
+        self.assertEqual(resumed.training.epochs, 35)
+        self.assertEqual(resumed.training.max_batch_nodes, 30000)
+        self.assertEqual(resumed.training.max_batch_edges, 150000)
+        self.assertEqual(resumed.training.oversize_graph_policy, "skip")
 
     def test_pipeline_cli_override_updates_nested_preset_training(self) -> None:
         config = {

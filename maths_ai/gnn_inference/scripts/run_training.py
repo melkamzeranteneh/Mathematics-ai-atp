@@ -294,6 +294,8 @@ def run_baseline(config: dict[str, Any], resume_run_dir: str | None = None) -> d
             Path(resume_run_dir) / "config.json",
             prepared_root_override=prepared_root,
             epochs_override=int(training_overrides["epochs"]),
+            device_override=config["device"],
+            training_overrides=dict(training_overrides),
         )
     else:
         # Rebuild config from dict to ensure proper normalization.
@@ -790,6 +792,11 @@ def main(argv: list[str] | None = None) -> int:
         config["run_root"] = args.run_root
 
     # Apply nested overrides
+    explicit_stage_overrides = {
+        key: value
+        for key, value in vars(args).items()
+        if "." in key and value is not None
+    }
     for key, value in vars(args).items():
         if "." in key and value is not None:
             _apply_cli_override(config, key, value)
@@ -830,6 +837,10 @@ def main(argv: list[str] | None = None) -> int:
             },
             "epochs": args.epochs,
         }
+        # Resume configuration supplies compatibility-critical architecture,
+        # then explicit CLI training overrides take final precedence.
+        for key, value in explicit_stage_overrides.items():
+            _apply_cli_override(config, key, value)
 
     # Print config and exit if dry run
     if args.dry_run:
