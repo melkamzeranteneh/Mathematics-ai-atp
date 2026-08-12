@@ -73,6 +73,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "num_layers": 4,
         "dropout": 0.2,
         "batch_size": 256,
+        "max_batch_nodes": 0,
+        "max_batch_edges": 0,
         "epochs": 20,
         "learning_rate": 0.001,
         "weight_decay": 0.0001,
@@ -237,7 +239,7 @@ def _resolve_stage_model(baseline_cfg: dict[str, Any]) -> dict[str, Any]:
     """
     inline_model_keys = ("hidden_dim", "num_layers", "dropout")
     inline_training_keys = (
-        "batch_size", "epochs", "learning_rate", "weight_decay",
+        "batch_size", "max_batch_nodes", "max_batch_edges", "epochs", "learning_rate", "weight_decay",
         "grad_clip", "num_workers", "use_amp", "cache_in_memory",
         "early_stopping_patience", "early_stopping_min_delta",
     )

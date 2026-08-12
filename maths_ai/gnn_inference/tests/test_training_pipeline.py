@@ -29,8 +29,35 @@ from maths_ai.gnn_inference.scripts.run_training import (
     _apply_cli_override,
     build_parser as build_pipeline_parser,
 )
-from maths_ai.gnn_inference.atp_lean_gnn.training import build_baseline_model
+from maths_ai.gnn_inference.atp_lean_gnn.training import GraphBudgetBatchSampler, build_baseline_model
 from maths_ai.gnn_inference.scripts.pack_prepared_dataset import pack_prepared_dataset
+
+
+class GraphBudgetBatchSamplerTests(unittest.TestCase):
+    def test_respects_all_batch_limits(self) -> None:
+        sizes = [(4, 8), (6, 12), (3, 5), (20, 40)]
+        sampler = GraphBudgetBatchSampler(
+            sizes, max_graphs=3, max_nodes=10, max_edges=20
+        )
+        batches = list(sampler)
+        self.assertEqual(batches, [[0, 1], [2], [3]])
+        self.assertEqual(len(sampler), 3)
+
+    def test_shuffle_is_deterministic_per_epoch(self) -> None:
+        sampler = GraphBudgetBatchSampler(
+            [(1, 1)] * 20, max_graphs=4, shuffle=True, seed=42
+        )
+        sampler.set_epoch(3)
+        first = list(sampler)
+        self.assertEqual(first, list(sampler))
+        sampler.set_epoch(4)
+        self.assertNotEqual(first, list(sampler))
+
+    def test_oversize_graph_is_a_singleton(self) -> None:
+        sampler = GraphBudgetBatchSampler(
+            [(20, 40), (2, 2)], max_graphs=8, max_nodes=10, max_edges=10
+        )
+        self.assertEqual(list(sampler), [[0], [1]])
 
 
 class TrainingPipelineTests(unittest.TestCase):

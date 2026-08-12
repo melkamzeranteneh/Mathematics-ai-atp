@@ -47,6 +47,7 @@ from .state import Hypothesis, ProofState, parse_state
 from .training import (
     DEFAULT_BASELINE_CONFIG_PATH,
     BaselineConfig,
+    GraphBudgetBatchSampler,
     PreparedGraphDataset,
     PreparedMetadata,
     TrainingLoopConfig,
@@ -72,6 +73,7 @@ __all__ = [
     "DEMO_STATE",
     "DatasetRow",
     "EMPTY_TACTIC",
+    "GraphBudgetBatchSampler",
     "GraphNode",
     "GATv2ClassifierConfig",
     "GATv2StateClassifier",

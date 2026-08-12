@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from torch_geometric.loader import DataLoader
 
 from .argument_training import (
@@ -48,6 +48,8 @@ REQUIRED_POINTER_DATA_FIELDS = REQUIRED_DATA_FIELDS + ("premise_mask", "arg_node
 @dataclass(frozen=True)
 class TrainingLoopConfig:
     batch_size: int = 32
+    max_batch_nodes: int = 0
+    max_batch_edges: int = 0
     epochs: int = 20
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
@@ -65,6 +67,8 @@ class TrainingLoopConfig:
     def to_dict(self) -> dict[str, object]:
         return {
             "batch_size": self.batch_size,
+            "max_batch_nodes": self.max_batch_nodes,
+            "max_batch_edges": self.max_batch_edges,
             "epochs": self.epochs,
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
@@ -124,6 +128,8 @@ class BaselineConfig:
             )),
             training=TrainingLoopConfig(
                 batch_size=int(training_payload.get("batch_size", 32)),
+                max_batch_nodes=int(training_payload.get("max_batch_nodes", 0)),
+                max_batch_edges=int(training_payload.get("max_batch_edges", 0)),
                 epochs=int(training_payload.get("epochs", 20)),
                 learning_rate=float(training_payload.get("learning_rate", 1e-3)),
                 weight_decay=float(training_payload.get("weight_decay", 1e-4)),
@@ -174,6 +180,10 @@ class BaselineConfig:
             )
         if self.training.batch_size < 1:
             raise ValueError("Training config field 'training.batch_size' must be positive.")
+        if self.training.max_batch_nodes < 0:
+            raise ValueError("Training config field 'training.max_batch_nodes' cannot be negative.")
+        if self.training.max_batch_edges < 0:
+            raise ValueError("Training config field 'training.max_batch_edges' cannot be negative.")
         if self.training.epochs < 1:
             raise ValueError("Training config field 'training.epochs' must be positive.")
         if self.training.learning_rate <= 0:
@@ -264,6 +274,8 @@ class PointerConfig:
             ),
             training=TrainingLoopConfig(
                 batch_size=int(training_payload.get("batch_size", 32)),
+                max_batch_nodes=int(training_payload.get("max_batch_nodes", 0)),
+                max_batch_edges=int(training_payload.get("max_batch_edges", 0)),
                 epochs=int(training_payload.get("epochs", 20)),
                 learning_rate=float(training_payload.get("learning_rate", 1e-3)),
                 weight_decay=float(training_payload.get("weight_decay", 1e-4)),
@@ -303,6 +315,10 @@ class PointerConfig:
             raise ValueError("Training config field 'arg_loss_weight' cannot be negative.")
         if self.training.batch_size < 1:
             raise ValueError("Training config field 'training.batch_size' must be positive.")
+        if self.training.max_batch_nodes < 0:
+            raise ValueError("Training config field 'training.max_batch_nodes' cannot be negative.")
+        if self.training.max_batch_edges < 0:
+            raise ValueError("Training config field 'training.max_batch_edges' cannot be negative.")
         if self.training.epochs < 1:
             raise ValueError("Training config field 'training.epochs' must be positive.")
         if self.training.learning_rate <= 0:
@@ -687,6 +703,79 @@ class PreparedGraphDataset(Dataset):
             )
         return list(self._thread_pool.map(self.__getitem__, indices))
 
+    def graph_sizes(self) -> list[tuple[int, int]]:
+        """Return (nodes, edges) without reopening thousands of graph files."""
+        if self._cache is None or any(data is None for data in self._cache):
+            raise RuntimeError(
+                "Node/edge-budget batching requires cache_in_memory=true and a complete "
+                "packed cache. Build the packed cache before enabling max_batch_nodes or "
+                "max_batch_edges."
+            )
+        return [
+            (int(data.num_nodes), int(data.edge_index.size(1)))
+            for data in self._cache
+        ]
+
+
+class GraphBudgetBatchSampler(Sampler[list[int]]):
+    """Greedily batch graphs under graph-count, node, and edge limits."""
+
+    def __init__(
+        self,
+        graph_sizes: list[tuple[int, int]],
+        *,
+        max_graphs: int,
+        max_nodes: int = 0,
+        max_edges: int = 0,
+        shuffle: bool = False,
+        seed: int = 0,
+    ) -> None:
+        self.graph_sizes = graph_sizes
+        self.max_graphs = int(max_graphs)
+        self.max_nodes = int(max_nodes)
+        self.max_edges = int(max_edges)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+        if self.max_graphs < 1:
+            raise ValueError("max_graphs must be positive.")
+        if self.max_nodes < 0 or self.max_edges < 0:
+            raise ValueError("Graph budgets cannot be negative.")
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _batches(self) -> list[list[int]]:
+        indices = list(range(len(self.graph_sizes)))
+        if self.shuffle:
+            random.Random(self.seed + self.epoch).shuffle(indices)
+        batches: list[list[int]] = []
+        batch: list[int] = []
+        nodes = edges = 0
+        for index in indices:
+            graph_nodes, graph_edges = self.graph_sizes[index]
+            exceeds = bool(batch) and (
+                len(batch) >= self.max_graphs
+                or (self.max_nodes > 0 and nodes + graph_nodes > self.max_nodes)
+                or (self.max_edges > 0 and edges + graph_edges > self.max_edges)
+            )
+            if exceeds:
+                batches.append(batch)
+                batch = []
+                nodes = edges = 0
+            batch.append(index)
+            nodes += graph_nodes
+            edges += graph_edges
+        if batch:
+            batches.append(batch)
+        return batches
+
+    def __iter__(self):
+        return iter(self._batches())
+
+    def __len__(self) -> int:
+        return len(self._batches())
+
 
 def _shm_bytes() -> int:
     """Return available shared-memory size in bytes (0 if unknown)."""
@@ -742,7 +831,6 @@ def build_dataloaders(
             "shared-memory-safe DataLoader fallback."
         )
     loader_kwargs: dict[str, object] = {
-        "batch_size": config.training.batch_size,
         "num_workers": num_workers,
         "pin_memory": config.training.pin_memory,
     }
@@ -761,14 +849,35 @@ def build_dataloaders(
         )
         for split in CANONICAL_SPLITS
     }
-    loaders = {
-        split: DataLoader(
-            dataset,
-            shuffle=(split == "train"),
-            **loader_kwargs,
-        )
-        for split, dataset in datasets.items()
-    }
+    use_graph_budget = bool(
+        config.training.max_batch_nodes or config.training.max_batch_edges
+    )
+    if use_graph_budget:
+        samplers = {
+            split: GraphBudgetBatchSampler(
+                dataset.graph_sizes(),
+                max_graphs=config.training.batch_size,
+                max_nodes=config.training.max_batch_nodes,
+                max_edges=config.training.max_batch_edges,
+                shuffle=(split == "train"),
+                seed=config.seed,
+            )
+            for split, dataset in datasets.items()
+        }
+        loaders = {
+            split: DataLoader(dataset, batch_sampler=samplers[split], **loader_kwargs)
+            for split, dataset in datasets.items()
+        }
+    else:
+        loaders = {
+            split: DataLoader(
+                dataset,
+                batch_size=config.training.batch_size,
+                shuffle=(split == "train"),
+                **loader_kwargs,
+            )
+            for split, dataset in datasets.items()
+        }
     return datasets, loaders
 
 
@@ -1351,7 +1460,9 @@ def train_baseline(
         f"val={len(datasets['val'])}, test={len(datasets['test'])}"
     )
     console_print(
-        f"  DataLoader settings      : batch_size={config.training.batch_size}, "
+        f"  DataLoader settings      : max_graphs={config.training.batch_size}, "
+        f"max_nodes={config.training.max_batch_nodes or 'unlimited'}, "
+        f"max_edges={config.training.max_batch_edges or 'unlimited'}, "
         f"process_workers={loaders['train'].num_workers}, "
         f"io_threads={datasets['train'].io_threads}, "
         f"pin_memory={config.training.pin_memory}, "
@@ -1367,6 +1478,9 @@ def train_baseline(
 
     for epoch in range(start_epoch, config.training.epochs + 1):
         last_completed_epoch = epoch
+        batch_sampler = getattr(loaders["train"], "batch_sampler", None)
+        if hasattr(batch_sampler, "set_epoch"):
+            batch_sampler.set_epoch(epoch)
         train_metrics = train_one_epoch(
             model,
             loaders["train"],
@@ -1619,6 +1733,9 @@ def train_pointer(
 
     for epoch in range(start_epoch, config.training.epochs + 1):
         last_completed_epoch = epoch
+        batch_sampler = getattr(loaders["train"], "batch_sampler", None)
+        if hasattr(batch_sampler, "set_epoch"):
+            batch_sampler.set_epoch(epoch)
         train_metrics = train_one_epoch_with_args(
             model,
             loaders["train"],
