@@ -59,6 +59,27 @@ class GraphBudgetBatchSamplerTests(unittest.TestCase):
         )
         self.assertEqual(list(sampler), [[0], [1]])
 
+    def test_oversize_graph_can_be_skipped(self) -> None:
+        sampler = GraphBudgetBatchSampler(
+            [(20, 40), (2, 2), (3, 4)],
+            max_graphs=8,
+            max_nodes=10,
+            max_edges=10,
+            oversize_policy="skip",
+        )
+        self.assertEqual(sampler.oversize_indices, [0])
+        self.assertEqual(list(sampler), [[1, 2]])
+
+    def test_oversize_graph_can_fail_early(self) -> None:
+        with self.assertRaisesRegex(ValueError, "1 graphs exceed"):
+            GraphBudgetBatchSampler(
+                [(20, 40)],
+                max_graphs=8,
+                max_nodes=10,
+                max_edges=10,
+                oversize_policy="error",
+            )
+
 
 class TrainingPipelineTests(unittest.TestCase):
     def setUp(self) -> None:

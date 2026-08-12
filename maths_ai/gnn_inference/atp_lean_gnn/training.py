@@ -50,6 +50,7 @@ class TrainingLoopConfig:
     batch_size: int = 32
     max_batch_nodes: int = 0
     max_batch_edges: int = 0
+    oversize_graph_policy: str = "singleton"
     epochs: int = 20
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
@@ -69,6 +70,7 @@ class TrainingLoopConfig:
             "batch_size": self.batch_size,
             "max_batch_nodes": self.max_batch_nodes,
             "max_batch_edges": self.max_batch_edges,
+            "oversize_graph_policy": self.oversize_graph_policy,
             "epochs": self.epochs,
             "learning_rate": self.learning_rate,
             "weight_decay": self.weight_decay,
@@ -130,6 +132,7 @@ class BaselineConfig:
                 batch_size=int(training_payload.get("batch_size", 32)),
                 max_batch_nodes=int(training_payload.get("max_batch_nodes", 0)),
                 max_batch_edges=int(training_payload.get("max_batch_edges", 0)),
+                oversize_graph_policy=str(training_payload.get("oversize_graph_policy", "singleton")).lower().strip(),
                 epochs=int(training_payload.get("epochs", 20)),
                 learning_rate=float(training_payload.get("learning_rate", 1e-3)),
                 weight_decay=float(training_payload.get("weight_decay", 1e-4)),
@@ -184,6 +187,11 @@ class BaselineConfig:
             raise ValueError("Training config field 'training.max_batch_nodes' cannot be negative.")
         if self.training.max_batch_edges < 0:
             raise ValueError("Training config field 'training.max_batch_edges' cannot be negative.")
+        if self.training.oversize_graph_policy not in {"singleton", "skip", "error"}:
+            raise ValueError(
+                "Training config field 'training.oversize_graph_policy' must be one of: "
+                "singleton, skip, error."
+            )
         if self.training.epochs < 1:
             raise ValueError("Training config field 'training.epochs' must be positive.")
         if self.training.learning_rate <= 0:
@@ -276,6 +284,7 @@ class PointerConfig:
                 batch_size=int(training_payload.get("batch_size", 32)),
                 max_batch_nodes=int(training_payload.get("max_batch_nodes", 0)),
                 max_batch_edges=int(training_payload.get("max_batch_edges", 0)),
+                oversize_graph_policy=str(training_payload.get("oversize_graph_policy", "singleton")).lower().strip(),
                 epochs=int(training_payload.get("epochs", 20)),
                 learning_rate=float(training_payload.get("learning_rate", 1e-3)),
                 weight_decay=float(training_payload.get("weight_decay", 1e-4)),
@@ -319,6 +328,11 @@ class PointerConfig:
             raise ValueError("Training config field 'training.max_batch_nodes' cannot be negative.")
         if self.training.max_batch_edges < 0:
             raise ValueError("Training config field 'training.max_batch_edges' cannot be negative.")
+        if self.training.oversize_graph_policy not in {"singleton", "skip", "error"}:
+            raise ValueError(
+                "Training config field 'training.oversize_graph_policy' must be one of: "
+                "singleton, skip, error."
+            )
         if self.training.epochs < 1:
             raise ValueError("Training config field 'training.epochs' must be positive.")
         if self.training.learning_rate <= 0:
@@ -727,6 +741,7 @@ class GraphBudgetBatchSampler(Sampler[list[int]]):
         max_graphs: int,
         max_nodes: int = 0,
         max_edges: int = 0,
+        oversize_policy: str = "singleton",
         shuffle: bool = False,
         seed: int = 0,
     ) -> None:
@@ -734,6 +749,7 @@ class GraphBudgetBatchSampler(Sampler[list[int]]):
         self.max_graphs = int(max_graphs)
         self.max_nodes = int(max_nodes)
         self.max_edges = int(max_edges)
+        self.oversize_policy = str(oversize_policy).lower().strip()
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.epoch = 0
@@ -741,12 +757,30 @@ class GraphBudgetBatchSampler(Sampler[list[int]]):
             raise ValueError("max_graphs must be positive.")
         if self.max_nodes < 0 or self.max_edges < 0:
             raise ValueError("Graph budgets cannot be negative.")
+        if self.oversize_policy not in {"singleton", "skip", "error"}:
+            raise ValueError("oversize_policy must be one of: singleton, skip, error.")
+        self.oversize_indices = [
+            index
+            for index, (nodes, edges) in enumerate(self.graph_sizes)
+            if (self.max_nodes > 0 and nodes > self.max_nodes)
+            or (self.max_edges > 0 and edges > self.max_edges)
+        ]
+        if self.oversize_indices and self.oversize_policy == "error":
+            max_nodes = max(self.graph_sizes[index][0] for index in self.oversize_indices)
+            max_edges = max(self.graph_sizes[index][1] for index in self.oversize_indices)
+            raise ValueError(
+                f"{len(self.oversize_indices)} graphs exceed the configured batch budget "
+                f"(largest: {max_nodes} nodes, {max_edges} edges)."
+            )
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
     def _batches(self) -> list[list[int]]:
         indices = list(range(len(self.graph_sizes)))
+        if self.oversize_policy == "skip":
+            oversize = set(self.oversize_indices)
+            indices = [index for index in indices if index not in oversize]
         if self.shuffle:
             random.Random(self.seed + self.epoch).shuffle(indices)
         batches: list[list[int]] = []
@@ -859,11 +893,25 @@ def build_dataloaders(
                 max_graphs=config.training.batch_size,
                 max_nodes=config.training.max_batch_nodes,
                 max_edges=config.training.max_batch_edges,
+                oversize_policy=config.training.oversize_graph_policy,
                 shuffle=(split == "train"),
                 seed=config.seed,
             )
             for split, dataset in datasets.items()
         }
+        for split, sampler in samplers.items():
+            if sampler.oversize_indices:
+                largest_nodes = max(
+                    sampler.graph_sizes[index][0] for index in sampler.oversize_indices
+                )
+                largest_edges = max(
+                    sampler.graph_sizes[index][1] for index in sampler.oversize_indices
+                )
+                console_print(
+                    f"  [warn] {split}: {len(sampler.oversize_indices)} oversized graphs; "
+                    f"policy={sampler.oversize_policy}, largest={largest_nodes} nodes/"
+                    f"{largest_edges} edges."
+                )
         loaders = {
             split: DataLoader(dataset, batch_sampler=samplers[split], **loader_kwargs)
             for split, dataset in datasets.items()
@@ -1400,6 +1448,28 @@ def train_baseline(
         best_epoch = 0
         best_val_top1 = -1.0
 
+    oversize_report = {"policy": config.training.oversize_graph_policy, "splits": {}}
+    effective_dataset_sizes: dict[str, int] = {}
+    for split, dataset in datasets.items():
+        sampler = getattr(loaders[split], "batch_sampler", None)
+        indices = list(getattr(sampler, "oversize_indices", []))
+        records = [
+            {
+                "dataset_index": index,
+                "num_nodes": sampler.graph_sizes[index][0],
+                "num_edges": sampler.graph_sizes[index][1],
+            }
+            for index in indices
+        ]
+        skipped_count = len(indices) if config.training.oversize_graph_policy == "skip" else 0
+        effective_dataset_sizes[split] = len(dataset) - skipped_count
+        oversize_report["splits"][split] = {
+            "oversize_count": len(indices),
+            "skipped_count": skipped_count,
+            "records": records,
+        }
+    oversize_report_path = _write_json(run_dir / "oversize_graphs.json", oversize_report)
+
     metrics_path = run_dir / "metrics.jsonl"
     best_checkpoint_path = run_dir / "best.pt"
     last_checkpoint_path = run_dir / "last.pt"
@@ -1463,6 +1533,7 @@ def train_baseline(
         f"  DataLoader settings      : max_graphs={config.training.batch_size}, "
         f"max_nodes={config.training.max_batch_nodes or 'unlimited'}, "
         f"max_edges={config.training.max_batch_edges or 'unlimited'}, "
+        f"oversize_policy={config.training.oversize_graph_policy}, "
         f"process_workers={loaders['train'].num_workers}, "
         f"io_threads={datasets['train'].io_threads}, "
         f"pin_memory={config.training.pin_memory}, "
@@ -1618,6 +1689,8 @@ def train_baseline(
         "amp_enabled": use_amp,
         "amp_dtype": precision,
         "dataset_sizes": {split: len(dataset) for split, dataset in datasets.items()},
+        "effective_dataset_sizes": effective_dataset_sizes,
+        "oversize_graph_report": str(oversize_report_path),
         "start_epoch": start_epoch,
         "last_completed_epoch": last_completed_epoch,
         "best_epoch": best_epoch,
