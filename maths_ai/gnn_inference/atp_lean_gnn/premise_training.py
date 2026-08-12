@@ -15,7 +15,7 @@ from torch.optim import AdamW
 from torch_geometric.loader import DataLoader
 
 from .argument_selector import TacticWithArgsClassifier, compute_combined_loss
-from .labels import get_tactic_arity
+from .labels import get_tactic_arity, parse_tactic_arguments
 from .lemma_index import LemmaIndex
 from .premise_pool import build_unified_pools
 from .premise_scoring import PremiseScorer, compute_premise_ranking_loss
@@ -101,6 +101,26 @@ def _extract_arg_lemma_ids(
     return targets
 
 
+def _recover_lemma_targets(
+    batch, local_targets: torch.Tensor, lemma_targets: torch.Tensor,
+    lemma_index: LemmaIndex | None,
+) -> torch.Tensor:
+    """Resolve external tactic arguments by name when cached lemma IDs are absent."""
+    name_to_id = getattr(lemma_index, "name_to_id", {}) if lemma_index is not None else {}
+    if not name_to_id or not hasattr(batch, "tactic_raw"):
+        return lemma_targets
+    raw_tactics = batch.tactic_raw
+    if not isinstance(raw_tactics, (list, tuple)):
+        raw_tactics = [raw_tactics]
+    recovered = lemma_targets.clone()
+    for row, raw_tactic in enumerate(raw_tactics):
+        _, arguments = parse_tactic_arguments(str(raw_tactic))
+        for column, argument in enumerate(arguments[: recovered.size(1)]):
+            if local_targets[row, column] < 0 and recovered[row, column] < 0:
+                recovered[row, column] = int(name_to_id.get(argument, -1))
+    return recovered
+
+
 def train_one_epoch_with_premises(
     model: TacticWithArgsClassifier,
     scorer: PremiseScorer,
@@ -149,6 +169,9 @@ def train_one_epoch_with_premises(
         arg_targets = _extract_arg_targets(batch, model.max_args, device)
         pointer_arg_targets = _local_to_global_arg_targets(arg_targets, batch, device)
         arg_lemma_targets = _extract_arg_lemma_ids(batch, model.max_args, device)
+        arg_lemma_targets = _recover_lemma_targets(
+            batch, arg_targets, arg_lemma_targets, lemma_index
+        )
         tactic_arities = [get_tactic_arity(n) for n in tactic_names]
 
         optimizer.zero_grad(set_to_none=True)
@@ -312,6 +335,9 @@ def evaluate_model_with_premises(
         arg_targets = _extract_arg_targets(batch, model.max_args, device)
         pointer_arg_targets = _local_to_global_arg_targets(arg_targets, batch, device)
         arg_lemma_targets = _extract_arg_lemma_ids(batch, model.max_args, device)
+        arg_lemma_targets = _recover_lemma_targets(
+            batch, arg_targets, arg_lemma_targets, lemma_index
+        )
         tactic_arities = [get_tactic_arity(n) for n in tactic_names]
 
         with torch.amp.autocast(

@@ -115,6 +115,7 @@ def build_index(
     output_dir.mkdir(parents=True, exist_ok=True)
     vectors_path = output_dir / "lemma_vectors.npy"
     ids_path = output_dir / "lemma_ids.json"
+    names_path = output_dir / "lemma_names.json"
     index_path = output_dir / "faiss.index"
     failures_path = output_dir / "failures.jsonl"
     manifest_path = output_dir / "manifest.json"
@@ -138,6 +139,7 @@ def build_index(
         records = records[:limit]
 
     lemma_ids: list[int] = []
+    lemma_names: list[str] = []
     lemma_vectors: list[np.ndarray] = []
     failures: list[dict[str, object]] = []
 
@@ -171,6 +173,9 @@ def build_index(
         vectors = state_emb.detach().cpu().numpy().astype(np.float32)
 
         lemma_ids.extend(batch_ids)
+        lemma_names.extend(
+            record.name for record in batch if record.lemma_id in set(batch_ids)
+        )
         lemma_vectors.append(vectors)
 
     if lemma_vectors:
@@ -183,6 +188,7 @@ def build_index(
 
     np.save(vectors_path, lemma_vectors_np)
     ids_path.write_text(json.dumps(lemma_ids, indent=2), encoding="utf-8")
+    names_path.write_text(json.dumps(lemma_names, indent=2), encoding="utf-8")
 
     index = faiss.IndexFlatIP(lemma_vectors_np.shape[1])
     if lemma_vectors_np.size > 0:

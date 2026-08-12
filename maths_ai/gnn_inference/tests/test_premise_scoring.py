@@ -8,7 +8,9 @@ import numpy as np
 import torch
 
 from maths_ai.gnn_inference.atp_lean_gnn.premise_pool import CandidatePool
-from maths_ai.gnn_inference.atp_lean_gnn.premise_training import _local_to_global_arg_targets
+from maths_ai.gnn_inference.atp_lean_gnn.premise_training import (
+    _local_to_global_arg_targets, _recover_lemma_targets,
+)
 from maths_ai.gnn_inference.atp_lean_gnn.premise_scoring import (
     PremiseScorer,
     PremiseScorerConfig,
@@ -41,6 +43,18 @@ def _make_pool(
 
 
 class TestPremiseTargetIndexing(unittest.TestCase):
+    def test_recovers_external_lemma_id_from_tactic(self) -> None:
+        class Batch:
+            tactic_raw = ["exact Nat.add_comm a b", "apply h"]
+
+        class Index:
+            name_to_id = {"Nat.add_comm": 17}
+
+        local = torch.tensor([[-1], [3]], dtype=torch.long)
+        cached = torch.full((2, 1), -1, dtype=torch.long)
+        recovered = _recover_lemma_targets(Batch(), local, cached, Index())
+        self.assertTrue(torch.equal(recovered, torch.tensor([[17], [-1]])))
+
     def test_local_targets_are_shifted_for_pointer_loss(self) -> None:
         class Batch:
             ptr = torch.tensor([0, 3, 8], dtype=torch.long)

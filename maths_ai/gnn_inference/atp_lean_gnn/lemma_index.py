@@ -24,12 +24,17 @@ class LemmaIndex:
         lemma_ids: list[int],
         lemma_vectors: np.ndarray,
         *,
+        lemma_names: list[str] | None = None,
         normalize_queries: bool = False,
     ) -> None:
         self.index = index
         self.lemma_ids = lemma_ids
         self.lemma_vectors = lemma_vectors
         self.normalize_queries = normalize_queries
+        self.lemma_names = lemma_names or []
+        self.name_to_id = {
+            name: lemma_id for name, lemma_id in zip(self.lemma_names, self.lemma_ids)
+        }
 
         if self.lemma_vectors.ndim != 2:
             raise ValueError("lemma_vectors must be 2D (num_lemmas, dim).")
@@ -53,10 +58,12 @@ class LemmaIndex:
             index_path = input_path
             vectors_path = input_path.with_name("lemma_vectors.npy")
             ids_path = input_path.with_name("lemma_ids.json")
+            names_path = input_path.with_name("lemma_names.json")
         else:
             index_path = input_path / "faiss.index"
             vectors_path = input_path / "lemma_vectors.npy"
             ids_path = input_path / "lemma_ids.json"
+            names_path = input_path / "lemma_names.json"
 
         if not index_path.exists():
             raise FileNotFoundError(f"FAISS index not found at '{index_path}'.")
@@ -70,11 +77,16 @@ class LemmaIndex:
         if not isinstance(lemma_ids, list):
             raise ValueError("lemma_ids.json must contain a JSON list of ids.")
 
+        lemma_names = (
+            json.loads(names_path.read_text(encoding="utf-8"))
+            if names_path.exists() else None
+        )
         index = faiss.read_index(str(index_path))
         return cls(
             index,
             [int(x) for x in lemma_ids],
             lemma_vectors,
+            lemma_names=lemma_names,
             normalize_queries=normalize_queries,
         )
 
