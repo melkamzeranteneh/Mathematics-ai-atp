@@ -1,9 +1,10 @@
 """Tests for PremiseGNN — encode_nodes / readout / select_arguments contract."""
 
+import pytest
 import torch
 from torch_geometric.data import Batch, Data
 
-from maths_ai.gnn_inference.atp_lean_gnn.premise_gnn import PremiseGNN
+from atp_lean_gnn.premise_gnn import PremiseGNN
 
 
 NUM_NODE_LABELS = 50
@@ -172,6 +173,75 @@ class TestPremiseGNNContract:
         assert result.shape == (2, HIDDEN_DIM)
         assert torch.allclose(result[0], cached_vec)
         assert 20 in cache
+
+    def test_encode_state_cached_reuses_cache(self):
+        """encode_state_cached skips the GNN for already-cached states."""
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
+        cached_vec = torch.randn(HIDDEN_DIM)
+        cache = {10: cached_vec}
+
+        # Only state 20 is a miss — pass a single-graph batch for it only
+        batch = Batch.from_data_list([_make_graph(4, 3)])
+
+        result = model.encode_state_cached(batch, cache, [10, 20])
+
+        assert result.shape == (2, HIDDEN_DIM)
+        assert torch.allclose(result[0], cached_vec)
+        assert 20 in cache
+
+    def test_encode_state_cached_rejects_miss_count_mismatch(self):
+        """A batch that is not exactly the misses is an error, not silent misalignment.
+
+        Passing every graph (rather than only the missing ones) used to index
+        the wrong row of the readout and cache a wrong vector.
+        """
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
+        cache = {10: torch.randn(HIDDEN_DIM)}
+        # 2 graphs passed but only state 20 misses
+        batch = Batch.from_data_list([_make_graph(4, 3), _make_graph(5, 4)])
+
+        with pytest.raises(ValueError, match="cache misses"):
+            model.encode_state_cached(batch, cache, [10, 20])
+
+    def test_encode_lemma_cached_rejects_miss_count_mismatch(self):
+        """encode_lemma_cached enforces the same batch/miss agreement."""
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
+        cache = {10: torch.randn(HIDDEN_DIM)}
+        batch = Batch.from_data_list([_make_lemma_graph(4, 3), _make_lemma_graph(5, 4)])
+
+        with pytest.raises(ValueError, match="cache misses"):
+            model.encode_lemma_cached(batch, cache, [10, 20])
+
+    def test_cached_vector_does_not_retain_batch_storage(self):
+        """A cached vector must own its storage, not view into the whole batch.
+
+        Rows of the readout are views; caching one unchanged would keep the
+        entire [batch, hidden] tensor alive for as long as it stays cached.
+        """
+        model = PremiseGNN(
+            num_node_labels=NUM_NODE_LABELS,
+            num_tactics=NUM_TACTICS,
+            hidden_dim=HIDDEN_DIM
+        )
+        batch = Batch.from_data_list([_make_lemma_graph(4, 3) for _ in range(4)])
+        cache: dict = {}
+
+        model.encode_lemma_cached(batch, cache, [10, 20, 30, 40])
+
+        for vec in cache.values():
+            assert vec.untyped_storage().nbytes() == HIDDEN_DIM * vec.element_size()
 
     def test_tactic_embedding_exists(self):
         """PremiseGNN has tactic_embedding table."""

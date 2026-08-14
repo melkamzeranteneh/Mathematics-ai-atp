@@ -20,9 +20,11 @@ pantograph = { git = "https://github.com/stanford-centaur/PyPantograph" }
 
 [tool.setuptools.packages.find]
 where=["."]
-include=["maths_ai", "maths_ai.*"]
+include=["maths_ai", "maths_ai.*", "atp_lean_gnn", "atp_lean_gnn.*"]
 exclude=["data", "experiments", "tests", "tests.*"]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
 
 [dependency-groups]
 dev = ["pytest>=9.0.3"]
