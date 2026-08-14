@@ -7,6 +7,9 @@ tactic string.
 
 from __future__ import annotations
 
+from collections import OrderedDict
+from dataclasses import dataclass
+
 import torch
 from torch_geometric.data import Batch
 
@@ -16,7 +19,7 @@ from .labels import get_tactic_arity
 from .lemma_corpus import LemmaRecord
 from .lemma_index import LemmaIndex
 from .premise_gnn import PremiseGNN
-from .premise_pool import build_unified_pools
+from .premise_pool import CandidatePool, build_unified_pools
 from .premise_scoring import PremiseScorer
 from .pyg import build_premise_mask, dag_to_pyg
 from .state import parse_state
@@ -119,6 +122,21 @@ class InferenceResult:
         self.top_tactic_predictions = top_tactic_predictions or []
 
 
+@dataclass(frozen=True)
+class _EncodedState:
+    """Everything derived from a proof state that does not depend on ``top_k``.
+
+    Cached per state string so that re-expanding the same goal during proof
+    search skips the parse, the DAG build, the GNN forward pass and the FAISS
+    lookup. Only valid while the models stay in eval mode with fixed weights.
+    """
+
+    dag: DAGBuilder
+    state_emb: torch.Tensor
+    tactic_probs: torch.Tensor
+    pool: CandidatePool
+
+
 class InferencePipeline:
     """End-to-end tactic prediction pipeline."""
 
@@ -133,6 +151,7 @@ class InferencePipeline:
         k: int = 500,
         lemma_corpus: dict[int, LemmaRecord] | None = None,
         premise_gnn: PremiseGNN | None = None,
+        state_cache_size: int = 128,
     ) -> None:
         self.model = model
         self.scorer = scorer
@@ -145,6 +164,14 @@ class InferencePipeline:
         # When provided, PremiseGNN replaces the frozen backbone for embeddings
         self.premise_gnn = premise_gnn
 
+        # Proof search re-expands the same goal repeatedly (transpositions,
+        # backtracking), so encoded states are worth keeping. Set
+        # state_cache_size=0 to disable.
+        self._state_cache_size = max(int(state_cache_size), 0)
+        self._state_cache: OrderedDict[str, _EncodedState] = OrderedDict()
+        self._state_cache_hits = 0
+        self._state_cache_misses = 0
+
         # Invert tactic vocab for decoding
         self.id_to_tactic = {idx: name for name, idx in tactic_vocab.items()}
 
@@ -153,29 +180,53 @@ class InferencePipeline:
         if self.premise_gnn is not None:
             self.premise_gnn.eval()
 
-    @torch.no_grad()
-    def predict_tactic(self, state_str: str) -> str:
-        """Predict a full tactic string given a Lean proof state."""
-        return self.predict_tactic_result(state_str).predicted_tactic
+    @property
+    def state_cache_stats(self) -> dict[str, int]:
+        """Hit/miss counters and current occupancy of the encoded-state cache."""
+        return {
+            "hits": self._state_cache_hits,
+            "misses": self._state_cache_misses,
+            "size": len(self._state_cache),
+            "capacity": self._state_cache_size,
+        }
+
+    def clear_state_cache(self) -> None:
+        """Drop all cached states.
+
+        Must be called if the model weights change (e.g. loading a new
+        checkpoint, or switching a model back to train mode), since cached
+        embeddings come from the weights that were live when they were built.
+        """
+        self._state_cache.clear()
+        self._state_cache_hits = 0
+        self._state_cache_misses = 0
 
     @torch.no_grad()
-    def predict_tactic_result(self, state_str: str, *, top_k: int = 1) -> InferenceResult:
-        """Predict tactics and return detailed inference information for the top-k candidates."""
+    def _encode_state(self, state_str: str) -> _EncodedState:
+        """Build (or reuse) the state-dependent half of a prediction."""
+        if self._state_cache_size:
+            cached = self._state_cache.get(state_str)
+            if cached is not None:
+                self._state_cache.move_to_end(state_str)
+                self._state_cache_hits += 1
+                return cached
+            self._state_cache_misses += 1
+
         state = parse_state(state_str)
-        
+
         # 1. Graph construction
         dag = proof_state_to_dag(state)
         data = dag_to_pyg(dag, self.node_vocab)
-        
+
         try:
             state_idx = next(i for i, n in enumerate(dag.nodes) if n.label == "State")
         except StopIteration:
             state_idx = 0
         data.state_node_index = torch.tensor([state_idx], dtype=torch.long)
-        
+
         premise_mask = build_premise_mask(dag)
         data.premise_mask = torch.tensor(premise_mask, dtype=torch.bool)
-        
+
         data = data.to(self.device)
         data.state_node_index = data.state_node_index.to(self.device)
         data.premise_mask = data.premise_mask.to(self.device)
@@ -189,15 +240,9 @@ class InferencePipeline:
         else:
             node_embeddings = self.model.backbone.encode_nodes(batch)
             state_emb = self.model.backbone.readout(node_embeddings, batch)
-        
+
         tactic_logits = self.model.backbone.classifier(state_emb)
         tactic_probs = torch.softmax(tactic_logits.squeeze(0), dim=-1)
-        top_candidates = _top_tactic_candidates(tactic_probs, self.id_to_tactic, top_k=top_k)
-
-        tactic_distribution = [
-            (item["tactic_name"], float(item["probability"]))
-            for item in top_candidates
-        ]
 
         pools = build_unified_pools(
             state_emb,
@@ -207,7 +252,42 @@ class InferencePipeline:
             lemma_index=self.lemma_index,
             k=self.k,
         )
-        pool = pools[0]
+
+        encoded = _EncodedState(
+            dag=dag,
+            state_emb=state_emb,
+            tactic_probs=tactic_probs,
+            pool=pools[0],
+        )
+
+        if self._state_cache_size:
+            self._state_cache[state_str] = encoded
+            while len(self._state_cache) > self._state_cache_size:
+                self._state_cache.popitem(last=False)
+
+        return encoded
+
+    @torch.no_grad()
+    def predict_tactic(self, state_str: str) -> str:
+        """Predict a full tactic string given a Lean proof state."""
+        return self.predict_tactic_result(state_str).predicted_tactic
+
+    @torch.no_grad()
+    def predict_tactic_result(self, state_str: str, *, top_k: int = 1) -> InferenceResult:
+        """Predict tactics and return detailed inference information for the top-k candidates."""
+        encoded = self._encode_state(state_str)
+        dag = encoded.dag
+        state_emb = encoded.state_emb
+        pool = encoded.pool
+
+        top_candidates = _top_tactic_candidates(
+            encoded.tactic_probs, self.id_to_tactic, top_k=top_k
+        )
+
+        tactic_distribution = [
+            (item["tactic_name"], float(item["probability"]))
+            for item in top_candidates
+        ]
 
         top_tactic_predictions: list[dict[str, object]] = []
         for candidate in top_candidates:

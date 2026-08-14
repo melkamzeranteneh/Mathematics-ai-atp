@@ -208,6 +208,51 @@ class PremiseGNN(nn.Module):
 
         return selected_indices, selected_scores, selected_sources, selected_ids
 
+    def _encode_cached(
+        self,
+        graph_batch,
+        cache: dict[int, Tensor],
+        graph_ids: list[int],
+    ) -> Tensor:
+        """Encode graphs, reusing cached embeddings for ids already seen.
+
+        ``graph_batch`` must hold exactly the graphs whose ids miss the cache,
+        in the same order those ids appear in ``graph_ids``.
+        """
+        device = next(self.parameters()).device
+        results: dict[int, Tensor] = {}
+
+        miss_positions: list[int] = []
+        for pos, gid in enumerate(graph_ids):
+            cached = cache.get(gid)
+            if cached is None:
+                miss_positions.append(pos)
+                continue
+            cached = cached.to(device)
+            cache[gid] = cached
+            results[pos] = cached
+
+        if miss_positions:
+            if graph_batch is None:
+                raise ValueError("Cache miss but graph_batch is None.")
+            num_graphs = int(getattr(graph_batch, "num_graphs", 1))
+            if num_graphs != len(miss_positions):
+                raise ValueError(
+                    f"graph_batch contains {num_graphs} graphs "
+                    f"but there are {len(miss_positions)} cache misses."
+                )
+            with torch.no_grad():
+                node_embs = self.encode_nodes(graph_batch)
+                state_embs = self.readout(node_embs, graph_batch)
+            for i, pos in enumerate(miss_positions):
+                # clone: a row of state_embs is a view that would otherwise
+                # keep the whole batch's storage alive for as long as it is cached
+                vec = state_embs[i].clone()
+                cache[graph_ids[pos]] = vec
+                results[pos] = vec
+
+        return torch.stack([results[pos] for pos in range(len(graph_ids))], dim=0)
+
     def encode_lemma_cached(
         self,
         graph_batch,
@@ -215,36 +260,7 @@ class PremiseGNN(nn.Module):
         lemma_ids: list[int],
     ) -> Tensor:
         """Encode lemma graphs, reusing cached embeddings."""
-        device = next(self.parameters()).device
-        results: dict[int, Tensor] = {}
-
-        miss_positions: list[int] = []
-        for pos, lid in enumerate(lemma_ids):
-            if lid in cache:
-                vec = cache[lid].to(device)
-                cache[lid] = vec
-                results[pos] = vec
-            else:
-                miss_positions.append(pos)
-
-        if miss_positions:
-            if graph_batch is None:
-                raise ValueError("Cache miss but graph_batch is None.")
-            if len(miss_positions) != graph_batch.num_graphs:
-                raise ValueError(
-                    f"graph_batch contains {graph_batch.num_graphs} graphs "
-                    f"but there are {len(miss_positions)} cache misses."
-                )
-            with torch.no_grad():
-                node_embs = self.encode_nodes(graph_batch)
-                state_embs = self.readout(node_embs, graph_batch)
-            for i, pos in enumerate(miss_positions):
-                lid = lemma_ids[pos]
-                vec = state_embs[i].to(device)
-                cache[lid] = vec
-                results[pos] = vec
-
-        return torch.stack([results[pos] for pos in range(len(lemma_ids))], dim=0)
+        return self._encode_cached(graph_batch, cache, lemma_ids)
 
     def encode_state_cached(
         self,
@@ -253,31 +269,7 @@ class PremiseGNN(nn.Module):
         state_ids: list[int],
     ) -> Tensor:
         """Encode state graphs, reusing cached embeddings."""
-        device = next(self.parameters()).device
-        results: dict[int, Tensor] = {}
-
-        miss_positions: list[int] = []
-        for pos, sid in enumerate(state_ids):
-            if sid in cache:
-                vec = cache[sid].to(device)
-                cache[sid] = vec
-                results[pos] = vec
-            else:
-                miss_positions.append(pos)
-
-        if miss_positions:
-            if graph_batch is None:
-                raise ValueError("Cache miss but graph_batch is None.")
-            with torch.no_grad():
-                node_embs = self.encode_nodes(graph_batch)
-                state_embs = self.readout(node_embs, graph_batch)
-            for i, pos in enumerate(miss_positions):
-                sid = state_ids[pos]
-                vec = state_embs[i].to(device)
-                cache[sid] = vec
-                results[pos] = vec
-
-        return torch.stack([results[pos] for pos in range(len(state_ids))], dim=0)
+        return self._encode_cached(graph_batch, cache, state_ids)
 
     def get_state_and_local_embeddings(
         self,
