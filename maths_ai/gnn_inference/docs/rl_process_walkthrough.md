@@ -25,12 +25,15 @@ the exact tensors and file locations. It describes the system as implemented in
 
 ## 0. The model: one encoder, four heads
 
-`ActorCriticWithArgsClassifier` runs the GraphSAGE encoder **once** per state and feeds
-four heads from its outputs (`encode`, actor_critic.py):
+`ActorCriticWithArgsClassifier` runs one registered state-graph encoder **once** per
+state and feeds four heads from its outputs (`encode`, actor_critic.py). The checkpoint
+manifest selects `graphsage` or `gatv2`; the actor, critic, pointer, search, and loss paths
+do not branch on that choice.
 
 1. **Node embeddings** `[N, H]` — one vector per node of the state DAG (the proof state
    parsed into a hash-consed graph by `proof_state_to_dag`).
-2. **State embedding** `[B, H]` — readout at the `State` root node.
+2. **State embedding** `[B, H]` — GraphSAGE reads the `State` root. GATv2 can use the
+   same root or fuse it with state-conditioned attention and global mean/max summaries.
 3. **Tactic logits** `[B, T]` — the actor head: `actor(h) = base(h) + residual(h)`, where
    `base` inherited the supervised classifier at warm start and `residual`'s output layer
    was zero-initialized, so the RL policy starts exactly at supervised behavior and RL
@@ -261,11 +264,12 @@ Then: `loss.backward()`, `clip_grad_norm_(grad_clip)`, **one** `optimizer.step()
 `run_rl_training` (rl_training_driver.py) repeats sections 1–5 as rounds:
 
 ```
-warm start (strict load of the supervised actor-critic best.pt)
+warm start (manifest-driven reconstruction + strict actor-critic state load)
 pool ← LeanDojo proof states (parse_state), size-sorted, eval set held out
 for round in 0..num_rounds:
     batch    ← sample from the curriculum window (easy prefix of the sorted pool)
     results  ← collect_round(reasoner, batch)          # sequential, fault-isolated
+    validate total node/edge counts against the RL update budget
     metrics  ← train_step_onpolicy(..., bc_weight=anneal(round))   # ONE step
     window widens when the recent solve rate ≥ threshold
     last.pt every checkpoint_every rounds (model+optimizer+RNG+round → resumable)

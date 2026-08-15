@@ -1,287 +1,550 @@
-# Starting RL training: weights, environment, and launch (remote server / JupyterLab)
+# RL training setup: pluggable GNNs, checkpoints, and live Lean search
 
-Step-by-step operational guide: where the weight files go, what format the loaders
-expect, how to prepare a fresh remote machine, and how to launch, monitor, resume, and
-evaluate the RL run. The *mechanics* of what the loaders do internally are in
-`docs/rl_process_walkthrough.md` and `docs/dev_plans/rl_training_driver.md`; this file is
-the checklist.
+This is the operational guide for preparing data, selecting a GraphSAGE or GATv2
+actor, training the supervised warm start, and launching, monitoring, resuming, and
+evaluating reinforcement learning (RL). The mechanism inside the search and update
+loop is described in `docs/rl_process_walkthrough.md`.
 
-## 0. The two hand-offs at a glance
+Run commands from the repository root unless a command says otherwise.
 
+## 1. End-to-end artifact flow
+
+Architecture selection happens before RL training. Select an architecture in the
+pointer model config, use an actor-critic config with the same complete `model` block,
+and give the resulting actor-critic checkpoint to the RL driver.
+
+```text
+prepared dataset and vocabularies
+            |
+            v
+matching pointer config: model.architecture = graphsage or gatv2
+            |
+            v
+pointer best.pt
+            |
+            | strict transfer of encoder, tactic classifier,
+            | tactic embedding, and argument selector
+            v
+matching supervised actor-critic config
+            |
+            v
+actor-critic best.pt with a version-2 manifest
+            |
+            | RL reconstructs the model described by the manifest
+            v
+RL best.pt
 ```
-pointer best.pt ──(hand-off A: filtered load + zero-residual copy)──▶ supervised actor-critic
-                                                                        │ trains actor+critic
-supervised actor-critic best.pt ──(hand-off B: strict full load)──▶ RL driver
-                                                                        │ collect→train rounds
-                                                              runs/rl_actor_critic/<stamp>/best.pt
+
+The RL config does not contain `architecture`, `hidden_dim`, `num_layers`, `dropout`,
+`use_node_type`, `max_args`, `heads`, or `readout`. It also does not accept a source
+directory containing model code. The version-2 warm-start checkpoint is the single
+source of truth for the actor encoder and its associated policy components.
+
+This design keeps an RL run reproducible: the checkpoint records the normalized model
+specification, architecture version, vocabulary fingerprints, and a fingerprint of the
+trained encoder weights.
+
+## 2. Select an architecture and readout
+
+The stable architecture names are exactly `graphsage` and `gatv2`.
+
+GraphSAGE has a state-root readout. Its `model` block is:
+
+```json
+{
+  "architecture": "graphsage",
+  "hidden_dim": 512,
+  "dropout": 0.2,
+  "use_node_type": true,
+  "max_args": 3,
+  "encoder": {
+    "num_layers": 4
+  }
+}
 ```
 
-The RL driver does **not** accept a pointer checkpoint directly — it strict-loads a full
-`ActorCriticWithArgsClassifier` state dict. If you only have pointer weights, run
-hand-off A first (even briefly) to produce one.
+GATv2 has a configurable multi-head attention encoder and graph readout. For example:
 
-## 1. Checkpoint file format
+```json
+{
+  "architecture": "gatv2",
+  "hidden_dim": 512,
+  "dropout": 0.2,
+  "use_node_type": true,
+  "max_args": 3,
+  "encoder": {
+    "num_layers": 4,
+    "heads": 8,
+    "readout": "state_mean_attention"
+  }
+}
+```
 
-Both loaders call `torch.load(path)` and read `checkpoint["model_state_dict"]`
-(falling back to the whole object if that key is absent). So the expected file is:
+`hidden_dim` is the width of every node and proof-state embedding. For GATv2 it must be
+divisible by `heads`, the number of attention heads. The supported GATv2 readouts are:
 
-- a **`.pt` file** written by `torch.save`,
-- containing a dict `{"model_state_dict": <state_dict>, ...}` — extra keys like
-  `optimizer_state_dict`/`epoch` are ignored — **or** a bare state dict.
+| Readout | Proof-state representation supplied to the policy and critic |
+|---|---|
+| `state` | embedding of the distinguished proof-state root node |
+| `state_mean_attention` | learned fusion of the root, the mean node embedding, and a state-conditioned attention summary |
+| `state_max_attention` | learned fusion of the root, the maximum node embedding, and a state-conditioned attention summary |
+| `state_mean_max_attention` | learned fusion of the root, mean and maximum node embeddings, and a state-conditioned attention summary |
 
-This is exactly what this repo's training scripts write; checkpoints they produced need
-no conversion. What the state dict must contain per hand-off:
+Use a pointer preset and actor-critic preset with the same suffix:
 
-| Hand-off | Expected tensors | Loaded by |
+| Architecture and readout | Pointer preset | Actor-critic preset |
 |---|---|---|
-| A (pointer → supervised AC) | `TacticWithArgsClassifier`: `backbone.*`, `tactic_embedding.*`, `argument_selector.*` | `load_from_pointer_checkpoint` (filtered, shape-guarded, `strict=False`) |
-| B (supervised AC → RL) | full `ActorCriticWithArgsClassifier` incl. `actor.*`, `critic.*` | RL driver (`strict=True`) |
+| GraphSAGE, state root | `pointer_graphsage_state.json` | `actor_critic_graphsage_state.json` |
+| GATv2, state root | `pointer_gatv2_state.json` | `actor_critic_gatv2_state.json` |
+| GATv2, mean plus attention | `pointer_gatv2_state_mean_attention.json` | `actor_critic_gatv2_state_mean_attention.json` |
+| GATv2, maximum plus attention | `pointer_gatv2_state_max_attention.json` | `actor_critic_gatv2_state_max_attention.json` |
+| GATv2, mean, maximum, plus attention | `pointer_gatv2_state_mean_max_attention.json` | `actor_critic_gatv2_state_mean_max_attention.json` |
 
-Do not rename tensors from a foreign checkpoint to force a fit: matching shapes with a
-different node/tactic vocab ordering loads without error and silently maps every
-embedding row to the wrong token. The checkpoint is only valid together with the
-`prepared_root` it was trained against.
+Baseline presets with the same architecture and readout names also exist for supervised
+tactic-classification experiments. The RL warm start must be an actor-critic checkpoint,
+not a baseline or pointer checkpoint.
 
-## 2. Where to copy the files on the server
+## 3. Regenerate the prepared dataset
 
-All paths are configuration, not convention — but use the repo layout so configs stay
-readable. From the repo root:
+Regenerate data prepared before the pluggable-architecture change. Each PyTorch
+Geometric artifact now has a `.size.json` sidecar containing:
 
+- `nodes`: number of graph nodes;
+- `edges_forward`: number of stored directed edges;
+- `edges_bidirectional`: number of edges after adding reverse edges and removing
+  duplicates.
+
+The supervised batch sampler reads the field matching `edge_mode`. Old sidecars do not
+contain these edge counts and cannot enforce the current graph budgets correctly.
+
+```bash
+uv run python -m maths_ai.gnn_inference.scripts.prepare_dataset \
+  --output-root maths_ai/gnn_inference/artifacts/prepared/v1 \
+  --splits train,val,test \
+  --force
 ```
-runs/pointer_gnn/imported/best.pt            # ← your pointer weights (hand-off A input)
-runs/actor_critic_gnn/<run>/best.pt          # ← produced by hand-off A (or copied in, if
-                                             #    you already trained the AC phase elsewhere)
-artifacts/prepared/v1/                       # ← the prepared dataset BOTH phases used:
-    vocab/node_vocab.json                    #    these two files size & order every
-    vocab/tactic_vocab.json                  #    embedding table — same files, all phases
-    ...(split manifests / pyg tensors)...
+
+`--force` replaces the selected output root. Copy any prepared artifacts you need to
+retain before running it.
+
+Use the same prepared root for pointer training, supervised actor-critic training, and
+RL. In particular, use the same files at:
+
+```text
+<prepared-root>/vocab/node_vocab.json
+<prepared-root>/vocab/tactic_vocab.json
 ```
 
-Copy from your machine with `scp -r runs artifacts user@server:/path/to/new-maths/`, or
-upload through the JupyterLab file browser (drag-and-drop; for multi-GB artifacts, zip
-first and unzip in a terminal — the browser upload is per-file).
+The integer assignments in these vocabularies determine the rows of the model's
+embedding and classifier tables. Version-2 loaders compare fingerprints of the complete
+mappings, so equal vocabulary sizes with different assignments are rejected.
 
-Note: the repo contains a symlink `maths_ai/gnn_inference/artifacts/prepared →
-../../_support_files/artifacts/prepared` which is broken unless that target exists.
-Either create the target directory or (simpler) point `prepared_root` in the configs at
-the real absolute path of your prepared dataset.
+The repository may contain the symlink
+`maths_ai/gnn_inference/artifacts/prepared -> ../../_support_files/artifacts/prepared`.
+If its target does not exist on a new machine, set `prepared_root` in each config to the
+real absolute dataset directory.
 
-## 3. Environment preparation (remote server, JupyterLab)
+## 4. Copy artifacts to a remote machine
 
-The RL phase runs live Lean and petta subprocesses, so the Python packages alone are not
-enough. Work in a **JupyterLab terminal** (File → New → Terminal), not a notebook — the
-driver is a long-running CLI process.
+The paths are configuration values, but keeping the following layout makes the hand-offs
+easy to audit:
 
-### 3.1 Python side
+```text
+maths_ai/gnn_inference/runs/pointer_gatv2_state_mean_attention/<run>/best.pt
+maths_ai/gnn_inference/runs/actor_critic_gatv2_state_mean_attention/<run>/best.pt
+maths_ai/gnn_inference/artifacts/prepared/v1/
+    vocab/node_vocab.json
+    vocab/tactic_vocab.json
+    train/pyg/...
+    val/pyg/...
+    test/pyg/...
+```
+
+Copy the run and prepared-data directories together, or set each config to their actual
+absolute locations:
+
+```bash
+scp -r /local/path/to/maths_ai/gnn_inference/runs \
+  user@server:/path/to/new-maths/maths_ai/gnn_inference/
+scp -r /local/path/to/prepared/v1 \
+  user@server:/path/to/new-maths/maths_ai/gnn_inference/artifacts/prepared/
+```
+
+Do not copy a checkpoint without the prepared vocabulary files that produced it.
+
+## 5. Prepare the runtime environment
+
+Use a JupyterLab terminal or another persistent shell for setup and training. The RL
+driver is a long-running command-line process.
+
+### 5.1 Python and CUDA
 
 ```bash
 cd /path/to/new-maths
-uv sync                          # installs torch, torch-geometric, pydantic, faiss-cpu,
-                                 # and pantograph (from the PyPantograph git source)
-uv add datasets                  # HuggingFace streaming — required by the driver's
-                                 # dataset mode (iter_dataset_rows); not yet in pyproject
-```
-
-CUDA check (the prepared configs use `"device": "auto"`, which falls back to CPU —
-fine for the RL phase, whose bottleneck is Lean, but verify what you got):
-
-```bash
+uv sync
+uv add datasets
 uv run python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
 ```
 
-### 3.2 Lean / Pantograph
+The `datasets` package supplies the Hugging Face streaming interface used when the RL
+config has `"data_source": "dataset"`. It is not currently declared in
+`pyproject.toml`.
 
-PyPantograph needs a Lean 4 toolchain (`elan`/`lake`) on PATH:
+The supervised trainers choose mixed precision from the selected encoder:
+
+- GraphSAGE uses FP16 on CUDA when `training.use_amp` is true.
+- GATv2 uses BF16 on CUDA hardware that supports BF16 and otherwise uses FP32. GATv2
+  never uses FP16 because FP16 attention scores can become non-finite.
+- CPU training uses FP32 for both architectures.
+
+The supervised baseline, pointer, and actor-critic trainers stop with a diagnostic
+`FloatingPointError` when a loss is non-finite. Do not continue from a run that reports
+this error; inspect the named architecture, precision, loss component, and batch first.
+
+### 5.2 Lean and Pantograph
+
+PyPantograph requires a Lean 4 toolchain through `elan` and `lake`:
 
 ```bash
-curl https://elan.lean-lang.org/elan-init.sh -sSf | sh   # installs to ~/.elan
+curl https://elan.lean-lang.org/elan-init.sh -sSf | sh
 source ~/.elan/env
-uv run python -c "
-import asyncio
-from pantograph.server import Server
-async def main():
-    s = await Server.create()
-    st = await s.goal_start_async('forall (p : Prop), p -> p')
-    print('pantograph OK:', st.goals[0].target)
-asyncio.run(main())
-"
 ```
 
-The first `Server.create()` may compile Lean core — minutes, one-time.
+For goals that use Mathlib notation or declarations, set `source_root` to a compiled
+Lake project containing Mathlib. A server started without `source_root` imports core
+Lean only and cannot elaborate notation such as `ℕ`.
 
-### 3.3 petta (PLN)
-
-The PLN reward path shells out to the `petta` binary. `PLNInference` finds it via, in
-order: the `petta_bin` constructor arg, the `PETTA_BIN` environment variable, or
-`shutil.which("petta")`. So either install it on PATH (e.g. `/usr/local/bin/petta`) or:
-
-```bash
-export PETTA_BIN=/path/to/petta          # put this in ~/.bashrc for JupyterLab terminals
-```
-
-Check:
-
-```bash
-uv run python -c "
-from maths_ai.pln_inference.model import PLNInference
-p = PLNInference()
-r = p.evaluate('p -> p', hypotheses=['p : Prop'])
-print('petta OK:', r.status, r.stv, 'fallback =', r.is_fallback)
-"
-```
-
-`is_fallback=True` with status `petta_unavailable` means the binary wasn't found — the
-run would still work but every Φ would be exploration noise instead of PLN.
-
-### 3.4 Sanity: unit suite + live smoke
-
-```bash
-uv run python -m pytest maths_ai/gnn_inference/tests/ -q
-# expected: all green except the pre-existing test_premise_pool failure
-uv run python -m maths_ai.gnn_inference.scripts.rl_smoke
-# expected: "[rl_smoke] OK — collect → harvest → one on-policy gradient step completed."
-```
-
-The smoke test needs no checkpoints (it builds a tiny fresh model) and validates the
-whole live chain: Pantograph server, petta scoring, sampling search, harvest, gradient.
-
-## 4. Hand-off A: pointer weights → supervised actor-critic checkpoint
-
-Skip this section if you already have a trained `ActorCriticWithArgsClassifier`
-checkpoint; go to section 5.
-
-1. Edit `maths_ai/gnn_inference/configs/actor_critic_graphsage_state.json`:
+You may set the environment in `configs/rl_actor_critic.json`:
 
 ```json
-"prepared_root": "/abs/path/artifacts/prepared/v1",
-"pretrained_pointer_checkpoint": "runs/pointer_gnn/imported/best.pt",
+"source_root": "/abs/path/to/mathlib-lake-project",
+"pantograph_repl": null,
+"pantograph_imports": null,
+"server_timeout_s": 120
 ```
 
-   The `model` block (`hidden_dim: 512, num_layers: 4, max_args: 3`) must equal the
-   pointer run's architecture — the loader shape-checks every transferred tensor and
-   raises a `ValueError` naming the mismatched keys rather than leaving the model at
-   random init.
-
-2. Run the supervised actor-critic phase:
+With `source_root` set and `pantograph_imports` left as `null`, the driver imports
+`Init,Mathlib`. An explicit `pantograph_repl` must use the same Lean toolchain as the
+Lake project. Command-line values override the corresponding config values:
 
 ```bash
-uv run python maths_ai/gnn_inference/scripts/train_baseline.py \
+uv run python -m maths_ai.gnn_inference.scripts.rl_smoke \
+  --source-root /abs/path/to/mathlib-lake-project
+```
+
+If a custom REPL is required:
+
+```bash
+uv run python -m maths_ai.gnn_inference.scripts.rl_smoke \
+  --source-root /abs/path/to/mathlib-lake-project \
+  --pantograph-repl /abs/path/to/pantograph-repl
+```
+
+The expected final line is:
+
+```text
+[rl_smoke] OK — collect → harvest → one on-policy gradient step completed.
+```
+
+### 5.3 Optional petta/PLN process
+
+The probabilistic logic network (PLN) path invokes the `petta` executable. It resolves
+the executable from an explicit constructor value, the `PETTA_BIN` environment
+variable, or `PATH`, in that order.
+
+```bash
+export PETTA_BIN=/abs/path/to/petta
+```
+
+Check the process before enabling PLN:
+
+```bash
+uv run python -c "from maths_ai.pln_inference.model import PLNInference; p = PLNInference(); r = p.evaluate('p -> p', hypotheses=['p : Prop']); print(r.status, r.stv, r.is_fallback)"
+```
+
+`r.stv` is the strength-and-confidence value returned by PLN. An
+`is_fallback=True` result with status `petta_unavailable` means the executable was not
+found.
+
+## 6. Train the pointer model
+
+Choose one pointer preset from the table in the architecture section. Update its
+`prepared_root` and `run_root`, then train it. This example selects the GATv2
+`state_mean_attention` readout:
+
+```bash
+uv run python -m maths_ai.gnn_inference.scripts.train_baseline \
+  --model-type pointer \
+  --config maths_ai/gnn_inference/configs/pointer_gatv2_state_mean_attention.json
+```
+
+For GraphSAGE, use:
+
+```bash
+uv run python -m maths_ai.gnn_inference.scripts.train_baseline \
+  --model-type pointer \
+  --config maths_ai/gnn_inference/configs/pointer_graphsage_state.json
+```
+
+Each supervised preset combines an example-count limit with two graph-size limits:
+
+- `training.batch_size` limits the number of examples in a batch;
+- `training.max_batch_nodes` and `training.max_batch_edges` limit the combined graph
+  size of the batch.
+
+The graph-budget sampler forms a batch only while all enabled limits remain satisfied.
+`edge_mode` selects whether `max_batch_edges` is checked against `edges_forward` or
+`edges_bidirectional` in each prepared sidecar. The checked-in presets use
+`"edge_mode": "bidirectional"`.
+
+The output used by the next phase is the pointer run's `best.pt`.
+The preset's `run_root` determines its directory; do not infer the path from the preset
+filename.
+
+## 7. Train the matching supervised actor-critic
+
+Select the actor-critic preset with the same architecture and readout as the pointer
+checkpoint. Set:
+
+```json
+"prepared_root": "/abs/path/to/prepared/v1",
+"pretrained_pointer_checkpoint": "maths_ai/gnn_inference/runs/pointer_gatv2_state_mean_attention/<run>/best.pt"
+```
+
+The complete normalized `model` specification must match the pointer checkpoint. This
+includes `architecture`, `hidden_dim`, `dropout`, `use_node_type`, `max_args`, and all
+fields inside `encoder`. Pointer transfer also verifies both vocabulary fingerprints.
+There is no partial or architecture-only transfer mode.
+
+For the example GATv2 chain:
+
+```bash
+uv run python -m maths_ai.gnn_inference.scripts.train_baseline \
+  --model-type actor_critic \
+  --config maths_ai/gnn_inference/configs/actor_critic_gatv2_state_mean_attention.json
+```
+
+For GraphSAGE:
+
+```bash
+uv run python -m maths_ai.gnn_inference.scripts.train_baseline \
   --model-type actor_critic \
   --config maths_ai/gnn_inference/configs/actor_critic_graphsage_state.json
 ```
 
-3. Verify the warm start took, on the console: the
-   `Warm-start: loaded N tensors ...` line, and **first-epoch tactic accuracy ≈ the
-   pointer run's final accuracy** (the zero-residual property: the actor's step-0
-   distribution is the supervised classifier's; near-random first-epoch accuracy means
-   the warm start failed and the shape guard should have said why).
+At startup, verify the `Warm-start: loaded N tensors ...` message. The output needed by
+RL is the actor-critic run's `best.pt`.
 
-4. Output: `runs/actor_critic_gnn/<timestamp>/best.pt` — the input to hand-off B.
+## 8. Inspect or migrate the checkpoint
 
-## 5. Hand-off B: launch the RL driver
+All runtime loaders require checkpoint format version 2. Inspect an actor-critic
+checkpoint before starting a long RL run:
 
-1. Edit `maths_ai/gnn_inference/configs/rl_actor_critic.json`:
-
-```json
-"warmstart_checkpoint": "runs/actor_critic_gnn/<timestamp>/best.pt",
-"prepared_root": "/abs/path/artifacts/prepared/v1",
-"run_root": "runs/rl_actor_critic",
-"device": "auto",
-"use_pln": true
+```bash
+uv run python -c "import pprint, torch; checkpoint = torch.load('maths_ai/gnn_inference/runs/actor_critic_gatv2_state_mean_attention/<run>/best.pt', map_location='cpu', weights_only=False); pprint.pp(checkpoint.get('manifest'))"
 ```
 
-   Leave the architecture block (`hidden_dim` etc.) matching the checkpoint — the strict
-   load makes any disagreement a startup error, which is the guard working, not a bug.
-   The rest of the config (curriculum, BC anneal, budgets) ships with the plan's
-   defaults; the two you are most likely to tune first are `theorems_per_round` (8) and
-   `theorem_timeout_s` (120).
+Confirm that the manifest contains:
 
-   **`use_pln`** (default `true`) controls whether the PLN component participates in the
-   search. Setting it to `false`:
-   - No petta subprocess is ever spawned — `PLNInference` is never constructed.
-   - Subgoal nodes are added in the order Lean produces them, capped at `top_k_subgoals`;
-     frontier ranking degrades to GNN probability alone (`stv=None` is handled by the
-     existing `ProofNode.local_score` path with no code change).
-   - The `_expand` PLN-fallback path is disabled — a node whose tactic candidates were all
-     rejected by Lean is marked exhausted rather than closed via a fabricated QED edge.
-   - `edge_shaped_reward` reduces to `edge_terminal_reward`: every shaping potential
-     `Φ(node)` is zero because `potential()` already returns `0.0` when `node.stv is None`.
+- `checkpoint_format_version: 2`;
+- `model_kind: actor_critic_with_args`;
+- the expected `model_spec`, including the GATv2 readout when applicable;
+- `node_vocab_fingerprint` and `tactic_vocab_fingerprint`;
+- `encoder_fingerprint`.
 
-   Use `"use_pln": false` for a terminal-reward-only ablation, or when petta is not
-   installed and you want a clean signal rather than fallback noise.
+Runtime loaders reject version-1 checkpoints and bare state dictionaries. Migrate an
+audited GraphSAGE actor-critic checkpoint offline with:
 
-2. Launch **inside a persistent terminal** — a JupyterLab terminal dies with your browser
-   session unless wrapped, so use tmux (or `nohup ... &`):
+```bash
+uv run python -m maths_ai.gnn_inference.scripts.migrate_model_checkpoint \
+  --layout ac_graphsage_actor_critic \
+  --checkpoint runs/legacy_actor_critic/best.pt \
+  --config runs/legacy_actor_critic/config.json \
+  --prepared-root maths_ai/gnn_inference/artifacts/prepared/v1 \
+  --output runs/migrated_actor_critic/best.pt
+```
+
+The accepted migration layouts are:
+
+- `graphsage_baseline`;
+- `graphsage_pointer`;
+- `ac_graphsage_actor_critic`;
+- `gatv2_baseline`;
+- `gatv2_pointer`.
+
+For example, migrate a legacy GATv2 pointer checkpoint with:
+
+```bash
+uv run python -m maths_ai.gnn_inference.scripts.migrate_model_checkpoint \
+  --layout gatv2_pointer \
+  --checkpoint runs/legacy_gatv2_pointer/best.pt \
+  --config runs/legacy_gatv2_pointer/config.json \
+  --prepared-root maths_ai/gnn_inference/artifacts/prepared/v1 \
+  --output runs/migrated_gatv2_pointer/best.pt
+```
+
+Migration remaps only the listed, audited layouts. It builds the current model, loads
+all remapped parameters strictly, verifies public model outputs on a fixed batch, and
+writes a version-2 manifest. There is no legacy GATv2 actor-critic migration layout; use
+a matching pointer checkpoint to train a current actor-critic checkpoint first.
+
+## 9. Configure and launch RL
+
+Edit `maths_ai/gnn_inference/configs/rl_actor_critic.json`:
+
+```json
+"warmstart_checkpoint": "maths_ai/gnn_inference/runs/actor_critic_gatv2_state_mean_attention/<run>/best.pt",
+"prepared_root": "/abs/path/to/prepared/v1",
+"run_root": "runs/rl_actor_critic",
+"device": "auto",
+"source_root": "/abs/path/to/mathlib-lake-project",
+"use_pln": false
+```
+
+The checked-in preset has `use_pln: false`. The `RLTrainingConfig` class default is
+`true`, but the JSON value is explicit and therefore controls a normal launch.
+
+With `use_pln: true`, petta supplies each search node's PLN value and the reward code
+uses the change in that value as potential-based shaping. With `use_pln: false`:
+
+- no `PLNInference` object or petta subprocess is created;
+- Lean subgoals remain in executor order, subject to `top_k_subgoals`;
+- search frontier scoring uses the GNN probability with `stv=None`;
+- the PLN fallback that can fabricate a QED edge after executor rejection is disabled;
+- every shaping potential is zero, so the reward contains the configured terminal terms
+  and per-transition step penalty, without PLN shaping.
+
+The RL search budgets and update budgets control different objects:
+
+| Config field | Limit |
+|---|---|
+| `max_depth` | maximum tactic depth within one theorem search |
+| `max_nodes` | maximum proof-search nodes within one theorem search |
+| `theorems_per_round` | theorem searches collected before one optimizer update |
+| `max_update_nodes` | total graph nodes across all transitions and rejected actions in one optimizer update |
+| `max_update_edges` | total graph edges across all transitions and rejected actions in one optimizer update |
+
+The update is rejected if the complete collected round exceeds either enabled update
+budget. Reduce `theorems_per_round` to collect a smaller update, or raise the budget only
+after measuring available memory.
+
+Launch inside `tmux` or another session that survives a browser disconnect:
 
 ```bash
 tmux new -s rl
-cd /path/to/new-maths && source ~/.elan/env
-uv run python maths_ai/gnn_inference/scripts/rl_train.py \
+cd /path/to/new-maths
+source ~/.elan/env
+uv run python -m maths_ai.gnn_inference.scripts.rl_train \
   --config maths_ai/gnn_inference/configs/rl_actor_critic.json \
   2>&1 | tee rl_train.log
-# detach: Ctrl-b d      reattach later: tmux attach -t rl
 ```
 
-3. What startup prints, in order — each line is a checkpoint you can verify:
-   `Warm start (strict): ...` → `Run dir: runs/rl_actor_critic/<stamp>` →
-   `Theorem pool: N usable states, M dropped` → `Pool: X train / Y eval; curriculum
-   window Z` → per-round lines:
+You can also override the Lean environment without editing the JSON:
 
+```bash
+uv run python -m maths_ai.gnn_inference.scripts.rl_train \
+  --config maths_ai/gnn_inference/configs/rl_actor_critic.json \
+  --source-root /abs/path/to/mathlib-lake-project \
+  --pantograph-repl /abs/path/to/pantograph-repl
 ```
-Round 0: solved 2/8, trans 11, fail 19, return 0.213, loss 0.847, bc 0.500, 94.2s
+
+The driver verifies the Lean environment before constructing the model. It then loads
+the prepared vocabularies, validates the checkpoint manifest, reconstructs the exact
+actor-critic architecture, and loads the full state dictionary strictly.
+
+## 10. Monitor, resume, and evaluate
+
+A round line distinguishes executor-rejected actions from complete search errors:
+
+```text
+Round 0: solved 2/8, trans 11, rej 19, err 0, return 0.213, loss 0.847, bc 0.500, 94.2s
 ```
 
-## 6. Monitoring, resuming, evaluating
+- `rej` counts sampled actions rejected by Lean inside searches that ran;
+- `err` counts complete theorem searches that raised an exception or timed out.
 
-**Monitor** — from a JupyterLab notebook (this is the one place a notebook is the right
-tool), plot the metrics file the driver appends per round:
+An environment that cannot elaborate the theorem pool commonly reports `rej 0` and an
+`err` count near `theorems_per_round`. Check `source_root`, imports, the Lean toolchain,
+and the Pantograph REPL before changing model settings.
+
+The driver appends one JSON object per round to `metrics.jsonl`. A notebook can plot the
+principal metrics:
 
 ```python
-import json, pandas as pd
-rows = [json.loads(l) for l in open("runs/rl_actor_critic/<stamp>/metrics.jsonl")]
-train = pd.DataFrame([r for r in rows if "num_transitions" in r])
-train.plot(x="round", y=["solved", "num_failures", "mean_return", "total_loss"], subplots=True)
+import json
+import pandas as pd
+
+path = "runs/rl_actor_critic/<run>/metrics.jsonl"
+rows = [json.loads(line) for line in open(path)]
+train = pd.DataFrame(row for row in rows if "num_transitions" in row)
+train.plot(
+    x="round",
+    y=["solved", "num_failures", "searches_failed", "mean_return", "total_loss"],
+    subplots=True,
+)
 ```
 
-Healthy early signs: `num_failures` trending down, `solved` and `mean_return` up,
-`entropy` positive (not collapsing to 0), curriculum-widened lines appearing.
-
-**Resume after a disconnect/preemption** — the driver checkpoints `last.pt` (model +
-optimizer + RNG + round counter) every `checkpoint_every` rounds:
+Resume from the run directory containing `last.pt`:
 
 ```bash
-uv run python maths_ai/gnn_inference/scripts/rl_train.py \
+uv run python -m maths_ai.gnn_inference.scripts.rl_train \
   --config maths_ai/gnn_inference/configs/rl_actor_critic.json \
-  --resume runs/rl_actor_critic/<stamp>
+  --resume runs/rl_actor_critic/<run>
 ```
 
-**Evaluate** — greedy proof rate on the same held-out pool, for the comparison that
-matters (did RL beat its own warm start):
+Evaluate the supervised warm start and the RL-selected checkpoint on the same held-out
+pool:
 
 ```bash
-# baseline: the supervised warm start, before any RL
-uv run python maths_ai/gnn_inference/scripts/rl_train.py \
+uv run python -m maths_ai.gnn_inference.scripts.rl_train \
   --config maths_ai/gnn_inference/configs/rl_actor_critic.json \
-  --eval-only --checkpoint runs/actor_critic_gnn/<timestamp>/best.pt
+  --eval-only \
+  --checkpoint maths_ai/gnn_inference/runs/actor_critic_gatv2_state_mean_attention/<run>/best.pt
 
-# RL-tuned
-uv run python maths_ai/gnn_inference/scripts/rl_train.py \
+uv run python -m maths_ai.gnn_inference.scripts.rl_train \
   --config maths_ai/gnn_inference/configs/rl_actor_critic.json \
-  --eval-only --checkpoint runs/rl_actor_critic/<stamp>/best.pt
+  --eval-only \
+  --checkpoint runs/rl_actor_critic/<run>/best.pt
 ```
 
-`best.pt` in the run dir is already model-selected by this metric (evaluated every
-`eval_every` rounds), so the final artifact of the whole pipeline is
-`runs/rl_actor_critic/<stamp>/best.pt`.
+The RL run's `best.pt` is selected by greedy proof rate at each evaluation interval.
+`last.pt` contains the model, optimizer, random-number-generator state, and round counter
+needed to resume training.
 
-## 7. Failure modes at startup, and what each means
+## 11. Lemma-index and premise-scorer compatibility
 
-| Error | Cause | Fix |
+This section applies when an inference or training path uses a lemma index or a learned
+premise scorer. Their manifests store the `encoder_fingerprint`, a hash derived from the
+normalized model specification, both vocabulary mappings, and the trained encoder
+weights.
+
+A lemma index or premise-scorer checkpoint is valid only for the exact encoder that
+created it. Switching from GraphSAGE to GATv2, changing a GATv2 readout, changing a
+vocabulary assignment, or changing encoder weights produces a different fingerprint.
+Rebuild the lemma index and retrain or replace the scorer for the active model. Loaders
+reject mismatched fingerprints rather than using incompatible embeddings.
+
+## 12. Common failures
+
+| Error or symptom | Mechanism | Required action |
 |---|---|---|
-| `Missing vocab file: .../vocab/node_vocab.json` | `prepared_root` wrong or symlink broken | point at the real prepared dataset directory |
-| `RuntimeError: Error(s) in loading state_dict ... size mismatch` | architecture block ≠ checkpoint | set `hidden_dim`/`num_layers`/`max_args` to the checkpoint's values |
-| `Missing key(s) in state_dict: "actor.base.weight" ...` | a pointer checkpoint was given to hand-off B | run hand-off A first |
-| `Warm-start shape mismatch (hidden_dim disagreement...)` | hand-off A config ≠ pointer architecture | same fix as above, in the AC config |
-| every PLN result `is_fallback=True` | petta not found | install petta / set `PETTA_BIN`; or set `"use_pln": false` to skip PLN entirely |
-| `Server.create()` hangs or errors | no Lean toolchain | install elan, `source ~/.elan/env` |
-| `ModuleNotFoundError: datasets` | streaming dep not installed | `uv add datasets` |
+| missing `vocab/node_vocab.json` | `prepared_root` does not identify a complete prepared dataset | point all phases at the real prepared root |
+| sidecar is missing `edges_forward` or `edges_bidirectional` | prepared data predates edge-mode-aware graph budgets | regenerate the prepared dataset |
+| checkpoint has no version-2 manifest | a version-1 checkpoint or bare state dictionary was supplied | run the audited offline migration, or retrain when no migration layout exists |
+| checkpoint model kind is `tactic_with_args` | a pointer checkpoint was supplied directly to RL | train the matching supervised actor-critic first |
+| pointer and actor-critic model specifications differ | architecture, readout, dimensions, or another normalized model field does not match | use matching presets and identical complete `model` blocks |
+| vocabulary fingerprint does not match | the prepared vocabulary mapping differs from the checkpoint's mapping | use the prepared dataset that created the checkpoint |
+| encoder fingerprint does not match | encoder weights, architecture, readout, or vocabularies differ | rebuild the dependent index or scorer for the active checkpoint |
+| GATv2 reports a non-finite loss | the current batch or precision produced invalid values | use the registered GATv2 precision policy and inspect the named loss and batch |
+| collected RL update exceeds its graph budget | all graphs in the round exceed `max_update_nodes` or `max_update_edges` together | reduce `theorems_per_round` or raise a measured update limit |
+| round shows many `err` values and no transitions | complete Lean searches are failing or timing out | verify `source_root`, imports, toolchain compatibility, and the REPL |
+| every PLN result is a fallback | petta is unavailable or failing | set `PETTA_BIN`, fix petta, or run explicitly with `use_pln: false` |
+| `ModuleNotFoundError: datasets` | Hugging Face dataset streaming dependency is absent | install it with `uv add datasets` |
+
+For an environment and integration diagnostic after these checks, run:
+
+```bash
+uv run python -m pytest maths_ai/gnn_inference/tests/ -q
+uv run python -m maths_ai.gnn_inference.scripts.rl_smoke \
+  --source-root /abs/path/to/mathlib-lake-project
+```
