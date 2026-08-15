@@ -28,6 +28,7 @@ from maths_ai.data_models.proof_components import Goal
 from maths_ai.hybrid_reasoner.pantograph_env import PantographEnv
 
 from .actor_critic import ActorCriticWithArgsClassifier
+from .checkpointing import build_model_from_checkpoint, checkpoint_payload
 from .dataset import iter_dataset_rows
 from .pln_reward import RewardConfig
 from .pln_rl_training import make_dag_featurizer, train_step_onpolicy
@@ -45,11 +46,8 @@ from .state import parse_state
 class RLTrainingConfig:
     """Configuration for the RL training driver (flat JSON, ``from_json`` below).
 
-    ``warmstart_checkpoint`` is the phase-3 supervised actor-critic ``best.pt``
-    (full ``ActorCriticWithArgsClassifier`` state dict, loaded strict). The
-    ``hidden_dim``/``num_layers``/``max_args``/``use_node_type`` block must match
-    that checkpoint's architecture — the strict load turns a mismatch into a
-    startup error instead of a silent random init.
+    ``warmstart_checkpoint`` is a version-2, self-describing supervised
+    actor-critic checkpoint. Its manifest owns the encoder architecture.
     """
 
     warmstart_checkpoint: Path
@@ -93,7 +91,7 @@ class RLTrainingConfig:
     max_depth: int = 8
     max_nodes: int = 64
     # Set to False to disable all PLN involvement (no petta subprocess, no reward
-    # shaping, no PLN fallback QED).  Reward degrades to terminal-only.
+    # shaping, no PLN fallback QED). Terminal rewards and the step penalty remain.
     use_pln: bool = True
 
     # Optimizer / loss.
@@ -103,19 +101,14 @@ class RLTrainingConfig:
     critic_weight: float = 0.5
     entropy_weight: float = 0.01
     arg_loss_weight: float = 0.5
+    max_update_nodes: int = 0
+    max_update_edges: int = 0
 
     # Reward (Approach 1 potential shaping lives inside pln_reward).
     reward_gamma: float = 0.99
     reward_step_penalty: float = 0.01
     reward_terminal_success: float = 1.0
     reward_terminal_failure: float = 0.0
-
-    # Model architecture — MUST match the warm-start checkpoint (strict load enforces it).
-    hidden_dim: int = 512
-    num_layers: int = 4
-    dropout: float = 0.2
-    max_args: int = 3
-    use_node_type: bool = True
 
     run_root: Path = Path("runs/rl_actor_critic")
     device: str = "auto"
@@ -393,20 +386,26 @@ def save_checkpoint(
     path: Path,
     *,
     anneal_rounds_done: int = 0,
+    node_vocab: dict[str, int],
+    tactic_vocab: dict[str, int],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "round": round_idx,
-            "curriculum_size": curriculum_size,
-            "best_proof_rate": best_proof_rate,
+        checkpoint_payload(
+            model_kind="actor_critic_with_args",
+            model_spec=model.model_spec,
+            node_vocab=node_vocab,
+            tactic_vocab=tactic_vocab,
+            model=model,
+            optimizer_state_dict=optimizer.state_dict(),
+            round=round_idx,
+            curriculum_size=curriculum_size,
+            best_proof_rate=best_proof_rate,
             # The BC-anneal clock counts optimizer steps, not loop iterations, so it
             # cannot be recomputed from `round` on resume.
-            "anneal_rounds_done": anneal_rounds_done,
-            "torch_rng_state": torch.get_rng_state(),
-        },
+            anneal_rounds_done=anneal_rounds_done,
+            torch_rng_state=torch.get_rng_state(),
+        ),
         path,
     )
 
@@ -479,6 +478,34 @@ def _create_run_dir(run_root: Path) -> Path:
     return run_dir
 
 
+async def _create_live_reasoner(
+    *,
+    model: ActorCriticWithArgsClassifier,
+    node_vocab: dict[str, int],
+    tactic_vocab: dict[str, int],
+    cfg: RLTrainingConfig,
+    device: torch.device,
+    env: PantographEnv,
+) -> RLHybridReasoner:
+    """Create the live search reasoner from the complete RL search config."""
+    from maths_ai.hybrid_reasoner.joint_inference import PantographExecutor
+
+    server = await env.create_server()
+    return RLHybridReasoner(
+        model=model,
+        node_vocab=node_vocab,
+        tactic_vocab=tactic_vocab,
+        executor=PantographExecutor(server),
+        device=device,
+        top_k_tactics=cfg.top_k_tactics,
+        top_k_subgoals=cfg.top_k_subgoals,
+        max_depth=cfg.max_depth,
+        max_nodes=cfg.max_nodes,
+        use_pln=cfg.use_pln,
+        env=env,
+    )
+
+
 async def run_rl_training(
     cfg: RLTrainingConfig,
     *,
@@ -495,19 +522,15 @@ async def run_rl_training(
     device = _resolve_device(cfg.device)
     node_vocab, tactic_vocab = _load_vocabs(cfg.prepared_root)
 
-    # Model + warm start (strict full load of the supervised actor-critic run).
-    model = ActorCriticWithArgsClassifier(
-        num_node_labels=len(node_vocab),
-        num_tactics=len(tactic_vocab),
-        hidden_dim=cfg.hidden_dim,
-        num_layers=cfg.num_layers,
-        dropout=cfg.dropout,
-        use_node_type=cfg.use_node_type,
-        max_args=cfg.max_args,
-    ).to(device)
-
+    # The checkpoint manifest owns the complete actor-critic architecture.
     checkpoint = torch.load(cfg.warmstart_checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint.get("model_state_dict", checkpoint), strict=True)
+    model, warmstart_manifest, warmstart_spec = build_model_from_checkpoint(
+        checkpoint,
+        node_vocab=node_vocab,
+        tactic_vocab=tactic_vocab,
+        expected_model_kind="actor_critic_with_args",
+    )
+    model = model.to(device)
     console_print(f"Warm start (strict): {cfg.warmstart_checkpoint}")
 
     optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
@@ -523,7 +546,16 @@ async def run_rl_training(
         if not last_path.exists():
             raise FileNotFoundError(f"Resume requested but {last_path} does not exist")
         state = torch.load(last_path, map_location=device, weights_only=False)
-        model.load_state_dict(state["model_state_dict"], strict=True)
+        resumed_model, _, resumed_spec = build_model_from_checkpoint(
+            state,
+            node_vocab=node_vocab,
+            tactic_vocab=tactic_vocab,
+            expected_model_kind="actor_critic_with_args",
+        )
+        if resumed_spec != warmstart_spec:
+            raise ValueError("Resume checkpoint model specification differs from the warm start.")
+        model = resumed_model.to(device)
+        optimizer = AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
         optimizer.load_state_dict(state["optimizer_state_dict"])
         torch.set_rng_state(state["torch_rng_state"].cpu())
         start_round = int(state["round"]) + 1
@@ -543,24 +575,15 @@ async def run_rl_training(
 
     # Reasoner (live Pantograph unless a factory is injected).
     if reasoner_factory is None:
-        from maths_ai.hybrid_reasoner.joint_inference import PantographExecutor
-
         env = pantograph_env(cfg)
         env.verify()
         console_print(f"Pantograph environment: {env.describe()}")
-        server = await env.create_server()
-        executor = PantographExecutor(server)
-        reasoner = RLHybridReasoner(
+        reasoner = await _create_live_reasoner(
             model=model,
             node_vocab=node_vocab,
             tactic_vocab=tactic_vocab,
-            executor=executor,
+            cfg=cfg,
             device=device,
-            top_k_tactics=cfg.top_k_tactics,
-            top_k_subgoals=cfg.top_k_subgoals,
-            max_depth=cfg.max_depth,
-            max_nodes=cfg.max_nodes,
-            use_pln=cfg.use_pln,
             env=env,
         )
     else:
@@ -629,6 +652,8 @@ async def run_rl_training(
                 entropy_weight=cfg.entropy_weight,
                 arg_loss_weight=cfg.arg_loss_weight,
                 bc_weight=bc_weight,
+                max_update_nodes=cfg.max_update_nodes,
+                max_update_edges=cfg.max_update_edges,
             )
             anneal_rounds_done += 1
         else:
@@ -679,6 +704,7 @@ async def run_rl_training(
             save_checkpoint(
                 model, optimizer, round_idx, pool.curriculum_size, best_proof_rate,
                 run_dir / "last.pt", anneal_rounds_done=anneal_rounds_done,
+                node_vocab=node_vocab, tactic_vocab=tactic_vocab,
             )
 
         if cfg.eval_every > 0 and (round_idx + 1) % cfg.eval_every == 0 and pool.eval_items:
@@ -693,6 +719,7 @@ async def run_rl_training(
                 save_checkpoint(
                     model, optimizer, round_idx, pool.curriculum_size, best_proof_rate,
                     run_dir / "best.pt", anneal_rounds_done=anneal_rounds_done,
+                    node_vocab=node_vocab, tactic_vocab=tactic_vocab,
                 )
                 console_print(f"  New best proof rate {best_proof_rate:.3f} → best.pt")
 
@@ -700,6 +727,7 @@ async def run_rl_training(
     save_checkpoint(
         model, optimizer, cfg.num_rounds - 1, pool.curriculum_size, best_proof_rate,
         run_dir / "last.pt", anneal_rounds_done=anneal_rounds_done,
+        node_vocab=node_vocab, tactic_vocab=tactic_vocab,
     )
     return last_metrics
 
@@ -758,26 +786,21 @@ def driver_main(argv: list[str] | None = None) -> int:
 
             device = _resolve_device(cfg.device)
             node_vocab, tactic_vocab = _load_vocabs(cfg.prepared_root)
-            model = ActorCriticWithArgsClassifier(
-                num_node_labels=len(node_vocab),
-                num_tactics=len(tactic_vocab),
-                hidden_dim=cfg.hidden_dim,
-                num_layers=cfg.num_layers,
-                dropout=cfg.dropout,
-                use_node_type=cfg.use_node_type,
-                max_args=cfg.max_args,
-            ).to(device)
             checkpoint = torch.load(cfg.warmstart_checkpoint, map_location=device, weights_only=False)
-            model.load_state_dict(checkpoint.get("model_state_dict", checkpoint), strict=True)
+            model, _, _ = build_model_from_checkpoint(
+                checkpoint,
+                node_vocab=node_vocab,
+                tactic_vocab=tactic_vocab,
+                expected_model_kind="actor_critic_with_args",
+            )
+            model = model.to(device)
 
-            from maths_ai.hybrid_reasoner.joint_inference import PantographExecutor
-
-            server = await env.create_server()
-            reasoner = RLHybridReasoner(
-                model=model, node_vocab=node_vocab, tactic_vocab=tactic_vocab,
-                executor=PantographExecutor(server), device=device,
-                top_k_tactics=cfg.top_k_tactics, top_k_subgoals=cfg.top_k_subgoals,
-                max_depth=cfg.max_depth, max_nodes=cfg.max_nodes,
+            reasoner = await _create_live_reasoner(
+                model=model,
+                node_vocab=node_vocab,
+                tactic_vocab=tactic_vocab,
+                cfg=cfg,
+                device=device,
                 env=env,
             )
             pool = build_theorem_pool(cfg)

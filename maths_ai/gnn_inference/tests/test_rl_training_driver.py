@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from torch.optim import AdamW
@@ -14,6 +15,7 @@ from maths_ai.hybrid_reasoner.hypergraph import TacticOutcome
 from maths_ai.pln_inference.model import PLNResult
 
 from maths_ai.gnn_inference.atp_lean_gnn.actor_critic import ActorCriticWithArgsClassifier
+from maths_ai.gnn_inference.atp_lean_gnn.checkpointing import checkpoint_payload
 from maths_ai.gnn_inference.atp_lean_gnn.graph import proof_state_to_dag
 from maths_ai.gnn_inference.atp_lean_gnn.pln_rl_training import goal_to_state
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import build_vocab
@@ -25,6 +27,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.rl_training_driver import (
     bc_weight_at_round,
     build_theorem_pool,
     collect_round,
+    driver_main,
     evaluate_proof_rate,
     pantograph_env,
     run_rl_training,
@@ -124,14 +127,8 @@ def _build_node_vocab():
 
 
 def _make_model(node_vocab):
-    return ActorCriticWithArgsClassifier(
-        num_node_labels=len(node_vocab),
-        num_tactics=len(TACTIC_VOCAB),
-        hidden_dim=16,
-        num_layers=2,
-        dropout=0.1,
-        max_args=2,
-    )
+    from maths_ai.gnn_inference.tests.model_helpers import actor_critic
+    return actor_critic(len(node_vocab), len(TACTIC_VOCAB))
 
 
 def _make_reasoner(model, node_vocab, executor, *, top_k=3):
@@ -168,17 +165,22 @@ def _write_config(tmp: Path, **overrides) -> RLTrainingConfig:
     torch.manual_seed(0)
     model = _make_model(node_vocab)
     ckpt = tmp / "warmstart.pt"
-    torch.save({"model_state_dict": model.state_dict()}, ckpt)
+    torch.save(
+        checkpoint_payload(
+            model_kind="actor_critic_with_args",
+            model_spec=model.model_spec,
+            node_vocab=node_vocab,
+            tactic_vocab=TACTIC_VOCAB,
+            model=model,
+        ),
+        ckpt,
+    )
 
     defaults = dict(
         warmstart_checkpoint=ckpt,
         prepared_root=tmp / "prepared",
         run_root=tmp / "runs",
         device="cpu",
-        hidden_dim=16,
-        num_layers=2,
-        dropout=0.1,
-        max_args=2,
         num_rounds=2,
         theorems_per_round=2,
         theorem_timeout_s=30.0,
@@ -552,7 +554,7 @@ class PantographEnvResolverTests(unittest.TestCase):
 
 
 class PLNKillSwitchConfigTests(unittest.TestCase):
-    """Tests for use_pln threading through RLTrainingConfig and run_rl_training."""
+    """Tests for use_pln threading through training and standalone evaluation."""
 
     def test_use_pln_false_survives_roundtrip(self):
         """use_pln=False survives to_dict / from_json without being reset."""
@@ -578,6 +580,63 @@ class PLNKillSwitchConfigTests(unittest.TestCase):
             torch.manual_seed(0)
             asyncio.run(run_rl_training(cfg, reasoner_factory=_recording_factory, pool=_pool()))
         self.assertEqual(received, [False])
+
+    def test_eval_only_does_not_construct_pln(self):
+        """The standalone evaluation path uses the same PLN-disabled reasoner config."""
+        observed: list[tuple[bool, object, object]] = []
+
+        class _EvalEnv:
+            def verify(self):
+                return None
+
+            def describe(self):
+                return "test environment"
+
+            async def create_server(self):
+                return _FakeServer()
+
+        async def _record_reasoner(reasoner, items, *, timeout_s):
+            observed.append(
+                (reasoner.use_pln, reasoner.petta_chainer, reasoner.dts_sampler)
+            )
+            return {
+                "proof_rate": 0.0,
+                "solved": 0.0,
+                "attempted": float(len(items)),
+                "searches_failed": 0.0,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = _write_config(tmp, use_pln=False, eval_pool_size=1)
+            config_path = tmp / "config.json"
+            with open(config_path, "w") as f:
+                json.dump(cfg.to_dict(), f)
+
+            with (
+                patch(
+                    "maths_ai.hybrid_reasoner.joint_inference.PLNInference",
+                    side_effect=AssertionError("PLNInference must not be constructed"),
+                ),
+                patch(
+                    "maths_ai.gnn_inference.atp_lean_gnn.rl_training_driver.pantograph_env",
+                    return_value=_EvalEnv(),
+                ),
+                patch(
+                    "maths_ai.gnn_inference.atp_lean_gnn.rl_training_driver.build_theorem_pool",
+                    return_value=_pool(n_items=2, eval_size=1),
+                ),
+                patch(
+                    "maths_ai.gnn_inference.atp_lean_gnn.rl_training_driver.evaluate_proof_rate",
+                    new=_record_reasoner,
+                ),
+            ):
+                self.assertEqual(
+                    driver_main(["--config", str(config_path), "--eval-only"]),
+                    0,
+                )
+
+        self.assertEqual(observed, [(False, None, None)])
 
 
 if __name__ == "__main__":

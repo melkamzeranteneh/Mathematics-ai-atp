@@ -25,6 +25,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.pln_rl_training import (
 )
 from maths_ai.gnn_inference.atp_lean_gnn.rl_reasoner import RLHybridReasoner
 from maths_ai.gnn_inference.atp_lean_gnn.search_harvest import extract_transitions
+from maths_ai.gnn_inference.tests.model_helpers import actor_critic
 
 
 # ---------------------------------------------------------------------------
@@ -85,14 +86,7 @@ def _make_reasoner(executor, *, top_k=3, seed=0):
     from maths_ai.gnn_inference.atp_lean_gnn.pln_rl_training import goal_to_state
 
     node_vocab = build_vocab([proof_state_to_dag(goal_to_state(goal))])
-    model = ActorCriticWithArgsClassifier(
-        num_node_labels=len(node_vocab),
-        num_tactics=len(TACTIC_VOCAB),
-        hidden_dim=16,
-        num_layers=2,
-        dropout=0.1,
-        max_args=2,
-    )
+    model = actor_critic(len(node_vocab), len(TACTIC_VOCAB))
     reasoner = RLHybridReasoner(
         model,
         node_vocab,
@@ -284,14 +278,7 @@ class PLNDisabledTests(unittest.TestCase):
         from maths_ai.gnn_inference.atp_lean_gnn.pln_rl_training import goal_to_state
 
         node_vocab = build_vocab([proof_state_to_dag(goal_to_state(goal))])
-        model = ActorCriticWithArgsClassifier(
-            num_node_labels=len(node_vocab),
-            num_tactics=len(TACTIC_VOCAB),
-            hidden_dim=16,
-            num_layers=2,
-            dropout=0.1,
-            max_args=2,
-        )
+        model = actor_critic(len(node_vocab), len(TACTIC_VOCAB))
         reasoner = RLHybridReasoner(
             model,
             node_vocab,

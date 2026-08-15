@@ -33,6 +33,27 @@ from .search_harvest import HarvestConfig, HarvestedTransition, extract_transiti
 from maths_ai.data_models.proof_components import Goal
 
 
+def _validate_update_size(
+    datas: list[Data],
+    *,
+    max_update_nodes: int,
+    max_update_edges: int,
+) -> tuple[int, int]:
+    if max_update_nodes < 0 or max_update_edges < 0:
+        raise ValueError("RL update node and edge budgets cannot be negative.")
+    node_count = sum(int(data.num_nodes) for data in datas)
+    edge_count = sum(int(data.edge_index.size(1)) for data in datas)
+    if (max_update_nodes and node_count > max_update_nodes) or (
+        max_update_edges and edge_count > max_update_edges
+    ):
+        raise ValueError(
+            "Collected RL update exceeds its graph budget: "
+            f"graphs={len(datas)}, nodes={node_count}, edges={edge_count}, "
+            f"max_nodes={max_update_nodes}, max_edges={max_update_edges}."
+        )
+    return node_count, edge_count
+
+
 @dataclass(frozen=True)
 class EdgeAction:
     """The integer record of one sampled action — everything the train phase needs to
@@ -120,6 +141,8 @@ def compute_transition_loss(
     critic_weight: float = 0.5,
     entropy_weight: float = 0.01,
     bc_weight: float = 0.0,
+    max_update_nodes: int = 0,
+    max_update_edges: int = 0,
 ) -> tuple[torch.Tensor, dict[str, float]] | None:
     """One actor-critic loss over a batch of harvested transitions (tactic-level policy grad).
 
@@ -146,6 +169,11 @@ def compute_transition_loss(
     if not datas:
         return None
 
+    node_count, edge_count = _validate_update_size(
+        datas,
+        max_update_nodes=max_update_nodes,
+        max_update_edges=max_update_edges,
+    )
     batch = Batch.from_data_list(datas).to(device)
     _node_emb, _state_emb, tactic_logits, values = model.encode(batch)
 
@@ -183,6 +211,8 @@ def compute_transition_loss(
         "mean_return": float(returns_t.mean().item()),
         "mean_value_target": float(value_targets_t.mean().item()),
         "num_transitions": float(len(datas)),
+        "update_node_count": float(node_count),
+        "update_edge_count": float(edge_count),
     }
     return total, metrics
 
@@ -200,6 +230,8 @@ def compute_onpolicy_loss(
     arg_loss_weight: float = 0.5,
     bc_weight: float = 0.0,
     reward_cfg: RewardConfig | None = None,
+    max_update_nodes: int = 0,
+    max_update_edges: int = 0,
 ) -> tuple[torch.Tensor, dict[str, float]] | None:
     """On-policy actor-critic loss with the argument-level policy gradient (B2).
 
@@ -252,6 +284,11 @@ def compute_onpolicy_loss(
     if not datas:
         return None
 
+    node_count, edge_count = _validate_update_size(
+        datas,
+        max_update_nodes=max_update_nodes,
+        max_update_edges=max_update_edges,
+    )
     batch = Batch.from_data_list(datas).to(device)
     max_args = max((len(r) for r in arg_rows), default=0)
     if max_args > 0:
@@ -312,6 +349,8 @@ def compute_onpolicy_loss(
         "mean_arg_logp": float(arg_logp.mean().item()),
         "num_transitions": float(int(success_t.sum().item())),
         "num_failures": float(len(failures)),
+        "update_node_count": float(node_count),
+        "update_edge_count": float(edge_count),
     }
     return total, metrics
 
@@ -405,6 +444,8 @@ def train_step_onpolicy(
     entropy_weight: float = 0.01,
     arg_loss_weight: float = 0.5,
     bc_weight: float = 0.0,
+    max_update_nodes: int = 0,
+    max_update_edges: int = 0,
 ) -> dict[str, float]:
     """One gradient step over a batch of ``RLSearchResult`` s (rl_reasoner.py).
 
@@ -442,6 +483,8 @@ def train_step_onpolicy(
         model, transitions, edge_actions, failures, featurize,
         device=device, critic_weight=critic_weight, entropy_weight=entropy_weight,
         arg_loss_weight=arg_loss_weight, bc_weight=bc_weight, reward_cfg=reward_cfg,
+        max_update_nodes=max_update_nodes,
+        max_update_edges=max_update_edges,
     )
     if loss_result is None:
         return {"num_transitions": 0.0, "num_failures": 0.0}

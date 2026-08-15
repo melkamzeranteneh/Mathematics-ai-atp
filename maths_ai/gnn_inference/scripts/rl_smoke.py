@@ -35,6 +35,8 @@ from maths_ai.hybrid_reasoner.joint_inference import PantographExecutor
 from maths_ai.hybrid_reasoner.pantograph_env import PantographEnv
 
 from maths_ai.gnn_inference.atp_lean_gnn.actor_critic import ActorCriticWithArgsClassifier
+from maths_ai.gnn_inference.atp_lean_gnn.model_factory import build_actor_critic_model
+from maths_ai.gnn_inference.atp_lean_gnn.model_spec import ModelSpec
 from maths_ai.gnn_inference.atp_lean_gnn.graph import proof_state_to_dag
 from maths_ai.gnn_inference.atp_lean_gnn.pln_reward import RewardConfig
 from maths_ai.gnn_inference.atp_lean_gnn.pln_rl_training import (
@@ -60,13 +62,19 @@ SEED_HYPS = ["p : Prop"]
 
 
 def build_model(node_vocab: dict[str, int]) -> ActorCriticWithArgsClassifier:
-    model = ActorCriticWithArgsClassifier(
+    model = build_actor_critic_model(
+        model_spec=ModelSpec.from_dict(
+            {
+                "architecture": "graphsage",
+                "hidden_dim": 32,
+                "dropout": 0.1,
+                "encoder": {"num_layers": 2},
+                "use_node_type": True,
+                "max_args": 1,
+            }
+        ),
         num_node_labels=len(node_vocab),
         num_tactics=len(TACTIC_VOCAB),
-        hidden_dim=32,
-        num_layers=2,
-        dropout=0.1,
-        max_args=1,
     )
     # Bias the fresh policy toward the tactics that can actually close the seed goal,
     # so the QED branch fires within a handful of i.i.d. draws. The base head's random

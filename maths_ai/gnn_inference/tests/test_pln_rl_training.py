@@ -11,6 +11,7 @@ from maths_ai.hybrid_reasoner.hypergraph import ProofHypergraph, NodeStatus
 from maths_ai.gnn_inference.atp_lean_gnn.graph import proof_state_to_dag
 from maths_ai.gnn_inference.atp_lean_gnn.pyg import build_vocab
 from maths_ai.gnn_inference.atp_lean_gnn.actor_critic import ActorCriticWithArgsClassifier
+from maths_ai.gnn_inference.tests.model_helpers import actor_critic
 from maths_ai.gnn_inference.atp_lean_gnn.pln_rl_training import (
     make_featurizer,
     train_step,
@@ -50,14 +51,7 @@ class PLNRLTrainingTests(unittest.TestCase):
         dags = [proof_state_to_dag(s) for s in (self.ROOT, self.SUB_A, self.SUB_B)]
         vocab = build_vocab(dags)
         featurize = make_featurizer(vocab)
-        model = ActorCriticWithArgsClassifier(
-            num_node_labels=len(vocab),
-            num_tactics=3,
-            hidden_dim=16,
-            num_layers=2,
-            dropout=0.1,
-            max_args=2,
-        )
+        model = actor_critic(len(vocab), 3)
         tactic_to_id = {"apply": 0}
         return g, featurize, model, tactic_to_id
 
@@ -93,6 +87,21 @@ class PLNRLTrainingTests(unittest.TestCase):
         # Empty vocab ⇒ every tactic unknown ⇒ None result.
         result = compute_transition_loss(model, transitions, featurize, {})
         self.assertIsNone(result)
+
+    def test_update_budget_rejects_the_complete_round(self):
+        g, featurize, model, tactic_to_id = self._setup()
+        transitions = extract_transitions(g, RewardConfig(step_penalty=0.0))
+        with self.assertRaisesRegex(
+            ValueError,
+            "Collected RL update exceeds.*nodes=.*max_nodes=1",
+        ):
+            compute_transition_loss(
+                model,
+                transitions,
+                featurize,
+                tactic_to_id,
+                max_update_nodes=1,
+            )
 
 
 if __name__ == "__main__":
