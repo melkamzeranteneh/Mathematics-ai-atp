@@ -1,0 +1,6 @@
+name: premise_gnn
+source: huggingface
+repo_type: model
+repo_id: iCog-Labs/PremiseGNN
+revision: v1.0.0
+local_subdir: gnn_inference/runs/premise_gnn
