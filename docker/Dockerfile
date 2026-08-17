@@ -72,6 +72,10 @@ ENV PYTHONPATH="/workspace"
 
 # Create non-root user for security
 RUN useradd -m -u 1000 maths_ai
+
+# Create data directory for assets
+RUN mkdir -p /data/gnn_inference/runs
+
 USER maths_ai
 WORKDIR /workspace
 
