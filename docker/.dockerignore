@@ -56,7 +56,7 @@ logs/
 .lean/
 
 # UV
-uv.lock
+# uv.lock is needed for uv sync in Dockerfile, so we don't ignore it
 
 # Local development
 .tmp/
