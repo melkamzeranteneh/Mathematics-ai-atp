@@ -14,6 +14,8 @@ changed field is `pointer.initialization_checkpoint`.
   four heads, `state_mean_attention` readout
 - Seed: 42
 - Selection criterion: lowest validation combined loss
+- Oversized-graph policy: `skip` (the normalized dataset contains pathological
+  multi-million-node graphs that cannot fit on a 24 GiB GPU as singletons)
 
 The initialization run fails before training if its architecture, edge mode,
 node vocabulary, or tactic vocabulary differs from the source baseline.

@@ -21,7 +21,7 @@
     "batch_size": 256,
     "max_batch_nodes": 12000,
     "max_batch_edges": 60000,
-    "oversize_graph_policy": "singleton",
+    "oversize_graph_policy": "skip",
     "epochs": 30,
     "learning_rate": 0.001,
     "weight_decay": 0.0001,
