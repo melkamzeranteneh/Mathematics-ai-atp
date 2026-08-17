@@ -2,10 +2,10 @@ from pathlib import Path
 from dataclasses import dataclass
 import os
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 
 # Config directory - defined early as it's used in default paths below
-CONFIG_DIR = ROOT_DIR / "config"
+CONFIG_DIR = ROOT_DIR / "maths_ai" / "config"
 
 # ENV = os.getenv("ENV", "development")
 # DEBUG = os.getenv("DEBUG", "True").lower() == "true"

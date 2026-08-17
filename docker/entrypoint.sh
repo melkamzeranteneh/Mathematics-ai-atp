@@ -10,7 +10,7 @@ set -euo pipefail
 
 # Directory where this script is located
 ENTRYPOINT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_DIR="$(dirname "$ENTRYPOINT_DIR")"
+WORKSPACE_DIR="/workspace"
 
 export PYTHONPATH="$WORKSPACE_DIR:${PYTHONPATH:-}"
 
