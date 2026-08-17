@@ -195,10 +195,13 @@ def evaluate_model_with_args(
     total_arg_loss = 0.0
     total_combined_loss = 0.0
     top1_correct = 0
+    top5_correct = 0
     known_count = 0
     total_count = 0
     arg_top1_correct = 0
+    arg_top5_correct = 0
     arg_valid_count = 0
+    arg_target_count = 0
     total_batches = len(loader)
     start_time = time.perf_counter()
 
@@ -237,14 +240,23 @@ def evaluate_model_with_args(
         total_arg_loss += metrics["arg_loss"] * bs
         total_combined_loss += metrics["total_loss"] * bs
         arg_top1_correct += int(metrics.get("arg_top1_correct", 0))
+        arg_top5_correct += int(metrics.get("arg_top5_correct", 0))
         arg_valid_count += int(metrics.get("arg_valid_count", 0))
+        arg_target_count += int(metrics.get("arg_target_count", 0))
 
         # Tactic top-1 accuracy (excluding UNK)
         known_mask = targets != unknown_tactic_id
         kc = int(known_mask.sum().item())
         if kc > 0:
-            preds = tactic_logits[known_mask].argmax(dim=1)
-            top1_correct += int((preds == targets[known_mask]).sum().item())
+            known_logits = tactic_logits[known_mask]
+            known_targets = targets[known_mask]
+            preds = known_logits.argmax(dim=1)
+            top1_correct += int((preds == known_targets).sum().item())
+            top_k = min(5, int(known_logits.size(1)))
+            top_indices = known_logits.topk(top_k, dim=1).indices
+            top5_correct += int(
+                (top_indices == known_targets.unsqueeze(1)).any(dim=1).sum().item()
+            )
         known_count += kc
         total_count += bs
 
@@ -265,8 +277,12 @@ def evaluate_model_with_args(
         "arg_loss": total_arg_loss / n,
         "combined_loss": total_combined_loss / n,
         "tactic_top1_accuracy": top1_correct / max(known_count, 1),
+        "tactic_top5_accuracy": top5_correct / max(known_count, 1),
         "arg_top1_accuracy": arg_top1_correct / max(arg_valid_count, 1),
+        "arg_top5_accuracy": arg_top5_correct / max(arg_valid_count, 1),
         "arg_valid_count": arg_valid_count,
+        "arg_target_count": arg_target_count,
+        "arg_target_coverage": arg_valid_count / max(arg_target_count, 1),
         "known_label_count": known_count,
         "evaluated_count": total_count,
     }

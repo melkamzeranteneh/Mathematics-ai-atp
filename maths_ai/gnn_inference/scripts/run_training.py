@@ -91,8 +91,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "hidden_dim": 512,
         "num_layers": 4,
         "dropout": 0.2,
+        "heads": 8,
+        "readout": "state",
         "max_args": 3,
         "arg_loss_weight": 0.5,
+        "initialization_checkpoint": None,
         "batch_size": 256,
         "max_batch_nodes": 0,
         "max_batch_edges": 0,
@@ -247,7 +250,7 @@ def _resolve_stage_model(baseline_cfg: dict[str, Any]) -> dict[str, Any]:
     under ``baseline.model`` / ``baseline.training``. This resolves both shapes,
     preferring the nested form when present.
     """
-    inline_model_keys = ("hidden_dim", "num_layers", "dropout")
+    inline_model_keys = ("hidden_dim", "num_layers", "dropout", "heads", "readout")
     inline_training_keys = (
         "batch_size", "max_batch_nodes", "max_batch_edges", "oversize_graph_policy", "epochs", "learning_rate", "weight_decay",
         "grad_clip", "num_workers", "use_amp", "cache_in_memory",
@@ -369,6 +372,10 @@ def run_pointer(config: dict[str, Any], resume_run_dir: str | None = None) -> di
     console_print(f"  epochs    : {_pt.get('epochs')}")
     console_print(f"  max_args  : {pointer_cfg.get('max_args', 3)}")
     console_print(f"  arg_wt    : {pointer_cfg.get('arg_loss_weight', 0.5)}")
+    console_print(
+        "  init ckpt : "
+        f"{pointer_cfg.get('initialization_checkpoint') or 'random initialization'}"
+    )
     console_print("")
 
     model_overrides, training_overrides = _resolve_stage_model(pointer_cfg)
@@ -393,6 +400,7 @@ def run_pointer(config: dict[str, Any], resume_run_dir: str | None = None) -> di
             "gnn_type": gnn_type,
             "max_args": pointer_cfg.get("max_args", 3),
             "arg_loss_weight": pointer_cfg.get("arg_loss_weight", 0.5),
+            "initialization_checkpoint": pointer_cfg.get("initialization_checkpoint"),
             "model": dict(model_overrides),
             "training": {
                 "log_every_batches": 50,
@@ -815,7 +823,7 @@ Examples:
         "--resume-run-dir",
         type=str,
         default=None,
-        help="Extend a specific completed baseline run from its last.pt checkpoint",
+        help="Extend a specific completed baseline or pointer run from its last.pt checkpoint",
     )
     parser.add_argument(
         "--epochs",
@@ -877,8 +885,11 @@ def main(argv: list[str] | None = None) -> int:
         if "model" in user_config or "training" in user_config:
             stage_key = "pointer" if "max_args" in user_config else "baseline"
             target = config.setdefault(stage_key, {})
-            for fld in ("model", "training", "gnn_type", "prepared_root",
-                        "run_root", "device", "edge_mode", "use_node_type", "seed"):
+            for fld in (
+                "model", "training", "gnn_type", "prepared_root", "run_root",
+                "device", "edge_mode", "use_node_type", "seed", "max_args",
+                "arg_loss_weight", "initialization_checkpoint",
+            ):
                 if fld in user_config:
                     if fld in ("model", "training"):
                         target[fld] = {**target.get(fld, {}), **user_config[fld]}
@@ -937,9 +948,10 @@ def main(argv: list[str] | None = None) -> int:
         config["seed"] = int(resume_config.get("seed", config["seed"]))
         config["device"] = args.device or str(resume_config.get("device", config["device"]))
         config["gnn_type"] = str(resume_config.get("gnn_type", config["gnn_type"]))
-        config["stages"] = ["baseline"]
-        config["baseline"] = {
-            **config["baseline"],
+        resume_stage = "pointer" if "max_args" in resume_config else "baseline"
+        config["stages"] = [resume_stage]
+        config[resume_stage] = {
+            **config[resume_stage],
             "gnn_type": config["gnn_type"],
             "edge_mode": resume_config.get("edge_mode", "bidirectional"),
             "use_node_type": bool(resume_config.get("use_node_type", True)),
@@ -950,6 +962,16 @@ def main(argv: list[str] | None = None) -> int:
             },
             "epochs": args.epochs,
         }
+        if resume_stage == "pointer":
+            config["pointer"].update({
+                "max_args": int(resume_config.get("max_args", 3)),
+                "arg_loss_weight": float(
+                    resume_config.get("arg_loss_weight", 0.5)
+                ),
+                "initialization_checkpoint": resume_config.get(
+                    "initialization_checkpoint"
+                ),
+            })
         # Resume configuration supplies compatibility-critical architecture,
         # then explicit CLI training overrides take final precedence.
         for key, value in explicit_stage_overrides.items():
@@ -1005,8 +1027,8 @@ def main(argv: list[str] | None = None) -> int:
                     resume_dir = state.stage_outputs["baseline"]["run_dir"]
                 results[stage] = run_baseline(config, resume_run_dir=resume_dir)
             elif stage == "pointer":
-                resume_dir = None
-                if args.resume and state.stage_outputs.get("pointer", {}).get("run_dir"):
+                resume_dir = args.resume_run_dir
+                if resume_dir is None and args.resume and state.stage_outputs.get("pointer", {}).get("run_dir"):
                     resume_dir = state.stage_outputs["pointer"]["run_dir"]
                 results[stage] = run_pointer(config, resume_run_dir=resume_dir)
             elif stage == "scorer":

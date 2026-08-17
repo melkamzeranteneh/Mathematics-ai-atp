@@ -12,6 +12,7 @@ from maths_ai.gnn_inference.atp_lean_gnn import (
     DatasetRow,
     GraphSAGEClassifierConfig,
     PreparedGraphDataset,
+    PreparedMetadata,
     TrainingLoopConfig,
     build_dataloaders,
     build_tactic_vocab,
@@ -30,7 +31,13 @@ from maths_ai.gnn_inference.scripts.run_training import (
     _apply_cli_override,
     build_parser as build_pipeline_parser,
 )
-from maths_ai.gnn_inference.atp_lean_gnn.training import GraphBudgetBatchSampler, build_baseline_model
+from maths_ai.gnn_inference.atp_lean_gnn.training import (
+    GraphBudgetBatchSampler,
+    PointerConfig,
+    build_baseline_model,
+    build_pointer_model,
+    initialize_pointer_from_baseline_checkpoint,
+)
 from maths_ai.gnn_inference.scripts.pack_prepared_dataset import pack_prepared_dataset
 from maths_ai.gnn_inference.scripts.build_lemma_index import _load_config_from_checkpoint
 
@@ -426,11 +433,16 @@ class TrainingPipelineTests(unittest.TestCase):
         args = build_pipeline_parser().parse_args([
             "--pointer.max_batch_nodes", "12000",
             "--pointer.oversize_graph_policy", "skip",
+            "--pointer.initialization_checkpoint", "runs/baseline/best.pt",
             "--scorer.max_batch_edges", "50000",
             "--scorer.cache_in_memory", "true",
         ])
         self.assertEqual(getattr(args, "pointer.max_batch_nodes"), "12000")
         self.assertEqual(getattr(args, "pointer.oversize_graph_policy"), "skip")
+        self.assertEqual(
+            getattr(args, "pointer.initialization_checkpoint"),
+            "runs/baseline/best.pt",
+        )
         self.assertEqual(getattr(args, "scorer.max_batch_edges"), "50000")
         self.assertEqual(getattr(args, "scorer.cache_in_memory"), "true")
 
@@ -482,6 +494,166 @@ class TrainingPipelineTests(unittest.TestCase):
         self.assertEqual(config["baseline"]["batch_size"], 32)
         self.assertEqual(config["baseline"]["training"]["batch_size"], 32)
         self.assertEqual(config["baseline"]["model"]["hidden_dim"], 64)
+
+    def test_pointer_initialization_transfers_baseline_and_preserves_pointer_head(self) -> None:
+        metadata = load_prepared_metadata(self.prepared_root)
+        baseline_config = BaselineConfig.from_dict({
+            "prepared_root": str(self.prepared_root),
+            "run_root": str(self.run_root / "baseline"),
+            "device": "cpu",
+            "gnn_type": "gat",
+            "model": {
+                "hidden_dim": 16,
+                "num_layers": 2,
+                "dropout": 0.1,
+                "heads": 4,
+                "readout": "state_mean_attention",
+            },
+            "training": {"batch_size": 2, "epochs": 1, "use_amp": False},
+        })
+        baseline_model = build_baseline_model(metadata, baseline_config)
+        with torch.no_grad():
+            for index, parameter in enumerate(baseline_model.parameters(), start=1):
+                parameter.fill_(index / 100.0)
+
+        checkpoint_path = self.run_root / "baseline_init.pt"
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "epoch": 7,
+            "config": baseline_config.to_dict(),
+            "model_state_dict": baseline_model.state_dict(),
+        }, checkpoint_path)
+
+        pointer_config = PointerConfig.from_dict({
+            "prepared_root": str(self.prepared_root),
+            "run_root": str(self.run_root / "pointer"),
+            "device": "cpu",
+            "gnn_type": "gat",
+            "initialization_checkpoint": str(checkpoint_path),
+            "max_args": 2,
+            "model": {
+                "hidden_dim": 16,
+                "num_layers": 2,
+                "dropout": 0.1,
+                "heads": 4,
+                "readout": "state_mean_attention",
+            },
+            "training": {"batch_size": 2, "epochs": 1, "use_amp": False},
+        })
+        pointer_model = build_pointer_model(metadata, pointer_config)
+        pointer_head_before = {
+            name: value.detach().clone()
+            for name, value in pointer_model.argument_selector.state_dict().items()
+        }
+
+        provenance = initialize_pointer_from_baseline_checkpoint(
+            pointer_model,
+            config=pointer_config,
+            metadata=metadata,
+            checkpoint_path=checkpoint_path,
+        )
+
+        for name, expected in baseline_model.state_dict().items():
+            self.assertTrue(
+                torch.equal(pointer_model.backbone.state_dict()[name], expected),
+                name,
+            )
+        self.assertTrue(
+            torch.equal(
+                pointer_model.tactic_embedding.weight,
+                baseline_model.classifier.weight,
+            )
+        )
+        for name, expected in pointer_head_before.items():
+            self.assertTrue(
+                torch.equal(pointer_model.argument_selector.state_dict()[name], expected),
+                name,
+            )
+        self.assertEqual(provenance["source_epoch"], 7)
+        self.assertEqual(
+            provenance["randomly_initialized_components"],
+            ["argument_selector"],
+        )
+
+    def test_pointer_initialization_rejects_architecture_mismatch(self) -> None:
+        metadata = load_prepared_metadata(self.prepared_root)
+        baseline_config = BaselineConfig.from_dict({
+            "prepared_root": str(self.prepared_root),
+            "run_root": str(self.run_root / "baseline"),
+            "device": "cpu",
+            "gnn_type": "sage",
+            "model": {"hidden_dim": 16, "num_layers": 2, "dropout": 0.1},
+            "training": {"batch_size": 2, "epochs": 1, "use_amp": False},
+        })
+        checkpoint_path = self.run_root / "mismatched_baseline.pt"
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "epoch": 1,
+            "config": baseline_config.to_dict(),
+            "model_state_dict": build_baseline_model(
+                metadata, baseline_config
+            ).state_dict(),
+        }, checkpoint_path)
+        pointer_config = PointerConfig.from_dict({
+            "prepared_root": str(self.prepared_root),
+            "run_root": str(self.run_root / "pointer"),
+            "device": "cpu",
+            "gnn_type": "sage",
+            "model": {"hidden_dim": 32, "num_layers": 2, "dropout": 0.1},
+            "training": {"batch_size": 2, "epochs": 1, "use_amp": False},
+        })
+
+        with self.assertRaisesRegex(ValueError, "architecture-incompatible"):
+            initialize_pointer_from_baseline_checkpoint(
+                build_pointer_model(metadata, pointer_config),
+                config=pointer_config,
+                metadata=metadata,
+                checkpoint_path=checkpoint_path,
+            )
+
+    def test_pointer_initialization_rejects_vocab_mismatch(self) -> None:
+        metadata = load_prepared_metadata(self.prepared_root)
+        baseline_config = BaselineConfig.from_dict({
+            "prepared_root": str(self.prepared_root),
+            "run_root": str(self.run_root / "baseline"),
+            "device": "cpu",
+            "gnn_type": "sage",
+            "model": {"hidden_dim": 16, "num_layers": 2, "dropout": 0.1},
+            "training": {"batch_size": 2, "epochs": 1, "use_amp": False},
+        })
+        checkpoint_path = self.run_root / "vocab_baseline.pt"
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "epoch": 1,
+            "config": baseline_config.to_dict(),
+            "model_state_dict": build_baseline_model(
+                metadata, baseline_config
+            ).state_dict(),
+        }, checkpoint_path)
+        pointer_config = PointerConfig.from_dict({
+            "prepared_root": str(self.prepared_root),
+            "run_root": str(self.run_root / "pointer"),
+            "device": "cpu",
+            "gnn_type": "sage",
+            "model": {"hidden_dim": 16, "num_layers": 2, "dropout": 0.1},
+            "training": {"batch_size": 2, "epochs": 1, "use_amp": False},
+        })
+        mismatched_metadata = PreparedMetadata(
+            root=metadata.root,
+            node_vocab=metadata.node_vocab,
+            tactic_vocab={**metadata.tactic_vocab, "different_tactic": 999},
+            manifests=metadata.manifests,
+            state_label_id=metadata.state_label_id,
+            unknown_tactic_id=metadata.unknown_tactic_id,
+        )
+
+        with self.assertRaisesRegex(ValueError, "tactic vocabularies differ"):
+            initialize_pointer_from_baseline_checkpoint(
+                build_pointer_model(metadata, pointer_config),
+                config=pointer_config,
+                metadata=mismatched_metadata,
+                checkpoint_path=checkpoint_path,
+            )
 
 
 if __name__ == "__main__":

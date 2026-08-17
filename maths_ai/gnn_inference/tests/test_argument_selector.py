@@ -265,7 +265,10 @@ class CombinedLossTests(unittest.TestCase):
         self.assertIn("tactic_loss", metrics)
         self.assertIn("arg_loss", metrics)
         self.assertEqual(metrics["arg_valid_count"], 1)
+        self.assertEqual(metrics["arg_target_count"], 2)
+        self.assertEqual(metrics["arg_target_coverage"], 0.5)
         self.assertIn("arg_top1_accuracy", metrics)
+        self.assertIn("arg_top5_accuracy", metrics)
 
         # Verify gradients flow
         loss.backward()
@@ -293,6 +296,8 @@ class CombinedLossTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["arg_loss"], 0.0)
         self.assertEqual(metrics["arg_valid_count"], 0)
         self.assertEqual(metrics["arg_top1_accuracy"], 0.0)
+        self.assertEqual(metrics["arg_top5_accuracy"], 0.0)
+        self.assertEqual(metrics["arg_target_coverage"], 0.0)
         self.assertTrue(torch.isfinite(loss))
 
 

@@ -120,6 +120,7 @@ class TacticWithArgsConfig:
     max_args: int = 3
     arg_loss_weight: float = 0.5
     heads: int = 8
+    readout: str = "state"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -129,14 +130,15 @@ class TacticWithArgsConfig:
             "max_args": self.max_args,
             "arg_loss_weight": self.arg_loss_weight,
             "heads": self.heads,
+            "readout": self.readout,
         }
 
 
 class TacticWithArgsClassifier(nn.Module):
     """Tactic family prediction + pointer-based argument selection.
 
-    The GNN backbone (``GraphSAGEStateClassifier``) is instantiated internally
-    and its ``encode_nodes`` / ``readout`` methods are reused.  The tactic
+    A GraphSAGE or GATv2 backbone is instantiated internally and its
+    ``encode_nodes`` / ``readout`` methods are reused.  The tactic
     classification head is inherited from the backbone.  A new
     ``ArgumentSelector`` pointer head is added on top.
     """
@@ -154,6 +156,7 @@ class TacticWithArgsClassifier(nn.Module):
         max_args: int = 3,
         gnn_type: str = "sage",
         heads: int = 8,
+        readout: str = "state",
     ) -> None:
         super().__init__()
 
@@ -168,7 +171,11 @@ class TacticWithArgsClassifier(nn.Module):
             use_node_type=use_node_type,
         )
         if gnn_type == "gat":
-            self.backbone = GATv2StateClassifier(heads=heads, **backbone_kwargs)
+            self.backbone = GATv2StateClassifier(
+                heads=heads,
+                readout=readout,
+                **backbone_kwargs,
+            )
         else:
             self.backbone = GraphSAGEStateClassifier(**backbone_kwargs)
 
@@ -321,7 +328,7 @@ def compute_combined_loss(
     unknown_tactic_id: int = 0,
     node_labels: Tensor | None = None,
     node_types: Tensor | None = None,
-) -> tuple[Tensor, dict[str, float]]:
+) -> tuple[Tensor, dict[str, float | int]]:
     """Tactic classification loss + masked argument selection loss."""
     device = tactic_logits.device
     batch_size = tactic_logits.size(0)
@@ -338,8 +345,12 @@ def compute_combined_loss(
             "arg_loss": 0.0,
             "total_loss": float(tactic_loss.item()),
             "arg_top1_correct": 0,
+            "arg_top5_correct": 0,
             "arg_valid_count": 0,
+            "arg_target_count": 0,
             "arg_top1_accuracy": 0.0,
+            "arg_top5_accuracy": 0.0,
+            "arg_target_coverage": 0.0,
         }
 
     padded_targets = resolve_arg_targets_to_padded(
@@ -348,7 +359,9 @@ def compute_combined_loss(
 
     arg_losses: list[Tensor] = []
     arg_top1_correct = 0
+    arg_top5_correct = 0
     arg_valid_count = 0
+    arg_target_count = 0
     for step_k, arg_logits_k in enumerate(arg_logits_list):
         if step_k >= padded_targets.size(1):
             break
@@ -358,7 +371,9 @@ def compute_combined_loss(
         for b_idx in range(batch_size):
             if tactic_arity_per_sample[b_idx] <= step_k:
                 valid[b_idx] = False
-            elif valid[b_idx]:
+            else:
+                arg_target_count += 1
+            if valid[b_idx]:
                 # Skip target if it was masked out by premise_mask
                 if torch.isneginf(arg_logits_k[b_idx, gt_k[b_idx]]):
                     valid[b_idx] = False
@@ -369,6 +384,11 @@ def compute_combined_loss(
         step_loss = F.cross_entropy(arg_logits_k[valid].clamp(min=-1e4), gt_k[valid])
         predictions = arg_logits_k[valid].argmax(dim=1)
         arg_top1_correct += int((predictions == gt_k[valid]).sum().item())
+        top_k = min(5, int(arg_logits_k.size(1)))
+        top_indices = arg_logits_k[valid].topk(top_k, dim=1).indices
+        arg_top5_correct += int(
+            (top_indices == gt_k[valid].unsqueeze(1)).any(dim=1).sum().item()
+        )
         arg_valid_count += int(valid.sum().item())
         arg_losses.append(step_loss)
 
@@ -383,7 +403,10 @@ def compute_combined_loss(
         "arg_loss": float(arg_loss.item()),
         "total_loss": float(total_loss.item()),
         "arg_top1_correct": arg_top1_correct,
+        "arg_top5_correct": arg_top5_correct,
         "arg_valid_count": arg_valid_count,
+        "arg_target_count": arg_target_count,
         "arg_top1_accuracy": arg_top1_correct / max(arg_valid_count, 1),
+        "arg_top5_accuracy": arg_top5_correct / max(arg_valid_count, 1),
+        "arg_target_coverage": arg_valid_count / max(arg_target_count, 1),
     }
-

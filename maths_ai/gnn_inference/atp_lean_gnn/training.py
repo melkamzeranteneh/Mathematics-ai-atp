@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 import random
@@ -249,6 +250,7 @@ class PointerConfig:
     gnn_type: str = "sage"
     max_args: int = 3
     arg_loss_weight: float = 0.5
+    initialization_checkpoint: Path | None = None
     model: TacticWithArgsConfig = field(default_factory=TacticWithArgsConfig)
     training: TrainingLoopConfig = field(default_factory=TrainingLoopConfig)
 
@@ -272,6 +274,11 @@ class PointerConfig:
             gnn_type=gnn_type,
             max_args=int(payload.get("max_args", 3)),
             arg_loss_weight=float(payload.get("arg_loss_weight", 0.5)),
+            initialization_checkpoint=(
+                Path(str(payload["initialization_checkpoint"]))
+                if payload.get("initialization_checkpoint")
+                else None
+            ),
             model=TacticWithArgsConfig(
                 hidden_dim=int(model_payload.get("hidden_dim", 128)),
                 num_layers=int(model_payload.get("num_layers", 4)),
@@ -279,6 +286,7 @@ class PointerConfig:
                 max_args=int(model_payload.get("max_args", 3)),
                 arg_loss_weight=float(model_payload.get("arg_loss_weight", 0.5)),
                 heads=int(model_payload.get("heads", 8)),
+                readout=str(model_payload.get("readout", "state")),
             ),
             training=TrainingLoopConfig(
                 batch_size=int(training_payload.get("batch_size", 32)),
@@ -322,6 +330,12 @@ class PointerConfig:
             raise ValueError("Training config field 'max_args' must be positive.")
         if self.arg_loss_weight < 0:
             raise ValueError("Training config field 'arg_loss_weight' cannot be negative.")
+        readout = self.model.readout.lower().strip()
+        if gnn_type == "gat" and readout not in VALID_READOUTS:
+            raise ValueError(
+                "Training config field 'model.readout' must be one of: "
+                f"{', '.join(VALID_READOUTS)}."
+            )
         if self.training.batch_size < 1:
             raise ValueError("Training config field 'training.batch_size' must be positive.")
         if self.training.max_batch_nodes < 0:
@@ -356,7 +370,20 @@ class PointerConfig:
             gnn_type=gnn_type,
             max_args=self.max_args,
             arg_loss_weight=self.arg_loss_weight,
-            model=self.model,
+            initialization_checkpoint=(
+                self.initialization_checkpoint.expanduser().resolve()
+                if self.initialization_checkpoint is not None
+                else None
+            ),
+            model=TacticWithArgsConfig(
+                hidden_dim=self.model.hidden_dim,
+                num_layers=self.model.num_layers,
+                dropout=self.model.dropout,
+                max_args=self.model.max_args,
+                arg_loss_weight=self.model.arg_loss_weight,
+                heads=self.model.heads,
+                readout=readout,
+            ),
             training=self.training,
         )
 
@@ -371,6 +398,11 @@ class PointerConfig:
             "gnn_type": self.gnn_type,
             "max_args": self.max_args,
             "arg_loss_weight": self.arg_loss_weight,
+            "initialization_checkpoint": (
+                str(self.initialization_checkpoint)
+                if self.initialization_checkpoint is not None
+                else None
+            ),
             "model": self.model.to_dict(),
             "training": self.training.to_dict(),
         }
@@ -1152,7 +1184,178 @@ def build_pointer_model(metadata: PreparedMetadata, config: PointerConfig) -> Ta
         max_args=config.max_args,
         gnn_type=config.gnn_type,
         heads=config.model.heads,
+        readout=config.model.readout,
     )
+
+
+def _stable_vocab_sha256(vocab: dict[str, int]) -> str:
+    payload = json.dumps(
+        vocab,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def initialize_pointer_from_baseline_checkpoint(
+    model: TacticWithArgsClassifier,
+    *,
+    config: PointerConfig,
+    metadata: PreparedMetadata,
+    checkpoint_path: str | Path,
+) -> dict[str, object]:
+    """Initialize a pointer backbone and tactic embedding from a baseline.
+
+    The transfer is deliberately strict.  A pointer may only inherit a
+    baseline whose encoder, readout, and vocabularies are identical; otherwise
+    a partial load could silently attach learned weights to different labels.
+    The argument selector is not touched.
+    """
+    source_path = Path(checkpoint_path).expanduser().resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(
+            f"Pointer initialization checkpoint '{source_path}' does not exist."
+        )
+    if not source_path.is_file():
+        raise FileNotFoundError(
+            f"Pointer initialization checkpoint '{source_path}' is not a file."
+        )
+
+    checkpoint = _load_checkpoint(source_path, device=torch.device("cpu"))
+    checkpoint_config = checkpoint.get("config")
+    if not isinstance(checkpoint_config, dict):
+        sibling_config = source_path.parent / "config.json"
+        if not sibling_config.exists():
+            raise ValueError(
+                "Baseline initialization checkpoint has no embedded config and "
+                f"its run directory is missing '{sibling_config.name}'."
+            )
+        checkpoint_config = _read_json(sibling_config)
+
+    state_dict = checkpoint.get("model_state_dict")
+    if not isinstance(state_dict, dict):
+        raise ValueError(
+            f"Baseline initialization checkpoint '{source_path}' is missing "
+            "a model_state_dict."
+        )
+    if any(str(key).startswith("backbone.") for key in state_dict):
+        raise ValueError(
+            f"Pointer initialization checkpoint '{source_path}' contains a pointer "
+            "model, not a baseline model. Use --resume-run-dir to resume a pointer run."
+        )
+
+    try:
+        baseline_config = BaselineConfig.from_dict(checkpoint_config)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Could not load baseline config from initialization checkpoint "
+            f"'{source_path}': {exc}"
+        ) from exc
+
+    incompatibilities: list[str] = []
+    comparisons = {
+        "gnn_type": (baseline_config.gnn_type, config.gnn_type),
+        "edge_mode": (baseline_config.edge_mode, config.edge_mode),
+        "use_node_type": (baseline_config.use_node_type, config.use_node_type),
+        "model.hidden_dim": (
+            baseline_config.model.hidden_dim,
+            config.model.hidden_dim,
+        ),
+        "model.num_layers": (
+            baseline_config.model.num_layers,
+            config.model.num_layers,
+        ),
+        "model.dropout": (baseline_config.model.dropout, config.model.dropout),
+    }
+    if config.gnn_type == "gat":
+        comparisons.update(
+            {
+                "model.heads": (
+                    getattr(baseline_config.model, "heads", None),
+                    config.model.heads,
+                ),
+                "model.readout": (
+                    getattr(baseline_config.model, "readout", "state"),
+                    config.model.readout,
+                ),
+            }
+        )
+    for field_name, (baseline_value, pointer_value) in comparisons.items():
+        if baseline_value != pointer_value:
+            incompatibilities.append(
+                f"{field_name}: baseline={baseline_value!r}, pointer={pointer_value!r}"
+            )
+    if incompatibilities:
+        raise ValueError(
+            "Baseline checkpoint is architecture-incompatible with the pointer model: "
+            + "; ".join(incompatibilities)
+        )
+
+    try:
+        baseline_metadata = load_prepared_metadata(baseline_config.prepared_root)
+    except (FileNotFoundError, ValueError) as exc:
+        raise ValueError(
+            "Cannot validate baseline checkpoint vocabularies because its prepared "
+            f"dataset is unavailable or invalid at '{baseline_config.prepared_root}': {exc}"
+        ) from exc
+    if baseline_metadata.node_vocab != metadata.node_vocab:
+        raise ValueError(
+            "Baseline and pointer node vocabularies differ; refusing to transfer "
+            "label embeddings with incompatible token IDs."
+        )
+    if baseline_metadata.tactic_vocab != metadata.tactic_vocab:
+        raise ValueError(
+            "Baseline and pointer tactic vocabularies differ; refusing to transfer "
+            "the tactic classifier with incompatible class IDs."
+        )
+
+    baseline_model = build_baseline_model(baseline_metadata, baseline_config)
+    try:
+        baseline_model.load_state_dict(state_dict, strict=True)
+        model.backbone.load_state_dict(baseline_model.state_dict(), strict=True)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"Baseline checkpoint weights do not match its declared architecture: {exc}"
+        ) from exc
+
+    with torch.no_grad():
+        if model.tactic_embedding.weight.shape != baseline_model.classifier.weight.shape:
+            raise ValueError(
+                "Baseline classifier weights cannot initialize tactic embeddings: "
+                f"classifier shape={tuple(baseline_model.classifier.weight.shape)}, "
+                f"embedding shape={tuple(model.tactic_embedding.weight.shape)}."
+            )
+        model.tactic_embedding.weight.copy_(baseline_model.classifier.weight)
+
+    return {
+        "source_checkpoint": str(source_path),
+        "source_checkpoint_sha256": _file_sha256(source_path),
+        "source_epoch": int(checkpoint.get("epoch", 0)),
+        "source_prepared_root": str(baseline_config.prepared_root),
+        "source_node_vocab_sha256": _stable_vocab_sha256(
+            baseline_metadata.node_vocab
+        ),
+        "source_tactic_vocab_sha256": _stable_vocab_sha256(
+            baseline_metadata.tactic_vocab
+        ),
+        "transferred_components": [
+            "backbone.encoder",
+            "backbone.readout",
+            "backbone.tactic_classifier",
+            "tactic_embedding_from_classifier_weights",
+        ],
+        "randomly_initialized_components": ["argument_selector"],
+        "applied_this_invocation": True,
+    }
 
 
 def _amp_dtype(
@@ -1759,6 +1962,37 @@ def train_pointer(
     last_checkpoint_path = run_dir / "last.pt"
 
     model = build_pointer_model(metadata, config)
+    initialization_details: dict[str, object] | None = None
+    if resume_run_dir is None and config.initialization_checkpoint is not None:
+        initialization_details = initialize_pointer_from_baseline_checkpoint(
+            model,
+            config=config,
+            metadata=metadata,
+            checkpoint_path=config.initialization_checkpoint,
+        )
+        persisted_config = config.to_dict()
+        persisted_config["pointer_initialization"] = initialization_details
+        config_path = _write_json(config_path, persisted_config)
+    elif resume_run_dir is not None:
+        previous_summary_path = run_dir / "summary.json"
+        if previous_summary_path.exists():
+            previous_summary = _read_json(previous_summary_path)
+            previous_initialization = previous_summary.get("pointer_initialization")
+            if isinstance(previous_initialization, dict):
+                initialization_details = dict(previous_initialization)
+                initialization_details["applied_this_invocation"] = False
+        else:
+            run_config = _read_json(config_path)
+            config_initialization = run_config.get("pointer_initialization")
+            if isinstance(config_initialization, dict):
+                initialization_details = dict(config_initialization)
+                initialization_details["applied_this_invocation"] = False
+            elif config.initialization_checkpoint is not None:
+                initialization_details = {
+                    "source_checkpoint": str(config.initialization_checkpoint),
+                    "applied_this_invocation": False,
+                    "provenance_recovered_from_config_only": True,
+                }
     # Pointer outputs have replica-dependent padded widths, so PyG DataParallel
     # cannot gather them safely. Keep pointer training on one explicitly selected GPU.
     if device.type == "cuda" and device.index is None:
@@ -1817,6 +2051,16 @@ def train_pointer(
     )
     console_print(f"  Max args per step        : {config.max_args}")
     console_print(f"  Argument loss weight     : {config.arg_loss_weight}")
+    if initialization_details is not None:
+        console_print(
+            "  Baseline initialization  : "
+            f"{initialization_details.get('source_checkpoint')}"
+        )
+        if initialization_details.get("applied_this_invocation"):
+            console_print(
+                "  Transferred components   : encoder, readout, tactic classifier, "
+                "tactic embeddings"
+            )
     if resume_run_dir is not None:
         console_print(
             f"  Resuming from checkpoint : {last_checkpoint_path} "
@@ -1867,8 +2111,12 @@ def train_pointer(
             "val_arg_loss": float(val_metrics["arg_loss"]),
             "val_combined_loss": float(val_metrics["combined_loss"]),
             "val_tactic_accuracy": float(val_metrics["tactic_top1_accuracy"]),
+            "val_tactic_top5_accuracy": float(val_metrics["tactic_top5_accuracy"]),
             "val_arg_accuracy": float(val_metrics["arg_top1_accuracy"]),
+            "val_arg_top5_accuracy": float(val_metrics["arg_top5_accuracy"]),
             "val_arg_valid_count": int(val_metrics["arg_valid_count"]),
+            "val_arg_target_count": int(val_metrics["arg_target_count"]),
+            "val_arg_target_coverage": float(val_metrics["arg_target_coverage"]),
             "known_label_eval_count": int(val_metrics["known_label_count"]),
         }
         _append_jsonl(metrics_path, epoch_record)
@@ -1973,6 +2221,7 @@ def train_pointer(
         "best_checkpoint": str(best_checkpoint_path),
         "last_checkpoint": str(last_checkpoint_path),
         "resumed_from_checkpoint": resume_run_dir is not None,
+        "pointer_initialization": initialization_details,
         "best_validation": eval_val,
         "test_evaluation": eval_test,
     }
