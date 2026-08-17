@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Mathematics AI ATP - Docker Compose Configuration
 #
 # Architecture:
@@ -23,6 +21,7 @@ services:
   asset-fetch:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: core
     container_name: maths_ai-asset-fetch
     volumes:
@@ -31,7 +30,7 @@ services:
       - MATHS_AI_DATA_ROOT=/data
       - MATHS_AI_MODEL_CONFIG=/workspace/maths_ai/config/models/premise_gnn.yaml
       - MATHS_AI_CORPUS_CONFIG=/workspace/maths_ai/config/corpus/lemma_corpus_v1.yaml
-    command: ["python", "scripts/fetch_assets.py"]
+    entrypoint: ["python", "scripts/fetch_assets.py"]
     networks:
       - maths_ai_network
 
@@ -39,6 +38,7 @@ services:
   core:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: core
     container_name: maths_ai-core
     depends_on:
@@ -67,6 +67,7 @@ services:
   experimental:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: experimental
     container_name: maths_ai-experimental
     profiles:
@@ -85,6 +86,7 @@ services:
   training:
     build:
       context: .
+      dockerfile: docker/Dockerfile
       target: training
     container_name: maths_ai-training
     profiles:
@@ -97,6 +99,7 @@ services:
       - MATHS_AI_MODEL_CONFIG=/workspace/maths_ai/config/models/premise_gnn.yaml
       - MATHS_AI_CORPUS_CONFIG=/workspace/maths_ai/config/corpus/lemma_corpus_v1.yaml
       - MATHS_AI_LEAN_PROJECT=/opt/lean_project
+      - MATHS_AI_OUTPUT_DIR=/output
     deploy:
       resources:
         reservations:

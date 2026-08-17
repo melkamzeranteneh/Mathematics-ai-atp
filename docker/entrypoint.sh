@@ -8,8 +8,6 @@
 
 set -euo pipefail
 
-# Directory where this script is located
-ENTRYPOINT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="/workspace"
 
 export PYTHONPATH="$WORKSPACE_DIR:${PYTHONPATH:-}"
@@ -43,4 +41,9 @@ else
 fi
 
 # Execute the command passed as arguments
+# If skip-fetch was the first arg, shift it off so it doesn't get exec'd
+if [ "${1:-}" = "skip-fetch" ]; then
+    shift
+fi
+
 exec "$@"

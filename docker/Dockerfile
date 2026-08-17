@@ -43,6 +43,7 @@ RUN --mount=type=cache,target=/opt/lean_project/.lake \
     lake update && lake exe cache get && lake build
 
 ENV MATHS_AI_LEAN_PROJECT=/opt/lean_project
+ENV MATHS_AI_DATA_ROOT=/data
 
 # Install SWI-Prolog >= 9.3.x (Ubuntu apt ships 9.0.4 which is too old)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -62,7 +63,9 @@ ARG PETTACHAINER_REF=HEAD
 RUN git clone https://github.com/rTreutlein/PeTTaChainer.git /opt/pettachainer \
     && git -C /opt/pettachainer checkout ${PETTACHAINER_REF}
 
-# Create uv virtual environment and install Python dependencies
+# Set up workspace and install Python dependencies
+WORKDIR /workspace
+COPY pyproject.toml uv.lock /workspace/
 RUN uv venv /opt/venv && \
     uv sync --no-dev && \
     uv pip install -e . --no-deps
@@ -89,14 +92,15 @@ COPY scripts/ /workspace/scripts/
 COPY docker/commands/ /workspace/docker/commands/
 COPY docker/entrypoint.sh /entrypoint.sh
 
-# Set permissions for entrypoint
-RUN chmod +x /entrypoint.sh
+# Set permissions for entrypoint and command scripts
+USER root
+RUN chmod +x /entrypoint.sh && chmod +x /workspace/docker/commands/*.sh
+USER maths_ai
 
 # Health check: trivial proof/inference call
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -m maths_ai.healthcheck || exit 1
 
-USER maths_ai
 ENTRYPOINT ["/entrypoint.sh"]
 
 # ---------- experimental ----------
@@ -110,10 +114,11 @@ COPY docker/commands/ /workspace/docker/commands/
 COPY docker/entrypoint.sh /entrypoint.sh
 COPY experiments/ /workspace/experiments/
 
-# Set permissions for entrypoint
-RUN chmod +x /entrypoint.sh
-
+# Set permissions for entrypoint and command scripts
+USER root
+RUN chmod +x /entrypoint.sh && chmod +x /workspace/docker/commands/*.sh
 USER maths_ai
+
 ENTRYPOINT ["/entrypoint.sh"]
 
 # ---------- training ----------
@@ -126,8 +131,9 @@ COPY scripts/ /workspace/scripts/
 COPY docker/commands/ /workspace/docker/commands/
 COPY docker/entrypoint.sh /entrypoint.sh
 
-# Set permissions for entrypoint
-RUN chmod +x /entrypoint.sh
-
+# Set permissions for entrypoint and command scripts
+USER root
+RUN chmod +x /entrypoint.sh && chmod +x /workspace/docker/commands/*.sh
 USER maths_ai
+
 ENTRYPOINT ["/entrypoint.sh"]

@@ -28,13 +28,13 @@ DATA_DIR = ROOT_DIR / "data"
 # PROCESSED_DATA_DIR = DATA_DIR / "processed"
 
 # Existing hardcoded paths stay as fallback defaults
-MODELS_DIR = ROOT_DIR / "gnn_inference" / "runs" / "premise_gnn"
+MODELS_DIR = DATA_ROOT / "gnn_inference" / "runs" / "premise_gnn"
 CHECKPOINTS_DIR = MODELS_DIR
 
 LOGS_DIR = ROOT_DIR / "logs"
 TEMP_DIR = ROOT_DIR / "tmp"
 
-OUTPUT_DIR = ROOT_DIR / "outputs"
+OUTPUT_DIR = Path(os.getenv("MATHS_AI_OUTPUT_DIR", str(ROOT_DIR / "outputs")))
 DTS_STATE_DIR = ROOT_DIR / "dts_state"
 DTS_STATE_FILE = DTS_STATE_DIR / "thompson_sampler_state.json"
 DTS_DEFAULT_C = 100.0
