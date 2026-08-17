@@ -11,7 +11,7 @@ from pathlib import Path
 MATHLIB_URL = "https://github.com/leanprover-community/mathlib4.git"
 MATHLIB_COMMIT = "29dcec074de168ac2bf835a77ef68bbe069194c5"
 PANTOGRAPH_URL = "https://github.com/jajos12/Pantograph.git"
-PANTOGRAPH_COMMIT = "81ea5f4c2915e6ca7d7855c2f22962cb6f5d7844"
+PANTOGRAPH_COMMIT = "e6a8d53165a987d59c5780d2dd287d8ed4c95147"
 PANTOGRAPH_UPSTREAM_COMMIT = "22ddfaaf2124d323dec59220f567273f01623458"
 LEAN_TOOLCHAIN = "leanprover/lean4:v4.10.0-rc1"
 PANTOGRAPH_PATCHED_FILES = {

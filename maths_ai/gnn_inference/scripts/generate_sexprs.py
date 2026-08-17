@@ -114,7 +114,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--action-traces",
         action="store_true",
         help=(
-            "Write digest-bound action_trace_v1 sidecars containing Lean-elaborated "
+            "Write digest-bound action_trace_v2 sidecars containing Lean-elaborated "
             "tactic-term trees and stable local-context indices. Existing validated "
             "raw caches are required and are never overwritten."
         ),

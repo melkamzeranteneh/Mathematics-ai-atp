@@ -20,7 +20,7 @@ from .state import parse_state
 
 EXTRACTION_VERSION = SExprCache.EXTRACTOR_VERSION
 DATASET_MATHLIB_COMMIT = "29dcec074de168ac2bf835a77ef68bbe069194c5"
-MODEL_PANTOGRAPH_COMMIT = "81ea5f4c2915e6ca7d7855c2f22962cb6f5d7844"
+MODEL_PANTOGRAPH_COMMIT = "e6a8d53165a987d59c5780d2dd287d8ed4c95147"
 PANTOGRAPH_COMMIT = MODEL_PANTOGRAPH_COMMIT
 
 
@@ -435,6 +435,7 @@ def _capture_signature(candidate: dict[str, object]) -> str:
         "goal_before": _normalized_text(str(invocation.get("goalBefore", ""))),
         "goals_before": invocation.get("goalsBefore"),
         "terms": invocation.get("terms"),
+        "syntax_args": invocation.get("syntaxArgs"),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -701,6 +702,42 @@ def _make_action_trace_record(
             }
         )
 
+    syntax_args = invocation.get("syntaxArgs")
+    if not isinstance(syntax_args, list):
+        raise SourceExtractionError(
+            "Pantograph invocation has no structured syntax-argument trace.",
+            phase="action_trace_capture",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        )
+    normalized_syntax_args: list[dict[str, object]] = []
+    for argument in syntax_args:
+        if not isinstance(argument, dict) or not isinstance(argument.get("role"), str):
+            raise SourceExtractionError(
+                "Pantograph returned an invalid structured syntax argument.",
+                phase="action_trace_capture",
+                theorem=row.theorem,
+                row_index=row.row_index,
+            )
+        start = argument.get("sourceStart")
+        end = argument.get("sourceEnd")
+        if not isinstance(start, int) or not isinstance(end, int):
+            raise SourceExtractionError(
+                "Structured syntax argument has no byte range.",
+                phase="action_trace_capture",
+                theorem=row.theorem,
+                row_index=row.row_index,
+            )
+        normalized_syntax_args.append(
+            {
+                "role": argument["role"],
+                "source": str(argument.get("source", "")),
+                "syntax_kind": str(argument.get("syntaxKind", "")),
+                "source_start": start,
+                "source_end": end,
+            }
+        )
+
     goals = invocation.get("goalsBefore")
     if not isinstance(goals, list) or len(goals) != 1 or not isinstance(goals[0], dict):
         raise SourceExtractionError(
@@ -755,6 +792,7 @@ def _make_action_trace_record(
         "target_state_sha256": SExprCache.row_target_state_sha256(row),
         "tactic": row.tactic,
         "terms": normalized_terms,
+        "syntax_args": normalized_syntax_args,
         "local_context": local_context,
     }
 
@@ -792,6 +830,7 @@ def _row_is_action_cached(
     return (
         record is not None
         and isinstance(record.get("terms"), list)
+        and isinstance(record.get("syntax_args"), list)
         and isinstance(record.get("local_context"), list)
     )
 
@@ -995,7 +1034,7 @@ async def extract_split_with_client(
     if not clients:
         raise ValueError("At least one Pantograph client is required.")
     report_root = Path(prepared_root) / (
-        "action_trace_extraction_v1"
+        "action_trace_extraction_v2"
         if action_cache is not None
         else "model_sexpr_extraction_v2"
         if model_cache is not None
@@ -1338,7 +1377,7 @@ async def extract_sexpressions(
         ),
     }
     report_root = Path(config.prepared_root) / (
-        "action_trace_extraction_v1"
+        "action_trace_extraction_v2"
         if action_cache is not None
         else "model_sexpr_extraction_v2"
         if model_cache is not None

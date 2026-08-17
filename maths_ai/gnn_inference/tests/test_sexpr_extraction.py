@@ -59,6 +59,7 @@ def _invocation(
     target: str,
     *,
     terms: list[dict[str, object]] | None = None,
+    syntax_args: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
         "goalBefore": before,
@@ -67,6 +68,7 @@ def _invocation(
         "goalsBefore": [_goal(target, "p")],
         "goalsAfter": [],
         "terms": [] if terms is None else terms,
+        "syntaxArgs": [] if syntax_args is None else syntax_args,
     }
 
 
@@ -240,6 +242,15 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
                 "actionSexp": "(:local FV0)",
             }
         ]
+        units[0]["invocations"][0]["syntaxArgs"] = [
+            {
+                "role": "fresh_name",
+                "source": "x",
+                "syntaxKind": "ident",
+                "sourceStart": 40,
+                "sourceEnd": 41,
+            }
+        ]
         await self._extract(_FakeClient(units))
         raw_before = self.cache.load("train", 10)
         action_cache = ActionTraceCache(self.root / "prepared")
@@ -255,7 +266,7 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         sidecar = action_cache.load_for_raw_record("train", 10, raw_before)
-        self.assertEqual(manifest["extractor_version"], "lean-action-trace-v1")
+        self.assertEqual(manifest["extractor_version"], "lean-action-trace-v2")
         self.assertEqual(manifest["extracted_rows"], 2)
         self.assertEqual(
             sidecar["terms"],
@@ -266,6 +277,18 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
                     "source_start": 42,
                     "source_end": 43,
                     "action_sexp": "(:local FV0)",
+                }
+            ],
+        )
+        self.assertEqual(
+            sidecar["syntax_args"],
+            [
+                {
+                    "role": "fresh_name",
+                    "source": "x",
+                    "syntax_kind": "ident",
+                    "source_start": 40,
+                    "source_end": 41,
                 }
             ],
         )

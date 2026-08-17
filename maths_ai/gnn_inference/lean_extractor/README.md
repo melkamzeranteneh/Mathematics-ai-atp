@@ -3,7 +3,7 @@
 The LeanDojo dataset was traced from Mathlib commit
 `29dcec074de168ac2bf835a77ef68bbe069194c5` with Lean
 `v4.10.0-rc1`. The extractor pins commit
-`81ea5f4c2915e6ca7d7855c2f22962cb6f5d7844` from the persistent
+`e6a8d53165a987d59c5780d2dd287d8ed4c95147` from the persistent
 [`jajos12/Pantograph`](https://github.com/jajos12/Pantograph/tree/gnn-sexpr-v410)
 fork. That commit contains both source-invocation tracing and the Lean-native
 model S-expression serializer, plus Lean-elaborated tactic-term tracing; no
@@ -62,10 +62,11 @@ python -m maths_ai.gnn_inference.scripts.generate_sexprs \
 ```
 
 These sidecars live at
-`{prepared_root}/{split}/action_trace_v1/{row_index}.json`. They contain the
+`{prepared_root}/{split}/action_trace_v2/{row_index}.json`. They contain the
 elaborated argument expression tree (including `:local`, `:global`, `:ctor`,
-and `:app`) and the input goal's stable local-context indices. Each sidecar is
-bound to its validated raw record by SHA-256.
+and `:app`), semantically confirmed fresh binder names, and the input goal's
+stable local-context indices. Each sidecar is bound to its validated raw record
+by SHA-256.
 
 For a controlled pilot, first create one deterministic theorem-level
 selection before S-expression extraction. It needs no raw cache. It stratifies

@@ -195,8 +195,8 @@ class ActionTraceCache:
     invalidates the expensive source-state or normalized-expression caches.
     """
 
-    SCHEMA_VERSION = 1
-    EXTRACTOR_VERSION = "lean-action-trace-v1"
+    SCHEMA_VERSION = 2
+    EXTRACTOR_VERSION = "lean-action-trace-v2"
 
     def __init__(self, output_root: Path, enabled: bool = True):
         self.output_root = Path(output_root)
@@ -207,7 +207,7 @@ class ActionTraceCache:
         return ModelSExprCache.raw_record_sha256(raw_record)
 
     def _sidecar_dir(self, split: str) -> Path:
-        directory = self.output_root / split / "action_trace_v1"
+        directory = self.output_root / split / "action_trace_v2"
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
