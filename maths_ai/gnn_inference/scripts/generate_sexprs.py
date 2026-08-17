@@ -110,11 +110,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "and are never overwritten."
         ),
     )
+    parser.add_argument(
+        "--action-traces",
+        action="store_true",
+        help=(
+            "Write digest-bound action_trace_v1 sidecars containing Lean-elaborated "
+            "tactic-term trees and stable local-context indices. Existing validated "
+            "raw caches are required and are never overwritten."
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    if args.model_sexprs and args.action_traces:
+        print(
+            "S-expression extraction failed: --model-sexprs and "
+            "--action-traces are mutually exclusive."
+        )
+        return 1
     config = SExprExtractionConfig(
         prepared_root=args.prepared_root,
         source_root=args.source_root,
@@ -128,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         workers=args.workers,
         recycle_worker_files=args.recycle_worker_files,
         model_sexprs=args.model_sexprs,
+        action_traces=args.action_traces,
         expected_pantograph_commit=(
             MODEL_PANTOGRAPH_COMMIT if args.model_sexprs else PANTOGRAPH_COMMIT
         ),

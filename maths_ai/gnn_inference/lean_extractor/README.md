@@ -3,10 +3,11 @@
 The LeanDojo dataset was traced from Mathlib commit
 `29dcec074de168ac2bf835a77ef68bbe069194c5` with Lean
 `v4.10.0-rc1`. The extractor pins commit
-`9fea43c8cb5d7199c40914fc9022716c612755fd` from the persistent
+`81ea5f4c2915e6ca7d7855c2f22962cb6f5d7844` from the persistent
 [`jajos12/Pantograph`](https://github.com/jajos12/Pantograph/tree/gnn-sexpr-v410)
 fork. That commit contains both source-invocation tracing and the Lean-native
-model S-expression serializer; no uncommitted patching is required.
+model S-expression serializer, plus Lean-elaborated tactic-term tracing; no
+uncommitted patching is required.
 
 Create the pinned environment once:
 
@@ -48,6 +49,23 @@ Sidecars are stored under
 `{prepared_root}/{split}/model_sexpr_v2/{row_index}.json`. Each contains the
 SHA-256 digest of its corresponding raw record, so stale normalization is
 rejected automatically while the costly raw extraction remains reusable.
+
+Generate structured action traces without changing either existing cache:
+
+```bash
+python -m maths_ai.gnn_inference.scripts.generate_sexprs \
+  --prepared-root maths_ai/_support_files/artifacts/prepared/v1 \
+  --source-root maths_ai/_support_files/sexpr_environment/mathlib4 \
+  --pantograph-repl maths_ai/_support_files/sexpr_environment/Pantograph/.lake/build/bin/repl \
+  --splits train val test \
+  --action-traces
+```
+
+These sidecars live at
+`{prepared_root}/{split}/action_trace_v1/{row_index}.json`. They contain the
+elaborated argument expression tree (including `:local`, `:global`, `:ctor`,
+and `:app`) and the input goal's stable local-context indices. Each sidecar is
+bound to its validated raw record by SHA-256.
 
 For a controlled pilot, first create one deterministic theorem-level
 selection before S-expression extraction. It needs no raw cache. It stratifies

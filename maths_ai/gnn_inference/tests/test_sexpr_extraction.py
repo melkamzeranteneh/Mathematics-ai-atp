@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from maths_ai.gnn_inference.atp_lean_gnn.dataset import DatasetRow
 from maths_ai.gnn_inference.atp_lean_gnn.preparation import (
+    ActionTraceCache,
     ModelSExprCache,
     SExprCache,
     SExprUnavailableError,
@@ -51,13 +52,21 @@ def _goal(target: str, *names: str) -> dict[str, object]:
     }
 
 
-def _invocation(before: str, tactic: str, after: str, target: str) -> dict[str, object]:
+def _invocation(
+    before: str,
+    tactic: str,
+    after: str,
+    target: str,
+    *,
+    terms: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
     return {
         "goalBefore": before,
         "goalAfter": after,
         "tactic": tactic,
         "goalsBefore": [_goal(target, "p")],
         "goalsAfter": [],
+        "terms": [] if terms is None else terms,
     }
 
 
@@ -219,6 +228,83 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             model_cache.load_for_raw_record("train", 10, changed_raw)
         )
+
+    async def test_action_enrichment_preserves_lean_terms_and_stable_context(self):
+        units = self._units()
+        units[0]["invocations"][0]["terms"] = [
+            {
+                "source": "p",
+                "syntaxKind": "ident",
+                "sourceStart": 42,
+                "sourceEnd": 43,
+                "actionSexp": "(:local FV0)",
+            }
+        ]
+        await self._extract(_FakeClient(units))
+        raw_before = self.cache.load("train", 10)
+        action_cache = ActionTraceCache(self.root / "prepared")
+
+        manifest = await extract_split_with_client(
+            _FakeClient(units),
+            rows=self.rows,
+            cache=self.cache,
+            action_cache=action_cache,
+            prepared_root=self.root / "prepared",
+            source_root=self.source_root,
+            split="train",
+        )
+
+        sidecar = action_cache.load_for_raw_record("train", 10, raw_before)
+        self.assertEqual(manifest["extractor_version"], "lean-action-trace-v1")
+        self.assertEqual(manifest["extracted_rows"], 2)
+        self.assertEqual(
+            sidecar["terms"],
+            [
+                {
+                    "source": "p",
+                    "syntax_kind": "ident",
+                    "source_start": 42,
+                    "source_end": 43,
+                    "action_sexp": "(:local FV0)",
+                }
+            ],
+        )
+        self.assertEqual(
+            sidecar["local_context"],
+            [
+                {
+                    "context_index": 0,
+                    "user_name": "p",
+                    "internal_name": "internal_p",
+                    "binder_role": ":explicit",
+                    "is_instance": False,
+                    "is_let": False,
+                }
+            ],
+        )
+        self.assertEqual(self.cache.load("train", 10), raw_before)
+
+        changed_raw = dict(raw_before)
+        changed_raw["goal_sexp"] = "(:c Changed)"
+        self.assertIsNone(
+            action_cache.load_for_raw_record("train", 10, changed_raw)
+        )
+
+    async def test_action_enrichment_requires_validated_raw_records(self):
+        action_cache = ActionTraceCache(self.root / "prepared")
+        manifest = await extract_split_with_client(
+            _FakeClient(self._units()),
+            rows=self.rows,
+            cache=self.cache,
+            action_cache=action_cache,
+            prepared_root=self.root / "prepared",
+            source_root=self.source_root,
+            split="train",
+        )
+
+        self.assertEqual(manifest["failed_rows"], 2)
+        self.assertEqual(manifest["failure_phases"], {"raw_cache_missing": 2})
+        self.assertIsNone(action_cache.load("train", 10))
 
     async def test_target_state_change_invalidates_cache_and_alignment(self):
         await self._extract(_FakeClient(self._units()))

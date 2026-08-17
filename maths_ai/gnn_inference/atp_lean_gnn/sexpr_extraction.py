@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .dataset import DATASET_NAME, DatasetRow, canonicalize_split_name, iter_dataset_rows
-from .preparation import ModelSExprCache, SExprCache
+from .preparation import ActionTraceCache, ModelSExprCache, SExprCache
 from .pilot_sampling import selected_extraction_row_indices
 from .reporting import console_print
 from .state import parse_state
@@ -20,7 +20,7 @@ from .state import parse_state
 
 EXTRACTION_VERSION = SExprCache.EXTRACTOR_VERSION
 DATASET_MATHLIB_COMMIT = "29dcec074de168ac2bf835a77ef68bbe069194c5"
-MODEL_PANTOGRAPH_COMMIT = "9fea43c8cb5d7199c40914fc9022716c612755fd"
+MODEL_PANTOGRAPH_COMMIT = "81ea5f4c2915e6ca7d7855c2f22962cb6f5d7844"
 PANTOGRAPH_COMMIT = MODEL_PANTOGRAPH_COMMIT
 
 
@@ -42,6 +42,7 @@ class SExprExtractionConfig:
     recycle_worker_files: int = 10
     verify_source_commit: bool = True
     model_sexprs: bool = False
+    action_traces: bool = False
     theorem: str | None = None
     selection_manifest: Path | None = None
 
@@ -433,6 +434,7 @@ def _capture_signature(candidate: dict[str, object]) -> str:
         "capture_error": invocation.get("captureError"),
         "goal_before": _normalized_text(str(invocation.get("goalBefore", ""))),
         "goals_before": invocation.get("goalsBefore"),
+        "terms": invocation.get("terms"),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -656,6 +658,107 @@ def _make_model_record(
     }
 
 
+def _make_action_trace_record(
+    row: DatasetRow,
+    candidate: dict[str, object],
+    raw_record: dict[str, object],
+) -> dict[str, object]:
+    invocation = candidate["invocation"]
+    assert isinstance(invocation, dict)
+    terms = invocation.get("terms")
+    if not isinstance(terms, list):
+        raise SourceExtractionError(
+            "Pantograph invocation has no structured tactic-term trace.",
+            phase="action_trace_capture",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        )
+    normalized_terms: list[dict[str, object]] = []
+    for term in terms:
+        if not isinstance(term, dict) or not isinstance(term.get("actionSexp"), str):
+            raise SourceExtractionError(
+                "Pantograph returned an invalid structured tactic term.",
+                phase="action_trace_capture",
+                theorem=row.theorem,
+                row_index=row.row_index,
+            )
+        start = term.get("sourceStart")
+        end = term.get("sourceEnd")
+        if not isinstance(start, int) or not isinstance(end, int):
+            raise SourceExtractionError(
+                "Structured tactic term has no byte range.",
+                phase="action_trace_capture",
+                theorem=row.theorem,
+                row_index=row.row_index,
+            )
+        normalized_terms.append(
+            {
+                "source": str(term.get("source", "")),
+                "syntax_kind": str(term.get("syntaxKind", "")),
+                "source_start": start,
+                "source_end": end,
+                "action_sexp": term["actionSexp"],
+            }
+        )
+
+    goals = invocation.get("goalsBefore")
+    if not isinstance(goals, list) or len(goals) != 1 or not isinstance(goals[0], dict):
+        raise SourceExtractionError(
+            "Action tracing requires exactly one serialized input goal.",
+            phase="action_goal_cardinality",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        )
+    variables = goals[0].get("vars")
+    if not isinstance(variables, list):
+        raise SourceExtractionError(
+            "Action trace input goal has no local context.",
+            phase="action_context_metadata",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        )
+    local_context: list[dict[str, object]] = []
+    for variable in variables:
+        if not isinstance(variable, dict) or not isinstance(
+            variable.get("contextIndex"), int
+        ):
+            raise SourceExtractionError(
+                "Action trace local variable has no stable context index.",
+                phase="action_context_metadata",
+                theorem=row.theorem,
+                row_index=row.row_index,
+            )
+        local_context.append(
+            {
+                "context_index": variable["contextIndex"],
+                "user_name": str(variable.get("userName", "_")),
+                "internal_name": str(variable.get("name", "")),
+                "binder_role": str(variable.get("binderRole", "")),
+                "is_instance": bool(variable.get("isInstance", False)),
+                "is_let": bool(variable.get("isLet", False)),
+            }
+        )
+
+    return {
+        "schema_version": ActionTraceCache.SCHEMA_VERSION,
+        "extractor_version": ActionTraceCache.EXTRACTOR_VERSION,
+        "dataset": row.dataset_name,
+        "split": row.split,
+        "row_index": row.row_index,
+        "theorem": row.theorem,
+        "repo_commit": row.repo_commit,
+        "file_path": row.file_path,
+        "pantograph_commit": PANTOGRAPH_COMMIT,
+        "raw_record_sha256": ActionTraceCache.raw_record_sha256(raw_record),
+        "state_sha256": SExprCache.row_state_sha256(row),
+        "tactic_sha256": SExprCache.row_tactic_sha256(row),
+        "target_state_sha256": SExprCache.row_target_state_sha256(row),
+        "tactic": row.tactic,
+        "terms": normalized_terms,
+        "local_context": local_context,
+    }
+
+
 def _row_is_cached(cache: SExprCache, row: DatasetRow) -> bool:
     record = cache.load_for_row(row, extractor_version=EXTRACTION_VERSION)
     return (
@@ -676,6 +779,20 @@ def _row_is_model_cached(
         record is not None
         and isinstance(record.get("goal_sexp"), str)
         and isinstance(record.get("hyp_sexps"), list)
+    )
+
+
+def _row_is_action_cached(
+    raw_cache: SExprCache, action_cache: ActionTraceCache, row: DatasetRow
+) -> bool:
+    raw_record = raw_cache.load_for_row(row, extractor_version=EXTRACTION_VERSION)
+    if raw_record is None:
+        return False
+    record = action_cache.load_for_raw_record(row.split, row.row_index, raw_record)
+    return (
+        record is not None
+        and isinstance(record.get("terms"), list)
+        and isinstance(record.get("local_context"), list)
     )
 
 
@@ -737,8 +854,11 @@ async def _extract_file_with_client(
     expected_commit: str,
     resume: bool,
     model_cache: ModelSExprCache | None = None,
+    action_cache: ActionTraceCache | None = None,
 ) -> dict[str, object]:
     def row_is_cached(row: DatasetRow) -> bool:
+        if action_cache is not None:
+            return _row_is_action_cached(cache, action_cache, row)
         if model_cache is not None:
             return _row_is_model_cached(cache, model_cache, row)
         return _row_is_cached(cache, row)
@@ -790,7 +910,7 @@ async def _extract_file_with_client(
                     theorem=theorem,
                 )
             aligned = _align_rows(theorem_rows, candidates)
-            if model_cache is None:
+            if model_cache is None and action_cache is None:
                 records = [
                     _make_record(row, candidate)
                     for row, candidate in zip(theorem_rows, aligned)
@@ -812,19 +932,30 @@ async def _extract_file_with_client(
                         phase="raw_cache_missing",
                         theorem=theorem,
                     )
-                records = [
-                    _make_model_record(row, candidate, raw_record)
-                    for row, candidate, raw_record in zip(
-                        theorem_rows, aligned, raw_records
-                    )
-                    if raw_record is not None
-                ]
+                if action_cache is not None:
+                    records = [
+                        _make_action_trace_record(row, candidate, raw_record)
+                        for row, candidate, raw_record in zip(
+                            theorem_rows, aligned, raw_records
+                        )
+                        if raw_record is not None
+                    ]
+                else:
+                    records = [
+                        _make_model_record(row, candidate, raw_record)
+                        for row, candidate, raw_record in zip(
+                            theorem_rows, aligned, raw_records
+                        )
+                        if raw_record is not None
+                    ]
             # Validate every row in the theorem before committing any of them,
             # so a capture error cannot leave a partial group.
             uncached_indices = {row.row_index for row in uncached_rows}
             for row, record in zip(theorem_rows, records):
                 if row.row_index in uncached_indices:
-                    if model_cache is None:
+                    if action_cache is not None:
+                        action_cache.save(row.split, row.row_index, record)
+                    elif model_cache is None:
                         cache.save(row.split, row.row_index, record)
                     else:
                         model_cache.save(row.split, row.row_index, record)
@@ -856,12 +987,19 @@ async def extract_split_with_client(
     resume: bool = True,
     recycle_worker_files: int = 0,
     model_cache: ModelSExprCache | None = None,
+    action_cache: ActionTraceCache | None = None,
 ) -> dict[str, object]:
+    if model_cache is not None and action_cache is not None:
+        raise ValueError("model_cache and action_cache are mutually exclusive.")
     clients = list(client) if isinstance(client, (list, tuple)) else [client]
     if not clients:
         raise ValueError("At least one Pantograph client is required.")
     report_root = Path(prepared_root) / (
-        "model_sexpr_extraction_v2" if model_cache is not None else "sexpr_extraction"
+        "action_trace_extraction_v1"
+        if action_cache is not None
+        else "model_sexpr_extraction_v2"
+        if model_cache is not None
+        else "sexpr_extraction"
     )
     failure_path = report_root / "failures" / f"{split}.jsonl"
     failure_path.parent.mkdir(parents=True, exist_ok=True)
@@ -878,6 +1016,8 @@ async def extract_split_with_client(
         failed_rows = len(rows)
     else:
         def row_is_cached(row: DatasetRow) -> bool:
+            if action_cache is not None:
+                return _row_is_action_cached(cache, action_cache, row)
             if model_cache is not None:
                 return _row_is_model_cached(cache, model_cache, row)
             return _row_is_cached(cache, row)
@@ -927,6 +1067,7 @@ async def extract_split_with_client(
                             expected_commit=expected_commit,
                             resume=resume,
                             model_cache=model_cache,
+                            action_cache=action_cache,
                         )
                     except Exception as caught:
                         file_rows = [
@@ -994,12 +1135,18 @@ async def extract_split_with_client(
     covered_rows = cached_rows + extracted_rows
     manifest: dict[str, object] = {
         "schema_version": (
-            ModelSExprCache.SCHEMA_VERSION
+            ActionTraceCache.SCHEMA_VERSION
+            if action_cache is not None
+            else ModelSExprCache.SCHEMA_VERSION
             if model_cache is not None
             else SExprCache.SCHEMA_VERSION
         ),
         "extractor_version": (
-            ModelSExprCache.NORMALIZATION if model_cache is not None else EXTRACTION_VERSION
+            ActionTraceCache.EXTRACTOR_VERSION
+            if action_cache is not None
+            else ModelSExprCache.NORMALIZATION
+            if model_cache is not None
+            else EXTRACTION_VERSION
         ),
         "dataset": rows[0].dataset_name if rows else None,
         "source_commit": expected_commit,
@@ -1032,7 +1179,11 @@ def _git_head(source_root: Path) -> str:
     return result.stdout.strip()
 
 
-async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=None) -> dict[str, object]:
+async def extract_sexpressions(
+    config: SExprExtractionConfig, *, client_factory=None
+) -> dict[str, object]:
+    if config.model_sexprs and config.action_traces:
+        raise ValueError("model_sexprs and action_traces are mutually exclusive.")
     if config.selection_manifest is not None and config.sample_per_split is not None:
         raise ValueError(
             "--selection-manifest and --max-items cannot be combined; "
@@ -1078,7 +1229,7 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
                 startup_timeout=config.server_startup_timeout,
                 file_timeout=config.file_timeout,
                 buffer_limit=config.buffer_limit,
-                capture_model_sexprs=config.model_sexprs,
+                capture_model_sexprs=config.model_sexprs or config.action_traces,
             )
         else:
             client = client_factory(config)
@@ -1089,6 +1240,11 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
     model_cache = (
         ModelSExprCache(config.prepared_root, enabled=True)
         if config.model_sexprs
+        else None
+    )
+    action_cache = (
+        ActionTraceCache(config.prepared_root, enabled=True)
+        if config.action_traces
         else None
     )
     manifests: dict[str, dict[str, object]] = {}
@@ -1136,6 +1292,7 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
                 resume=config.resume,
                 recycle_worker_files=config.recycle_worker_files,
                 model_cache=model_cache,
+                action_cache=action_cache,
             )
     finally:
         if started:
@@ -1147,12 +1304,18 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
     covered_rows = sum(int(item["covered_rows"]) for item in manifests.values())
     summary: dict[str, object] = {
         "schema_version": (
-            ModelSExprCache.SCHEMA_VERSION
+            ActionTraceCache.SCHEMA_VERSION
+            if action_cache is not None
+            else ModelSExprCache.SCHEMA_VERSION
             if model_cache is not None
             else SExprCache.SCHEMA_VERSION
         ),
         "extractor_version": (
-            ModelSExprCache.NORMALIZATION if model_cache is not None else EXTRACTION_VERSION
+            ActionTraceCache.EXTRACTOR_VERSION
+            if action_cache is not None
+            else ModelSExprCache.NORMALIZATION
+            if model_cache is not None
+            else EXTRACTION_VERSION
         ),
         "dataset": config.dataset_name,
         "source_root": str(source_root),
@@ -1175,7 +1338,9 @@ async def extract_sexpressions(config: SExprExtractionConfig, *, client_factory=
         ),
     }
     report_root = Path(config.prepared_root) / (
-        "model_sexpr_extraction_v2"
+        "action_trace_extraction_v1"
+        if action_cache is not None
+        else "model_sexpr_extraction_v2"
         if model_cache is not None
         else "sexpr_extraction"
     )

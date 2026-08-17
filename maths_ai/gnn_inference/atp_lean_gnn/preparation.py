@@ -188,6 +188,65 @@ class ModelSExprCache:
         os.replace(temporary, path)
 
 
+class ActionTraceCache:
+    """Lean-elaborated tactic-term trees bound to a validated raw state.
+
+    Action traces are separate sidecars so extending argument supervision never
+    invalidates the expensive source-state or normalized-expression caches.
+    """
+
+    SCHEMA_VERSION = 1
+    EXTRACTOR_VERSION = "lean-action-trace-v1"
+
+    def __init__(self, output_root: Path, enabled: bool = True):
+        self.output_root = Path(output_root)
+        self.enabled = enabled
+
+    @staticmethod
+    def raw_record_sha256(raw_record: dict) -> str:
+        return ModelSExprCache.raw_record_sha256(raw_record)
+
+    def _sidecar_dir(self, split: str) -> Path:
+        directory = self.output_root / split / "action_trace_v1"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    def load(self, split: str, row_index: int) -> Optional[dict]:
+        path = self._sidecar_dir(split) / f"{row_index:09d}.json"
+        if not path.exists():
+            return None
+        try:
+            with path.open(encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception:
+            return None
+        if (
+            payload.get("schema_version") != self.SCHEMA_VERSION
+            or payload.get("extractor_version") != self.EXTRACTOR_VERSION
+        ):
+            return None
+        return payload
+
+    def load_for_raw_record(
+        self, split: str, row_index: int, raw_record: dict
+    ) -> Optional[dict]:
+        payload = self.load(split, row_index)
+        if payload is None:
+            return None
+        if payload.get("raw_record_sha256") != self.raw_record_sha256(raw_record):
+            return None
+        return payload
+
+    def save(self, split: str, row_index: int, data: dict) -> None:
+        path = self._sidecar_dir(split) / f"{row_index:09d}.json"
+        temporary = path.with_suffix(".json.tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+
+
 class SExprUnavailableError(RuntimeError):
     """Raised when strict S-expression mode has no validated cache record."""
 
