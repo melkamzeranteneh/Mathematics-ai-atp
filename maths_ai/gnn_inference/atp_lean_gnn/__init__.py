@@ -1,3 +1,8 @@
+from .argument_coverage import (
+    ArgumentCoverageConfig,
+    classify_argument_slots,
+    run_argument_coverage_audit,
+)
 from .argument_selector import (
     ArgumentSelector,
     TacticWithArgsClassifier,
@@ -68,6 +73,7 @@ from .visualize import build_visualization_html, visualize_dag
 
 __all__ = [
     "ArgumentSelector",
+    "ArgumentCoverageConfig",
     "BaselineConfig",
     "CandidatePool",
     "DAGBuilder",
@@ -121,6 +127,7 @@ __all__ = [
     "build_vocab",
     "build_vocab_from_labels",
     "compare_saved_runs",
+    "classify_argument_slots",
     "compute_combined_loss",
     "compute_eval_metrics_from_logits",
     "compute_premise_ranking_loss",
@@ -154,6 +161,7 @@ __all__ = [
     "render_run_comparison_markdown",
     "resolve_arg_targets_to_padded",
     "run_parser_audit",
+    "run_argument_coverage_audit",
     "run_preprocessing",
     "sexp_to_dag",
     "train_baseline",
