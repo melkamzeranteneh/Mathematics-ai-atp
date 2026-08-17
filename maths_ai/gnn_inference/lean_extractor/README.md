@@ -68,6 +68,21 @@ and `:app`), semantically confirmed fresh binder names, and the input goal's
 stable local-context indices. Each sidecar is bound to its validated raw record
 by SHA-256.
 
+Before implementing or training a decoder, compile and audit the available
+structured targets:
+
+```bash
+python -m maths_ai.gnn_inference.scripts.audit_action_targets \
+  --cache-root maths_ai/_support_files/artifacts/prepared/v1 \
+  --splits train \
+  --force
+```
+
+The audit writes typed prefix-operation targets, coverage statistics, sequence
+length percentiles, and representative unsupported cases beneath
+`action_trace_extraction_v2/target_audit`. A `LOCAL` operation is accepted only
+when its `FVn` index exists in that trace's digest-validated local context.
+
 For a controlled pilot, first create one deterministic theorem-level
 selection before S-expression extraction. It needs no raw cache. It stratifies
 by tactic frequency, proof-state size, proof length, and context shape, while
