@@ -54,12 +54,17 @@ ENV MATHS_AI_LEAN_PROJECT=/opt/lean_project
 ENV MATHS_AI_DATA_ROOT=/data
 
 # Install SWI-Prolog >= 9.3.x (Ubuntu apt ships 9.0.4 which is too old)
+# Use direct download from GitHub releases to avoid PPA network issues
+ARG SWI_PROLOG_VERSION=9.3.8
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    software-properties-common \
-    gnupg \
-    && apt-add-repository -y ppa:swi-prolog/stable \
-    && apt-get update && apt-get install -y --no-install-recommends swi-prolog \
-    && rm -rf /var/lib/apt/lists/*
+    wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && wget -q "https://github.com/SWI-Prolog/swipl-devel/releases/download/V${SWI_PROLOG_VERSION}/swipl-${SWI_PROLOG_VERSION}-linux.tar.gz" \
+    -O /tmp/swipl.tar.gz \
+    && tar -xzf /tmp/swipl.tar.gz -C /opt \
+    && mv /opt/swipl-${SWI_PROLOG_VERSION} /opt/swipl \
+    && ln -s /opt/swipl/bin/swipl /usr/local/bin/swipl \
+    && rm /tmp/swipl.tar.gz
 
 # Install petta
 ARG PETTA_REF=v1.0.3
