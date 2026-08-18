@@ -3,11 +3,11 @@
 The LeanDojo dataset was traced from Mathlib commit
 `29dcec074de168ac2bf835a77ef68bbe069194c5` with Lean
 `v4.10.0-rc1`. The extractor pins commit
-`e6a8d53165a987d59c5780d2dd287d8ed4c95147` from the persistent
+`73781c2d58456e4bf369dadd4a501e1b78a0b177` from the persistent
 [`jajos12/Pantograph`](https://github.com/jajos12/Pantograph/tree/gnn-sexpr-v410)
-fork. That commit contains both source-invocation tracing and the Lean-native
-model S-expression serializer, plus Lean-elaborated tactic-term tracing; no
-uncommitted patching is required.
+fork. That commit contains source-invocation tracing, the Lean-native model
+S-expression serializer, Lean-elaborated tactic-term tracing, and compact
+annotated tactic-syntax tracing; no uncommitted patching is required.
 
 Create the pinned environment once:
 
@@ -68,6 +68,30 @@ and `:app`), semantically confirmed fresh binder names, and the input goal's
 stable local-context indices. Each sidecar is bound to its validated raw record
 by SHA-256.
 
+Version 2 traces are diagnostics rather than decoder targets. Because they are
+built from Lean's fully elaborated terms, a local introduced inside the tactic
+cannot be pointed at a goal hypothesis, and a nested `by ...` proof expands into
+thousands of kernel nodes. The current decoder target is the compact original
+tactic syntax annotated by Lean, written to a separate directory so the
+elaborated traces stay available for comparison:
+
+```bash
+python -m maths_ai.gnn_inference.scripts.generate_sexprs \
+  --prepared-root maths_ai/_support_files/artifacts/prepared/v1 \
+  --source-root maths_ai/_support_files/sexpr_environment/mathlib4 \
+  --pantograph-repl maths_ai/_support_files/sexpr_environment/Pantograph/.lake/build/bin/repl \
+  --splits train val test \
+  --source-syntax-traces
+```
+
+These sidecars live at
+`{prepared_root}/{split}/action_trace_v3/{row_index}.json`. Each stores the
+parsed syntax tree of the tactic as it was written, where every identifier leaf
+carries the meaning Lean resolved for it: a stable local-context index, a
+tactic-scoped binding, a global constant, or a constructor. Elaborated
+expressions are deliberately not stored, only their byte ranges, so the
+kernel-term blowup cannot return through the cache.
+
 Before implementing or training a decoder, compile and audit the available
 structured targets:
 
@@ -75,13 +99,19 @@ structured targets:
 python -m maths_ai.gnn_inference.scripts.audit_action_targets \
   --cache-root maths_ai/_support_files/artifacts/prepared/v1 \
   --splits train \
+  --trace-version v3 \
+  --max-operations 256 \
   --force
 ```
 
 The audit writes typed prefix-operation targets, coverage statistics, sequence
 length percentiles, and representative unsupported cases beneath
-`action_trace_extraction_v2/target_audit`. A `LOCAL` operation is accepted only
-when its `FVn` index exists in that trace's digest-validated local context.
+`action_trace_extraction_v3/target_audit`; pass `--trace-version v2` to audit the
+elaborated traces under `action_trace_extraction_v2/target_audit` instead. A
+`LOCAL` operation is accepted only when its context index exists in that trace's
+digest-validated local context. Targets longer than `--max-operations` are
+excluded from `targets.jsonl` but still counted and sampled, so the cost of the
+cap stays visible in the summary.
 
 For a controlled pilot, first create one deterministic theorem-level
 selection before S-expression extraction. It needs no raw cache. It stratifies
