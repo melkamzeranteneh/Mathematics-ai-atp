@@ -119,15 +119,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "raw caches are required and are never overwritten."
         ),
     )
+    parser.add_argument(
+        "--source-syntax-traces",
+        action="store_true",
+        help=(
+            "Write digest-bound action_trace_v3 sidecars containing the compact "
+            "original tactic syntax annotated with Lean-resolved references. This "
+            "is the current decoder target; v2 sidecars are left untouched."
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    if args.model_sexprs and args.action_traces:
+    enabled_modes = [
+        flag
+        for flag, enabled in (
+            ("--model-sexprs", args.model_sexprs),
+            ("--action-traces", args.action_traces),
+            ("--source-syntax-traces", args.source_syntax_traces),
+        )
+        if enabled
+    ]
+    if len(enabled_modes) > 1:
         print(
-            "S-expression extraction failed: --model-sexprs and "
-            "--action-traces are mutually exclusive."
+            "S-expression extraction failed: "
+            f"{', '.join(enabled_modes)} are mutually exclusive."
         )
         return 1
     config = SExprExtractionConfig(
@@ -144,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         recycle_worker_files=args.recycle_worker_files,
         model_sexprs=args.model_sexprs,
         action_traces=args.action_traces,
+        source_syntax_traces=args.source_syntax_traces,
         expected_pantograph_commit=(
             MODEL_PANTOGRAPH_COMMIT if args.model_sexprs else PANTOGRAPH_COMMIT
         ),

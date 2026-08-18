@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Iterable
 
 from .dataset import DATASET_NAME, DatasetRow, canonicalize_split_name, iter_dataset_rows
-from .preparation import ActionTraceCache, ModelSExprCache, SExprCache
+from .preparation import (
+    ActionTraceCache,
+    ModelSExprCache,
+    SExprCache,
+    SourceSyntaxTraceCache,
+)
 from .pilot_sampling import selected_extraction_row_indices
 from .reporting import console_print
 from .state import parse_state
@@ -20,8 +25,14 @@ from .state import parse_state
 
 EXTRACTION_VERSION = SExprCache.EXTRACTOR_VERSION
 DATASET_MATHLIB_COMMIT = "29dcec074de168ac2bf835a77ef68bbe069194c5"
-MODEL_PANTOGRAPH_COMMIT = "e6a8d53165a987d59c5780d2dd287d8ed4c95147"
-PANTOGRAPH_COMMIT = MODEL_PANTOGRAPH_COMMIT
+# First fork commit that emitted normalized model S-expressions and elaborated
+# action traces.  Recorded for provenance of caches produced before the compact
+# tactic-syntax trace existed; those records stay valid.
+LEGACY_MODEL_PANTOGRAPH_COMMIT = "e6a8d53165a987d59c5780d2dd287d8ed4c95147"
+# Current pin.  It adds the compact annotated tactic-syntax trace and keeps
+# every earlier field, so raw and normalized extraction are unaffected.
+PANTOGRAPH_COMMIT = "73781c2d58456e4bf369dadd4a501e1b78a0b177"
+MODEL_PANTOGRAPH_COMMIT = PANTOGRAPH_COMMIT
 
 
 @dataclass(frozen=True)
@@ -43,6 +54,7 @@ class SExprExtractionConfig:
     verify_source_commit: bool = True
     model_sexprs: bool = False
     action_traces: bool = False
+    source_syntax_traces: bool = False
     theorem: str | None = None
     selection_manifest: Path | None = None
 
@@ -666,6 +678,97 @@ def _make_action_trace_record(
 ) -> dict[str, object]:
     invocation = candidate["invocation"]
     assert isinstance(invocation, dict)
+    return {
+        "schema_version": ActionTraceCache.SCHEMA_VERSION,
+        "extractor_version": ActionTraceCache.EXTRACTOR_VERSION,
+        "dataset": row.dataset_name,
+        "split": row.split,
+        "row_index": row.row_index,
+        "theorem": row.theorem,
+        "repo_commit": row.repo_commit,
+        "file_path": row.file_path,
+        "pantograph_commit": PANTOGRAPH_COMMIT,
+        "raw_record_sha256": ActionTraceCache.raw_record_sha256(raw_record),
+        "state_sha256": SExprCache.row_state_sha256(row),
+        "tactic_sha256": SExprCache.row_tactic_sha256(row),
+        "target_state_sha256": SExprCache.row_target_state_sha256(row),
+        "tactic": row.tactic,
+        "terms": _normalized_action_terms(row, invocation, include_action_sexp=True),
+        "syntax_args": _normalized_action_syntax_arguments(row, invocation),
+        "local_context": _normalized_action_local_context(row, invocation),
+    }
+
+
+def _make_source_syntax_trace_record(
+    row: DatasetRow,
+    candidate: dict[str, object],
+    raw_record: dict[str, object],
+) -> dict[str, object]:
+    """Build a version-3 sidecar around the compact annotated tactic syntax.
+
+    The elaborated term trees stay in the version-2 sidecars: repeating them here
+    would restore exactly the kernel-term blowup this schema exists to avoid, so
+    only their source ranges are kept as alignment diagnostics.
+    """
+    invocation = candidate["invocation"]
+    assert isinstance(invocation, dict)
+    encoded = invocation.get("sourceSyntax")
+    if not isinstance(encoded, str) or not encoded:
+        raise SourceExtractionError(
+            "Pantograph invocation has no compact tactic-syntax trace.",
+            phase="source_syntax_capture",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        )
+    try:
+        source_syntax = json.loads(encoded)
+    except json.JSONDecodeError as exc:
+        raise SourceExtractionError(
+            f"Compact tactic-syntax trace is not valid JSON: {exc}",
+            phase="source_syntax_capture",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        ) from exc
+    if not isinstance(source_syntax, dict) or not isinstance(
+        source_syntax.get("tag"), str
+    ):
+        raise SourceExtractionError(
+            "Compact tactic-syntax trace has no tagged root node.",
+            phase="source_syntax_capture",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        )
+
+    return {
+        "schema_version": SourceSyntaxTraceCache.SCHEMA_VERSION,
+        "extractor_version": SourceSyntaxTraceCache.EXTRACTOR_VERSION,
+        "dataset": row.dataset_name,
+        "split": row.split,
+        "row_index": row.row_index,
+        "theorem": row.theorem,
+        "repo_commit": row.repo_commit,
+        "file_path": row.file_path,
+        "pantograph_commit": PANTOGRAPH_COMMIT,
+        "raw_record_sha256": SourceSyntaxTraceCache.raw_record_sha256(raw_record),
+        "state_sha256": SExprCache.row_state_sha256(row),
+        "tactic_sha256": SExprCache.row_tactic_sha256(row),
+        "target_state_sha256": SExprCache.row_target_state_sha256(row),
+        "tactic": row.tactic,
+        "source_syntax": source_syntax,
+        "syntax_args": _normalized_action_syntax_arguments(row, invocation),
+        "term_ranges": _normalized_action_terms(
+            row, invocation, include_action_sexp=False
+        ),
+        "local_context": _normalized_action_local_context(row, invocation),
+    }
+
+
+def _normalized_action_terms(
+    row: DatasetRow,
+    invocation: dict[str, object],
+    *,
+    include_action_sexp: bool,
+) -> list[dict[str, object]]:
     terms = invocation.get("terms")
     if not isinstance(terms, list):
         raise SourceExtractionError(
@@ -692,16 +795,21 @@ def _make_action_trace_record(
                 theorem=row.theorem,
                 row_index=row.row_index,
             )
-        normalized_terms.append(
-            {
-                "source": str(term.get("source", "")),
-                "syntax_kind": str(term.get("syntaxKind", "")),
-                "source_start": start,
-                "source_end": end,
-                "action_sexp": term["actionSexp"],
-            }
-        )
+        normalized: dict[str, object] = {
+            "source": str(term.get("source", "")),
+            "syntax_kind": str(term.get("syntaxKind", "")),
+            "source_start": start,
+            "source_end": end,
+        }
+        if include_action_sexp:
+            normalized["action_sexp"] = term["actionSexp"]
+        normalized_terms.append(normalized)
+    return normalized_terms
 
+
+def _normalized_action_syntax_arguments(
+    row: DatasetRow, invocation: dict[str, object]
+) -> list[dict[str, object]]:
     syntax_args = invocation.get("syntaxArgs")
     if not isinstance(syntax_args, list):
         raise SourceExtractionError(
@@ -737,7 +845,12 @@ def _make_action_trace_record(
                 "source_end": end,
             }
         )
+    return normalized_syntax_args
 
+
+def _normalized_action_local_context(
+    row: DatasetRow, invocation: dict[str, object]
+) -> list[dict[str, object]]:
     goals = invocation.get("goalsBefore")
     if not isinstance(goals, list) or len(goals) != 1 or not isinstance(goals[0], dict):
         raise SourceExtractionError(
@@ -775,26 +888,7 @@ def _make_action_trace_record(
                 "is_let": bool(variable.get("isLet", False)),
             }
         )
-
-    return {
-        "schema_version": ActionTraceCache.SCHEMA_VERSION,
-        "extractor_version": ActionTraceCache.EXTRACTOR_VERSION,
-        "dataset": row.dataset_name,
-        "split": row.split,
-        "row_index": row.row_index,
-        "theorem": row.theorem,
-        "repo_commit": row.repo_commit,
-        "file_path": row.file_path,
-        "pantograph_commit": PANTOGRAPH_COMMIT,
-        "raw_record_sha256": ActionTraceCache.raw_record_sha256(raw_record),
-        "state_sha256": SExprCache.row_state_sha256(row),
-        "tactic_sha256": SExprCache.row_tactic_sha256(row),
-        "target_state_sha256": SExprCache.row_target_state_sha256(row),
-        "tactic": row.tactic,
-        "terms": normalized_terms,
-        "syntax_args": normalized_syntax_args,
-        "local_context": local_context,
-    }
+    return local_context
 
 
 def _row_is_cached(cache: SExprCache, row: DatasetRow) -> bool:
@@ -827,12 +921,16 @@ def _row_is_action_cached(
     if raw_record is None:
         return False
     record = action_cache.load_for_raw_record(row.split, row.row_index, raw_record)
-    return (
-        record is not None
-        and isinstance(record.get("terms"), list)
-        and isinstance(record.get("syntax_args"), list)
-        and isinstance(record.get("local_context"), list)
-    )
+    if record is None:
+        return False
+    if any(
+        not isinstance(record.get(field), list)
+        for field in action_cache.REQUIRED_LIST_FIELDS
+    ):
+        return False
+    if isinstance(action_cache, SourceSyntaxTraceCache):
+        return isinstance(record.get("source_syntax"), dict)
+    return True
 
 
 def _failure_record(exc: Exception, file_path: str, theorem: str, rows: list[DatasetRow]) -> dict[str, object]:
@@ -847,6 +945,32 @@ def _failure_record(exc: Exception, file_path: str, theorem: str, rows: list[Dat
         "error_type": type(exc).__name__,
         "error": str(exc),
     }
+
+
+def _report_root(
+    prepared_root: Path,
+    *,
+    model_cache: ModelSExprCache | None,
+    action_cache: ActionTraceCache | None,
+) -> Path:
+    """Keep every cache generation's reports in its own directory."""
+    if action_cache is not None:
+        return Path(prepared_root) / action_cache.REPORT_ROOT
+    if model_cache is not None:
+        return Path(prepared_root) / model_cache.REPORT_ROOT
+    return Path(prepared_root) / SExprCache.REPORT_ROOT
+
+
+def _sidecar_versions(
+    *,
+    model_cache: ModelSExprCache | None,
+    action_cache: ActionTraceCache | None,
+) -> tuple[int, str]:
+    if action_cache is not None:
+        return action_cache.SCHEMA_VERSION, action_cache.EXTRACTOR_VERSION
+    if model_cache is not None:
+        return ModelSExprCache.SCHEMA_VERSION, ModelSExprCache.NORMALIZATION
+    return SExprCache.SCHEMA_VERSION, EXTRACTION_VERSION
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -972,8 +1096,13 @@ async def _extract_file_with_client(
                         theorem=theorem,
                     )
                 if action_cache is not None:
+                    make_action_record = (
+                        _make_source_syntax_trace_record
+                        if isinstance(action_cache, SourceSyntaxTraceCache)
+                        else _make_action_trace_record
+                    )
                     records = [
-                        _make_action_trace_record(row, candidate, raw_record)
+                        make_action_record(row, candidate, raw_record)
                         for row, candidate, raw_record in zip(
                             theorem_rows, aligned, raw_records
                         )
@@ -1033,12 +1162,8 @@ async def extract_split_with_client(
     clients = list(client) if isinstance(client, (list, tuple)) else [client]
     if not clients:
         raise ValueError("At least one Pantograph client is required.")
-    report_root = Path(prepared_root) / (
-        "action_trace_extraction_v2"
-        if action_cache is not None
-        else "model_sexpr_extraction_v2"
-        if model_cache is not None
-        else "sexpr_extraction"
+    report_root = _report_root(
+        prepared_root, model_cache=model_cache, action_cache=action_cache
     )
     failure_path = report_root / "failures" / f"{split}.jsonl"
     failure_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1172,21 +1297,12 @@ async def extract_split_with_client(
 
     attempted_rows = len(rows)
     covered_rows = cached_rows + extracted_rows
+    schema_version, extractor_version = _sidecar_versions(
+        model_cache=model_cache, action_cache=action_cache
+    )
     manifest: dict[str, object] = {
-        "schema_version": (
-            ActionTraceCache.SCHEMA_VERSION
-            if action_cache is not None
-            else ModelSExprCache.SCHEMA_VERSION
-            if model_cache is not None
-            else SExprCache.SCHEMA_VERSION
-        ),
-        "extractor_version": (
-            ActionTraceCache.EXTRACTOR_VERSION
-            if action_cache is not None
-            else ModelSExprCache.NORMALIZATION
-            if model_cache is not None
-            else EXTRACTION_VERSION
-        ),
+        "schema_version": schema_version,
+        "extractor_version": extractor_version,
         "dataset": rows[0].dataset_name if rows else None,
         "source_commit": expected_commit,
         "split": split,
@@ -1221,8 +1337,20 @@ def _git_head(source_root: Path) -> str:
 async def extract_sexpressions(
     config: SExprExtractionConfig, *, client_factory=None
 ) -> dict[str, object]:
-    if config.model_sexprs and config.action_traces:
-        raise ValueError("model_sexprs and action_traces are mutually exclusive.")
+    enabled_modes = [
+        name
+        for name, enabled in (
+            ("model_sexprs", config.model_sexprs),
+            ("action_traces", config.action_traces),
+            ("source_syntax_traces", config.source_syntax_traces),
+        )
+        if enabled
+    ]
+    if len(enabled_modes) > 1:
+        raise ValueError(
+            "model_sexprs, action_traces and source_syntax_traces are mutually "
+            f"exclusive; received: {enabled_modes}."
+        )
     if config.selection_manifest is not None and config.sample_per_split is not None:
         raise ValueError(
             "--selection-manifest and --max-items cannot be combined; "
@@ -1268,7 +1396,11 @@ async def extract_sexpressions(
                 startup_timeout=config.server_startup_timeout,
                 file_timeout=config.file_timeout,
                 buffer_limit=config.buffer_limit,
-                capture_model_sexprs=config.model_sexprs or config.action_traces,
+                capture_model_sexprs=(
+                    config.model_sexprs
+                    or config.action_traces
+                    or config.source_syntax_traces
+                ),
             )
         else:
             client = client_factory(config)
@@ -1281,11 +1413,11 @@ async def extract_sexpressions(
         if config.model_sexprs
         else None
     )
-    action_cache = (
-        ActionTraceCache(config.prepared_root, enabled=True)
-        if config.action_traces
-        else None
-    )
+    action_cache: ActionTraceCache | None = None
+    if config.action_traces:
+        action_cache = ActionTraceCache(config.prepared_root, enabled=True)
+    elif config.source_syntax_traces:
+        action_cache = SourceSyntaxTraceCache(config.prepared_root, enabled=True)
     manifests: dict[str, dict[str, object]] = {}
     started = False
     try:
@@ -1341,21 +1473,12 @@ async def extract_sexpressions(
 
     attempted_rows = sum(int(item["attempted_rows"]) for item in manifests.values())
     covered_rows = sum(int(item["covered_rows"]) for item in manifests.values())
+    schema_version, extractor_version = _sidecar_versions(
+        model_cache=model_cache, action_cache=action_cache
+    )
     summary: dict[str, object] = {
-        "schema_version": (
-            ActionTraceCache.SCHEMA_VERSION
-            if action_cache is not None
-            else ModelSExprCache.SCHEMA_VERSION
-            if model_cache is not None
-            else SExprCache.SCHEMA_VERSION
-        ),
-        "extractor_version": (
-            ActionTraceCache.EXTRACTOR_VERSION
-            if action_cache is not None
-            else ModelSExprCache.NORMALIZATION
-            if model_cache is not None
-            else EXTRACTION_VERSION
-        ),
+        "schema_version": schema_version,
+        "extractor_version": extractor_version,
         "dataset": config.dataset_name,
         "source_root": str(source_root),
         "source_commit": config.expected_commit,
@@ -1376,12 +1499,8 @@ async def extract_sexpressions(
             else None
         ),
     }
-    report_root = Path(config.prepared_root) / (
-        "action_trace_extraction_v2"
-        if action_cache is not None
-        else "model_sexpr_extraction_v2"
-        if model_cache is not None
-        else "sexpr_extraction"
+    report_root = _report_root(
+        config.prepared_root, model_cache=model_cache, action_cache=action_cache
     )
     _write_json(report_root / "summary.json", summary)
     _write_summary_markdown(report_root / "summary.md", summary)

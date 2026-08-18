@@ -14,6 +14,7 @@ from maths_ai.gnn_inference.atp_lean_gnn.preparation import (
     ModelSExprCache,
     SExprCache,
     SExprUnavailableError,
+    SourceSyntaxTraceCache,
     prepare_example,
 )
 from maths_ai.gnn_inference.atp_lean_gnn.sexpr_extraction import (
@@ -60,6 +61,7 @@ def _invocation(
     *,
     terms: list[dict[str, object]] | None = None,
     syntax_args: list[dict[str, object]] | None = None,
+    source_syntax: str | None = None,
 ) -> dict[str, object]:
     return {
         "goalBefore": before,
@@ -67,6 +69,7 @@ def _invocation(
         "tactic": tactic,
         "goalsBefore": [_goal(target, "p")],
         "goalsAfter": [],
+        "sourceSyntax": "" if source_syntax is None else source_syntax,
         "terms": [] if terms is None else terms,
         "syntaxArgs": [] if syntax_args is None else syntax_args,
     }
@@ -312,6 +315,121 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             action_cache.load_for_raw_record("train", 10, changed_raw)
         )
+
+    async def test_source_syntax_enrichment_keeps_compact_tree_beside_v2_traces(self):
+        source_syntax = json.dumps(
+            {
+                "tag": "node",
+                "kind": "Lean.Parser.Tactic.exact",
+                "source": "exact p",
+                "sourceStart": 40,
+                "sourceEnd": 47,
+                "children": [
+                    {"tag": "atom", "source": "exact", "sourceStart": 40, "sourceEnd": 45},
+                    {
+                        "tag": "identifier",
+                        "source": "p",
+                        "semanticRole": "local",
+                        "contextIndex": 0,
+                        "sourceStart": 46,
+                        "sourceEnd": 47,
+                    },
+                ],
+            },
+            separators=(",", ":"),
+        )
+        units = self._units()
+        for invocation in units[0]["invocations"]:
+            invocation["sourceSyntax"] = source_syntax
+            invocation["terms"] = [
+                {
+                    "source": "p",
+                    "syntaxKind": "ident",
+                    "sourceStart": 46,
+                    "sourceEnd": 47,
+                    "actionSexp": "(:local FV0)",
+                }
+            ]
+        await self._extract(_FakeClient(units))
+        raw_before = self.cache.load("train", 10)
+        v2_cache = ActionTraceCache(self.root / "prepared")
+        v3_cache = SourceSyntaxTraceCache(self.root / "prepared")
+
+        v2_manifest = await extract_split_with_client(
+            _FakeClient(units),
+            rows=self.rows,
+            cache=self.cache,
+            action_cache=v2_cache,
+            prepared_root=self.root / "prepared",
+            source_root=self.source_root,
+            split="train",
+        )
+        v3_manifest = await extract_split_with_client(
+            _FakeClient(units),
+            rows=self.rows,
+            cache=self.cache,
+            action_cache=v3_cache,
+            prepared_root=self.root / "prepared",
+            source_root=self.source_root,
+            split="train",
+        )
+
+        sidecar = v3_cache.load_for_raw_record("train", 10, raw_before)
+        self.assertEqual(v2_manifest["extractor_version"], "lean-action-trace-v2")
+        self.assertEqual(v3_manifest["extractor_version"], "lean-action-trace-v3")
+        self.assertEqual(v3_manifest["extracted_rows"], 2)
+        self.assertEqual(sidecar["schema_version"], 3)
+        self.assertEqual(sidecar["source_syntax"], json.loads(source_syntax))
+        self.assertEqual(
+            sidecar["local_context"],
+            [
+                {
+                    "context_index": 0,
+                    "user_name": "p",
+                    "internal_name": "internal_p",
+                    "binder_role": ":explicit",
+                    "is_instance": False,
+                    "is_let": False,
+                }
+            ],
+        )
+        # Elaborated terms stay in v2; v3 keeps only their ranges.
+        self.assertNotIn("action_sexp", sidecar["term_ranges"][0])
+        self.assertEqual(sidecar["term_ranges"][0]["source_start"], 46)
+        self.assertIn(
+            "action_sexp",
+            v2_cache.load_for_raw_record("train", 10, raw_before)["terms"][0],
+        )
+        self.assertEqual(
+            json.loads(
+                (
+                    self.root
+                    / "prepared"
+                    / "action_trace_extraction_v3"
+                    / "manifests"
+                    / "train.json"
+                ).read_text(encoding="utf-8")
+            )["covered_rows"],
+            2,
+        )
+
+    async def test_source_syntax_enrichment_rejects_missing_compact_tree(self):
+        await self._extract(_FakeClient(self._units()))
+        v3_cache = SourceSyntaxTraceCache(self.root / "prepared")
+
+        manifest = await extract_split_with_client(
+            _FakeClient(self._units()),
+            rows=self.rows,
+            cache=self.cache,
+            action_cache=v3_cache,
+            prepared_root=self.root / "prepared",
+            source_root=self.source_root,
+            split="train",
+        )
+
+        self.assertEqual(manifest["failed_rows"], 2)
+        self.assertEqual(manifest["failure_phases"], {"source_syntax_capture": 2})
+        self.assertIsNone(v3_cache.load("train", 10))
 
     async def test_action_enrichment_requires_validated_raw_records(self):
         action_cache = ActionTraceCache(self.root / "prepared")

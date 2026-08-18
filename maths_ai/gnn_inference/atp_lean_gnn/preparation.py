@@ -37,6 +37,7 @@ class SExprCache:
 
     SCHEMA_VERSION = 4
     EXTRACTOR_VERSION = "source-invocation-v4"
+    REPORT_ROOT = "sexpr_extraction"
 
     @staticmethod
     def row_state_sha256(row: DatasetRow) -> str:
@@ -132,6 +133,7 @@ class ModelSExprCache:
     SCHEMA_VERSION = 2
     EXPRESSION_VERSION = 1
     NORMALIZATION = "lean-model-sexp-v2"
+    REPORT_ROOT = "model_sexpr_extraction_v2"
 
     def __init__(self, output_root: Path, enabled: bool = True):
         self.output_root = Path(output_root)
@@ -197,6 +199,9 @@ class ActionTraceCache:
 
     SCHEMA_VERSION = 2
     EXTRACTOR_VERSION = "lean-action-trace-v2"
+    SIDECAR_DIR = "action_trace_v2"
+    REPORT_ROOT = "action_trace_extraction_v2"
+    REQUIRED_LIST_FIELDS = ("terms", "syntax_args", "local_context")
 
     def __init__(self, output_root: Path, enabled: bool = True):
         self.output_root = Path(output_root)
@@ -207,7 +212,7 @@ class ActionTraceCache:
         return ModelSExprCache.raw_record_sha256(raw_record)
 
     def _sidecar_dir(self, split: str) -> Path:
-        directory = self.output_root / split / "action_trace_v2"
+        directory = self.output_root / split / self.SIDECAR_DIR
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
@@ -245,6 +250,22 @@ class ActionTraceCache:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+
+
+class SourceSyntaxTraceCache(ActionTraceCache):
+    """Compact annotated tactic-syntax trees bound to a validated raw state.
+
+    Version 3 keeps the original tactic syntax as the generation target and uses
+    Lean only to annotate identifier leaves with resolved references.  It is a
+    separate sidecar directory so the elaborated version-2 traces stay readable
+    for comparison instead of being overwritten.
+    """
+
+    SCHEMA_VERSION = 3
+    EXTRACTOR_VERSION = "lean-action-trace-v3"
+    SIDECAR_DIR = "action_trace_v3"
+    REPORT_ROOT = "action_trace_extraction_v3"
+    REQUIRED_LIST_FIELDS = ("local_context",)
 
 
 class SExprUnavailableError(RuntimeError):
