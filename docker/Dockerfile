@@ -37,10 +37,18 @@ ENV PATH="/root/.local/bin:${PATH}"
 COPY lean_project/ /opt/lean_project/
 WORKDIR /opt/lean_project
 
+# Configure git for reliable cloning (longer timeouts, HTTP/2)
+RUN git config --global http.lowSpeedLimit 0 && \
+    git config --global http.lowSpeedTime 999999 && \
+    git config --global http.postBuffer 524288000 && \
+    git config --global http.version HTTP/1.1
+
 # Build Lean project with Mathlib cache
 # Uses BuildKit cache mount for .lake directory
 RUN --mount=type=cache,target=/opt/lean_project/.lake \
-    lake update && lake exe cache get && lake build
+    lake update && lake exe cache get
+RUN --mount=type=cache,target=/opt/lean_project/.lake \
+    lake build --verbose
 
 ENV MATHS_AI_LEAN_PROJECT=/opt/lean_project
 ENV MATHS_AI_DATA_ROOT=/data
