@@ -53,16 +53,6 @@ RUN --mount=type=cache,target=/opt/lean_project/.lake \
 ENV MATHS_AI_LEAN_PROJECT=/opt/lean_project
 ENV MATHS_AI_DATA_ROOT=/data
 
-# Install petta
-ARG PETTA_REF=v1.0.3
-RUN git clone --depth 1 --branch ${PETTA_REF} https://github.com/trueagi-io/PeTTa.git /opt/petta \
-    && pip install /opt/petta
-
-# Install PeTTaChainer (vendor at pinned commit, replace git-import in MeTTa)
-ARG PETTACHAINER_REF=HEAD
-RUN git clone https://github.com/rTreutlein/PeTTaChainer.git /opt/pettachainer \
-    && git -C /opt/pettachainer checkout ${PETTACHAINER_REF}
-
 # Set up workspace and install Python dependencies
 WORKDIR /workspace
 COPY pyproject.toml uv.lock /workspace/
@@ -70,6 +60,16 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv /opt/venv && \
     uv sync --no-dev && \
     uv pip install -e . --no-deps
+
+# Install petta into the project virtualenv, not the system Python
+ARG PETTA_REF=v1.0.3
+RUN git clone --depth 1 --branch ${PETTA_REF} https://github.com/trueagi-io/PeTTa.git /opt/petta \
+    && /opt/venv/bin/pip install /opt/petta
+
+# Install PeTTaChainer (vendor at pinned commit, replace git-import in MeTTa)
+ARG PETTACHAINER_REF=HEAD
+RUN git clone --depth 1 https://github.com/rTreutlein/PeTTaChainer.git /opt/pettachainer \
+    && git -C /opt/pettachainer checkout ${PETTACHAINER_REF}
 
 ENV PATH="/opt/venv/bin:/root/.local/bin:${PATH}"
 ENV PYTHONPATH="/workspace"
