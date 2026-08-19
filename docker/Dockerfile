@@ -12,8 +12,8 @@
 # =============================================================================
 
 # ---------- base ----------
-# Shared base stage with all slow dependencies (Lean/Mathlib, SWI-Prolog, petta)
-FROM ubuntu:24.04 AS base
+# Shared base stage with all slow dependencies (Lean/Mathlib, official SWI-Prolog, petta)
+FROM swipl:stable AS base
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -53,19 +53,6 @@ RUN --mount=type=cache,target=/opt/lean_project/.lake \
 ENV MATHS_AI_LEAN_PROJECT=/opt/lean_project
 ENV MATHS_AI_DATA_ROOT=/data
 
-# Install SWI-Prolog >= 9.3.x (Ubuntu apt ships 9.0.4 which is too old)
-# Use direct download from GitHub releases to avoid PPA network issues
-ARG SWI_PROLOG_VERSION=9.3.8
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget \
-    && rm -rf /var/lib/apt/lists/* \
-    && wget -q "https://github.com/SWI-Prolog/swipl-devel/releases/download/V${SWI_PROLOG_VERSION}/swipl-${SWI_PROLOG_VERSION}-linux.tar.gz" \
-    -O /tmp/swipl.tar.gz \
-    && tar -xzf /tmp/swipl.tar.gz -C /opt \
-    && mv /opt/swipl-${SWI_PROLOG_VERSION} /opt/swipl \
-    && ln -s /opt/swipl/bin/swipl /usr/local/bin/swipl \
-    && rm /tmp/swipl.tar.gz
-
 # Install petta
 ARG PETTA_REF=v1.0.3
 RUN git clone --depth 1 --branch ${PETTA_REF} https://github.com/trueagi-io/PeTTa.git /opt/petta \
@@ -79,11 +66,12 @@ RUN git clone https://github.com/rTreutlein/PeTTaChainer.git /opt/pettachainer \
 # Set up workspace and install Python dependencies
 WORKDIR /workspace
 COPY pyproject.toml uv.lock /workspace/
-RUN uv venv /opt/venv && \
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv /opt/venv && \
     uv sync --no-dev && \
     uv pip install -e . --no-deps
 
-ENV PATH="/opt/venv/bin:${PATH}"
+ENV PATH="/opt/venv/bin:/root/.local/bin:${PATH}"
 ENV PYTHONPATH="/workspace"
 
 # Create non-root user for security

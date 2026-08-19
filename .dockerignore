@@ -30,7 +30,7 @@ wheels/
 
 # Virtual environments
 .env
-.venv
+.venv/
 env/
 venv/
 ENV/
@@ -54,9 +54,7 @@ logs/
 *.cache
 .lake/
 .lean/
-
-# UV
-# uv.lock is needed for uv sync in Dockerfile, so we don't ignore it
+.pkl
 
 # Local development
 .tmp/
