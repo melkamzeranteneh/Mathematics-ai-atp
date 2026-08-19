@@ -45,6 +45,7 @@ RUN git config --global http.lowSpeedLimit 0 && \
 
 # Build Lean project with Mathlib cache
 # Uses BuildKit cache mount for .lake directory
+RUN elan toolchain install leanprover/lean4:v4.15.0
 RUN --mount=type=cache,target=/opt/lean_project/.lake \
     lake update && lake exe cache get
 RUN --mount=type=cache,target=/opt/lean_project/.lake \
@@ -57,14 +58,14 @@ ENV MATHS_AI_DATA_ROOT=/data
 WORKDIR /workspace
 COPY pyproject.toml uv.lock /workspace/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv venv /opt/venv && \
+    uv venv --seed /opt/venv && \
     uv sync --no-dev && \
-    uv pip install -e . --no-deps
+    uv pip install --python /opt/venv/bin/python -e . --no-deps
 
 # Install petta into the project virtualenv, not the system Python
 ARG PETTA_REF=v1.0.3
 RUN git clone --depth 1 --branch ${PETTA_REF} https://github.com/trueagi-io/PeTTa.git /opt/petta \
-    && /opt/venv/bin/pip install /opt/petta
+    && uv pip install --python /opt/venv/bin/python /opt/petta
 
 # Install PeTTaChainer (vendor at pinned commit, replace git-import in MeTTa)
 ARG PETTACHAINER_REF=HEAD
