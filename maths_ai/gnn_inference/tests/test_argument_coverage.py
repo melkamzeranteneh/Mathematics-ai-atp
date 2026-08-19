@@ -377,6 +377,30 @@ class StructuredArgumentCoverageTests(unittest.TestCase):
 
         self.assertEqual(names, {0: "h", 3: "hx"})
 
+    def test_records_without_context_indices_disable_the_cross_check(self) -> None:
+        # Raw source-faithful records carry no context index.  Reading their
+        # absence as "index not in the state" would report every local
+        # reference as a skew that does not exist.
+        self.assertIsNone(
+            hypothesis_names_by_context_index(
+                {"hyp_sexps": [{"name": "h", "sexp": "(:c P)"}]}
+            )
+        )
+
+        records, _ = classify_structured_argument_slots(
+            _graph([1, 2, 3], [False, False, True]),
+            _structured_trace(
+                _identifier("h", semanticRole="local", contextIndex=0)
+            ),
+            split="train",
+            node_vocab=self.NODE_VOCAB,
+            hypothesis_names=hypothesis_names_by_context_index(
+                {"hyp_sexps": [{"name": "h", "sexp": "(:c P)"}]}
+            ),
+        )
+
+        self.assertEqual(records[0]["category"], "local_selectable")
+
 
 class StructuredArgumentCoverageAuditTests(unittest.TestCase):
     """Run both metrics over one prepared root containing version-3 sidecars."""
@@ -513,6 +537,7 @@ class StructuredArgumentCoverageAuditTests(unittest.TestCase):
         train = summary["splits"]["train"]
         structured = train["structured"]
         self.assertTrue(summary["structured_traces"])
+        self.assertEqual(summary["context_index_node_labels"], 1)
         self.assertEqual(train["row_count"], 1)
         self.assertEqual(structured["trace_row_count"], 1)
         self.assertEqual(structured["rows_outside_trace_population"], 1)
@@ -537,6 +562,33 @@ class StructuredArgumentCoverageAuditTests(unittest.TestCase):
         )
         metrics = {json.loads(line)["metric"] for line in samples}
         self.assertEqual(metrics, {"regex", "structured"})
+
+    def test_corpus_without_context_index_nodes_says_so_in_the_report(self) -> None:
+        # A corpus prepared from the raw S-expression variant carries no
+        # FV{context_index} nodes at all, so every local reference is
+        # unresolvable for a reason that has nothing to do with the mask.
+        (self.prepared_root / "vocab" / "node_vocab.json").write_text(
+            json.dumps({"<UNK>": 0, "State": 1, "Hyp": 2, "h": 3}), encoding="utf-8"
+        )
+        self._save_graph(7)
+        self._save_structured_trace(7)
+
+        summary = run_argument_coverage_audit(
+            ArgumentCoverageConfig(
+                prepared_root=self.prepared_root,
+                output_dir=self.output_dir,
+                splits=("train",),
+                structured_traces=True,
+            )
+        )
+
+        structured = summary["splits"]["train"]["structured"]
+        self.assertEqual(summary["context_index_node_labels"], 0)
+        self.assertEqual(structured["categories"], {"local_label_outside_vocab": 1})
+        self.assertEqual(structured["local_selectable_coverage"], 0.0)
+
+        report = (self.output_dir / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("--sexpr-variant model", report)
 
     def test_audit_requires_structured_sidecars_when_asked_for_them(self) -> None:
         self._save_graph(7)

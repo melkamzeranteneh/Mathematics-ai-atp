@@ -147,6 +147,29 @@ graphed state disagree about which hypothesis an index names, and
 node. The name comparison ignores Lean's inaccessible-name marker and treats
 anonymous names as unknown, so shadowed hypotheses do not raise false alarms.
 
+That resolution presupposes something the prepared corpus must actually
+provide. The graph builder emits an `FV{context_index}` node only for
+hypotheses that record a context index, and only the normalized
+`model_sexpr_v2` sidecars record one; the raw source-faithful records carry
+just a name and a type S-expression. A corpus preprocessed with the default
+`--sexpr-variant raw` therefore contains no such node, and every local
+reference is unresolvable regardless of any mask. The audit reports
+`Context-index node labels in vocabulary` for exactly this reason and names the
+required rebuild when that count is zero:
+
+```bash
+python -m maths_ai.gnn_inference.atp_lean_gnn.preprocess \
+  --output-root maths_ai/_support_files/artifacts/prepared/v2 \
+  --use-sexpr \
+  --sexpr-cache-root maths_ai/_support_files/artifacts/prepared/v1 \
+  --sexpr-variant model \
+  --splits train val test
+```
+
+The hypothesis-name cross-check reads the same normalized sidecar. When a
+record carries no context indices at all, the check is disabled rather than
+reporting every index as absent from the state.
+
 For a controlled pilot, first create one deterministic theorem-level
 selection before S-expression extraction. It needs no raw cache. It stratifies
 by tactic frequency, proof-state size, proof length, and context shape, while

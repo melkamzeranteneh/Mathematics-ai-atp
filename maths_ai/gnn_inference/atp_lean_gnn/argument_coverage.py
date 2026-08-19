@@ -14,7 +14,7 @@ from .action_targets.source_syntax import compile_source_syntax_trace
 from .dataset import canonicalize_split_name
 from .labels import get_tactic_arity, parse_tactic_arguments
 from .lemma_corpus import load_lemma_corpus
-from .preparation import SExprCache, SourceSyntaxTraceCache
+from .preparation import ModelSExprCache, SExprCache, SourceSyntaxTraceCache
 from .reporting import console_print
 from .training import load_prepared_metadata
 
@@ -155,16 +155,22 @@ def _normalized_hypothesis_name(name: object) -> str:
     return str(name or "").replace(_HYGIENE_MARKER, "").strip()
 
 
-def hypothesis_names_by_context_index(raw_record: dict) -> dict[int, str]:
-    """Map local-context indices to hypothesis names in the audited proof state."""
+def hypothesis_names_by_context_index(record: dict) -> dict[int, str] | None:
+    """Map local-context indices to hypothesis names in the audited proof state.
+
+    Returns ``None`` when the record's hypotheses carry no context indices at
+    all.  Only the normalized ``model_sexpr_v2`` sidecars record them; the raw
+    source-faithful records do not, and treating their absence as "index not in
+    the state" would report every local reference as a skew that does not exist.
+    """
     names: dict[int, str] = {}
-    for hypothesis in raw_record.get("hyp_sexps") or ():
+    for hypothesis in record.get("hyp_sexps") or ():
         if not isinstance(hypothesis, dict):
             continue
         context_index = hypothesis.get("context_index")
         if isinstance(context_index, int):
             names[context_index] = str(hypothesis.get("name", ""))
-    return names
+    return names or None
 
 
 def _classify_local_reference(
@@ -558,6 +564,25 @@ def _render_markdown(summary: dict[str, object]) -> str:
         "",
     ]
     if summary.get("structured_traces"):
+        context_index_labels = int(summary.get("context_index_node_labels", 0))
+        lines.extend(
+            [
+                f"- Context-index node labels in vocabulary: `{context_index_labels}`",
+                "",
+            ]
+        )
+        if context_index_labels == 0:
+            lines.extend(
+                [
+                    "This prepared corpus contains no `FV{context_index}` nodes, so no",
+                    "local reference can be pointed at whatever its mask says. The graph",
+                    "builder emits those nodes only for hypotheses that record a context",
+                    "index, and only the normalized `model_sexpr_v2` sidecars record one.",
+                    "Rebuild the corpus with `--sexpr-variant model` before reading the",
+                    "local coverage below as a property of the targets.",
+                    "",
+                ]
+            )
         lines.extend(
             [
                 "Two metrics are reported over exactly the same rows: the",
@@ -638,8 +663,22 @@ def run_argument_coverage_audit(config: ArgumentCoverageConfig) -> dict[str, obj
     records_path = config.output_dir / "argument_samples.jsonl"
     sample_counts: Counter[tuple[str, str]] = Counter()
     node_vocab = dict(metadata.node_vocab) if config.structured_traces else {}
+    if config.structured_traces:
+        # A prepared corpus can only support local pointer targets when its
+        # graphs carry the ``FV{context_index}`` nodes, which the builder emits
+        # only for hypotheses that record a context index.  Report the count so
+        # a corpus built from the raw S-expression variant is diagnosed here
+        # rather than mistaken for a masking problem downstream.
+        summary["context_index_node_labels"] = sum(
+            1 for label in node_vocab if label.startswith("FV")
+        )
     raw_cache = (
         SExprCache(config.prepared_root, project_path="", enabled=True)
+        if config.structured_traces
+        else None
+    )
+    model_cache = (
+        ModelSExprCache(config.prepared_root, enabled=True)
         if config.structured_traces
         else None
     )
@@ -761,6 +800,19 @@ def run_argument_coverage_audit(config: ArgumentCoverageConfig) -> dict[str, obj
                             {"split": split, "row_index": row_index},
                         )
                     else:
+                        # Context indices live in the normalized sidecar; the
+                        # raw record is the fallback for corpora prepared from
+                        # a variant that already carries them.
+                        model_record = (
+                            model_cache.load_for_raw_record(
+                                split, row_index, raw_record
+                            )
+                            if model_cache is not None
+                            else None
+                        )
+                        hypothesis_names = hypothesis_names_by_context_index(
+                            model_record if model_record is not None else raw_record
+                        )
                         try:
                             structured_records, structured_row = (
                                 classify_structured_argument_slots(
@@ -769,9 +821,7 @@ def run_argument_coverage_audit(config: ArgumentCoverageConfig) -> dict[str, obj
                                     split=split,
                                     node_vocab=node_vocab,
                                     lemma_names=lemma_names,
-                                    hypothesis_names=hypothesis_names_by_context_index(
-                                        raw_record
-                                    ),
+                                    hypothesis_names=hypothesis_names,
                                 )
                             )
                         except ActionTargetError as exc:
