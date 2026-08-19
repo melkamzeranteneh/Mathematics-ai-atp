@@ -23,6 +23,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Lemma index directory containing lemma_names.json, or the names JSON itself.",
     )
+    parser.add_argument(
+        "--structured-traces",
+        action="store_true",
+        help=(
+            "Also classify Lean-annotated version-3 tactic-syntax targets, and "
+            "restrict both metrics to the rows that have such a trace."
+        ),
+    )
     parser.add_argument("--max-items-per-split", type=int, default=None)
     parser.add_argument("--sample-limit-per-category", type=int, default=20)
     parser.add_argument("--force", action="store_true")
@@ -47,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 lemma_corpus=args.lemma_corpus,
                 lemma_index=args.lemma_index,
+                structured_traces=args.structured_traces,
                 max_items_per_split=args.max_items_per_split,
                 sample_limit_per_category=args.sample_limit_per_category,
                 force=args.force,

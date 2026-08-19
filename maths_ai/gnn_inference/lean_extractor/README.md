@@ -113,6 +113,40 @@ digest-validated local context. Targets longer than `--max-operations` are
 excluded from `targets.jsonl` but still counted and sampled, so the cost of the
 cap stays visible in the summary.
 
+That audit measures the targets alone. To measure them against the graph the
+pointer head actually selects from, and against the regex-and-arity supervision
+they are meant to replace, run the argument coverage audit with
+`--structured-traces`:
+
+```bash
+python -m maths_ai.gnn_inference.scripts.audit_argument_coverage \
+  --prepared-root maths_ai/_support_files/artifacts/prepared/v1 \
+  --splits train \
+  --structured-traces \
+  --lemma-index maths_ai/_support_files/artifacts/lemma_index_v1 \
+  --force
+```
+
+With `--structured-traces`, both metrics are computed over exactly the rows that
+have a version-3 sidecar, so the comparison is not contaminated by rows only one
+of them can see; rows outside that population are counted as
+`rows_outside_trace_population`. The regex metric keeps its original denominator,
+the argument slots the static tactic-arity table expects. The structured metric
+uses a different denominator, the naming positions in the tactic Lean actually
+parsed, so the two totals are not interchangeable and the report says so.
+
+Each `LOCAL` position is resolved the way a decoder would have to resolve it:
+the local-context index becomes the label `FV{context_index}`, that label is
+looked up in the prepared node vocabulary, the matching node is found in the
+graph, and its `premise_mask` entry decides between `local_selectable` and
+`local_present_but_masked`. Failures are reported as distinct categories rather
+than folded into one number: `local_absent_from_state` when the audited proof
+state has no such context index, `local_name_mismatch` when the trace and the
+graphed state disagree about which hypothesis an index names, and
+`local_label_outside_vocab` or `local_node_absent` when the graph has no such
+node. The name comparison ignores Lean's inaccessible-name marker and treats
+anonymous names as unknown, so shadowed hypotheses do not raise false alarms.
+
 For a controlled pilot, first create one deterministic theorem-level
 selection before S-expression extraction. It needs no raw cache. It stratifies
 by tactic frequency, proof-state size, proof length, and context shape, while
