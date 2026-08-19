@@ -56,7 +56,7 @@ class PreprocessConfig:
     write_json_artifacts: bool = True
     use_sexpr: bool = False
     sexpr_cache_root: Path | None = None
-    sexpr_variant: str = "raw"
+    sexpr_variant: str = "model"
     project_path: str = "maths_ai/lean_mathlib"
     selection_manifest: Path | None = None
 
@@ -168,7 +168,7 @@ def _build_sexpr_map(
     use_sexpr: bool,
     sexpr_cache: Optional[SExprCache] = None,
     split_label: str = "",
-    sexpr_variant: str = "raw",
+    sexpr_variant: str = "model",
     require_complete: bool = False,
 ) -> dict[int, dict]:
     """Load validated Phase 2 records without silently generating or falling back."""
@@ -224,7 +224,7 @@ def scan_train_split(
     sexpr_cache: Optional[SExprCache],
     project_path: str = "maths_ai/lean_mathlib",
     use_sexpr: bool = False,
-    sexpr_variant: str = "raw",
+    sexpr_variant: str = "model",
     selection_manifest: Path | None = None,
     rows: list[DatasetRow] | None = None,
 ) -> tuple[dict[str, int], dict[str, int], SplitReport]:
@@ -364,7 +364,7 @@ def process_split(
     sexpr_cache: Optional[SExprCache],
     project_path: str = "maths_ai/lean_mathlib",
     use_sexpr: bool = False,
-    sexpr_variant: str = "raw",
+    sexpr_variant: str = "model",
     selection_manifest: Path | None = None,
     rows: list[DatasetRow] | None = None,
     resume: bool = False,
@@ -723,8 +723,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sexpr-variant",
         choices=("raw", "model"),
-        default="raw",
-        help="Consume source-faithful raw S-expressions or normalized model sidecars.",
+        default="model",
+        help=(
+            "Consume normalized model sidecars (the default: their hypotheses carry "
+            "the local-context indices the graph builder needs for pointer targets) "
+            "or source-faithful raw S-expressions."
+        ),
     )
     return parser
 

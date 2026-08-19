@@ -251,6 +251,19 @@ class TrainingPipelineTests(unittest.TestCase):
         )
         self.assertNotIn(int(sample.state_node_index.item()), source_nodes)
 
+    def test_metadata_can_require_only_the_requested_splits(self) -> None:
+        # Training needs all three splits, which stays the default.  An audit of
+        # a partially rebuilt corpus needs one, and must not be forced to invent
+        # manifests for splits it never reads.
+        for split in ("val", "test"):
+            (self.prepared_root / "manifests" / f"{split}.json").unlink()
+
+        metadata = load_prepared_metadata(self.prepared_root, splits=("train",))
+
+        self.assertEqual(set(metadata.manifests), {"train"})
+        with self.assertRaisesRegex(FileNotFoundError, "val.json"):
+            load_prepared_metadata(self.prepared_root)
+
     def test_threaded_batch_loading_preserves_order_and_can_cache(self) -> None:
         metadata = load_prepared_metadata(self.prepared_root)
         dataset = PreparedGraphDataset(

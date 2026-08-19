@@ -43,12 +43,14 @@ STRUCTURED_REFERENCE_OPERATIONS = frozenset(
         "MISSING",
     }
 )
-# Reference positions that a decoder can be supervised on as they stand.
+# Reference positions that a decoder can be supervised on as they stand.  A
+# global reference counts only once it has been checked against a candidate pool:
+# ``global_unchecked`` records that no pool was supplied, which is an absence of
+# evidence rather than a resolvable target, so it is deliberately excluded here.
 STRUCTURED_RESOLVED_CATEGORIES = frozenset(
     {
         "local_selectable",
         "global_library_lemma",
-        "global_unchecked",
         "tactic_scoped_binding",
         "fresh_identifier",
     }
@@ -64,6 +66,10 @@ class ArgumentCoverageConfig:
     splits: tuple[str, ...] = ("train", "val", "test")
     lemma_corpus: Path | None = None
     lemma_index: Path | None = None
+    # Root holding the S-expression and trace sidecars.  A corpus rebuilt into a
+    # new prepared root keeps reusing the sidecars extracted for the old one, so
+    # the two roots must be allowed to differ.  Defaults to ``prepared_root``.
+    sexpr_cache_root: Path | None = None
     structured_traces: bool = False
     max_items_per_split: int | None = None
     sample_limit_per_category: int = 20
@@ -91,6 +97,11 @@ class ArgumentCoverageConfig:
             lemma_index=(
                 self.lemma_index.expanduser().resolve()
                 if self.lemma_index is not None
+                else None
+            ),
+            sexpr_cache_root=(
+                self.sexpr_cache_root.expanduser().resolve()
+                if self.sexpr_cache_root is not None
                 else None
             ),
             structured_traces=self.structured_traces,
@@ -421,7 +432,7 @@ def _iter_graphs(prepared_root: Path, split: str) -> tuple[Iterable[object], str
         if isinstance(split_payload, dict) and split_payload.get("chunks"):
             return _iter_packed_graphs(prepared_root, split), "packed"
 
-    metadata = load_prepared_metadata(prepared_root)
+    metadata = load_prepared_metadata(prepared_root, splits=(split,))
     pyg_dir = metadata.split_pyg_dir(split)
     files = sorted(pyg_dir.glob("*.pt"))
     if not files:
@@ -538,6 +549,17 @@ def _render_structured_markdown(structured: dict[str, object]) -> list[str]:
     ]
     for category, count in dict(structured["categories"]).items():
         lines.append(f"| {category} | {count} | {count / reference_slots:.2%} |")
+    unchecked = int(dict(structured["categories"]).get("global_unchecked", 0))
+    if unchecked:
+        lines.extend(
+            [
+                "",
+                f"`global_unchecked` covers `{unchecked}` slots that no candidate pool",
+                "was supplied for, so they are excluded from the resolved coverage above",
+                "rather than assumed resolvable. Pass `--lemma-corpus` or `--lemma-index`",
+                "to split them into `global_library_lemma` and `global_outside_corpus`.",
+            ]
+        )
     lines.extend(
         ["", "#### Trace availability", "", "| State | Rows |", "| --- | ---: |"]
     )
@@ -561,6 +583,7 @@ def _render_markdown(summary: dict[str, object]) -> str:
         f"- Prepared root: `{summary['prepared_root']}`",
         f"- Lemma corpus: `{summary.get('lemma_corpus') or 'not supplied'}`",
         f"- Lemma index: `{summary.get('lemma_index') or 'not supplied'}`",
+        f"- S-expression cache root: `{summary.get('sexpr_cache_root') or 'not supplied'}`",
         "",
     ]
     if summary.get("structured_traces"):
@@ -626,7 +649,8 @@ def _render_markdown(summary: dict[str, object]) -> str:
 
 def run_argument_coverage_audit(config: ArgumentCoverageConfig) -> dict[str, object]:
     config = config.normalized()
-    metadata = load_prepared_metadata(config.prepared_root)
+    metadata = load_prepared_metadata(config.prepared_root, splits=config.splits)
+    sexpr_cache_root = config.sexpr_cache_root or config.prepared_root
     if config.output_dir.exists() and any(config.output_dir.iterdir()) and not config.force:
         raise FileExistsError(
             f"Output directory is not empty: {config.output_dir}. Use --force to overwrite reports."
@@ -657,6 +681,7 @@ def run_argument_coverage_audit(config: ArgumentCoverageConfig) -> dict[str, obj
         "prepared_root": str(config.prepared_root),
         "lemma_corpus": str(config.lemma_corpus) if config.lemma_corpus else None,
         "lemma_index": str(config.lemma_index) if config.lemma_index else None,
+        "sexpr_cache_root": str(sexpr_cache_root),
         "structured_traces": config.structured_traces,
         "splits": {},
     }
@@ -673,17 +698,17 @@ def run_argument_coverage_audit(config: ArgumentCoverageConfig) -> dict[str, obj
             1 for label in node_vocab if label.startswith("FV")
         )
     raw_cache = (
-        SExprCache(config.prepared_root, project_path="", enabled=True)
+        SExprCache(sexpr_cache_root, project_path="", enabled=True)
         if config.structured_traces
         else None
     )
     model_cache = (
-        ModelSExprCache(config.prepared_root, enabled=True)
+        ModelSExprCache(sexpr_cache_root, enabled=True)
         if config.structured_traces
         else None
     )
     trace_cache = (
-        SourceSyntaxTraceCache(config.prepared_root, enabled=True)
+        SourceSyntaxTraceCache(sexpr_cache_root, enabled=True)
         if config.structured_traces
         else None
     )
@@ -692,12 +717,12 @@ def run_argument_coverage_audit(config: ArgumentCoverageConfig) -> dict[str, obj
         for split in config.splits:
             trace_rows: set[int] | None = None
             if config.structured_traces:
-                trace_rows = _trace_row_indices(config.prepared_root, split)
+                trace_rows = _trace_row_indices(sexpr_cache_root, split)
                 if not trace_rows:
                     raise FileNotFoundError(
                         "No "
                         f"{SourceSyntaxTraceCache.SIDECAR_DIR} sidecars found under "
-                        f"{config.prepared_root / split / SourceSyntaxTraceCache.SIDECAR_DIR}"
+                        f"{sexpr_cache_root / split / SourceSyntaxTraceCache.SIDECAR_DIR}"
                     )
             graphs, source = _iter_graphs(config.prepared_root, split)
             stats = _new_tactic_stats()

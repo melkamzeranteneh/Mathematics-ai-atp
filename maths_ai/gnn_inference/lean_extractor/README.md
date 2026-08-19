@@ -120,12 +120,28 @@ they are meant to replace, run the argument coverage audit with
 
 ```bash
 python -m maths_ai.gnn_inference.scripts.audit_argument_coverage \
-  --prepared-root maths_ai/_support_files/artifacts/prepared/v1 \
+  --prepared-root maths_ai/_support_files/artifacts/prepared/v2 \
+  --sexpr-cache-root maths_ai/_support_files/artifacts/prepared/v1 \
+  --output-dir maths_ai/_support_files/artifacts/prepared/v2/reports/argument_coverage_v3 \
   --splits train \
   --structured-traces \
-  --lemma-index maths_ai/_support_files/artifacts/lemma_index_v1 \
+  --lemma-corpus maths_ai/_support_files/artifacts/lemmas/v1/corpus \
   --force
 ```
+
+`--sexpr-cache-root` is needed whenever the graphs being audited were rebuilt
+into a new prepared root while the S-expression and trace sidecars stayed in the
+root they were extracted into; it defaults to `--prepared-root`. Only the splits
+named by `--splits` must exist, so a partially rebuilt corpus can be audited
+without placeholder manifests for the splits it does not yet contain.
+
+Supply a candidate pool as well. Every `GLOBAL` and `CONSTRUCTOR` position is
+classified `global_unchecked` without one, and that category is excluded from
+`resolved_reference_coverage` rather than assumed resolvable, because "Lean gave
+us a name" is not evidence that the name can be selected. With a pool the same
+positions split into `global_library_lemma` and `global_outside_corpus`. Note
+that the shipped pool holds the theorems that appear as proof *targets*, so a
+lemma the corpus only ever cites can legitimately fall outside it.
 
 With `--structured-traces`, both metrics are computed over exactly the rows that
 have a version-3 sidecar, so the comparison is not contaminated by rows only one
@@ -151,11 +167,12 @@ That resolution presupposes something the prepared corpus must actually
 provide. The graph builder emits an `FV{context_index}` node only for
 hypotheses that record a context index, and only the normalized
 `model_sexpr_v2` sidecars record one; the raw source-faithful records carry
-just a name and a type S-expression. A corpus preprocessed with the default
+just a name and a type S-expression. A corpus preprocessed with
 `--sexpr-variant raw` therefore contains no such node, and every local
-reference is unresolvable regardless of any mask. The audit reports
-`Context-index node labels in vocabulary` for exactly this reason and names the
-required rebuild when that count is zero:
+reference is unresolvable regardless of any mask. Preprocessing defaults to
+`--sexpr-variant model` for that reason, and the audit reports
+`Context-index node labels in vocabulary` so a corpus built the other way is
+diagnosed here rather than mistaken for a masking problem downstream:
 
 ```bash
 python -m maths_ai.gnn_inference.atp_lean_gnn.preprocess \
@@ -163,12 +180,29 @@ python -m maths_ai.gnn_inference.atp_lean_gnn.preprocess \
   --use-sexpr \
   --sexpr-cache-root maths_ai/_support_files/artifacts/prepared/v1 \
   --sexpr-variant model \
+  --selection-manifest maths_ai/_support_files/artifacts/sexpr_pilot_30k.json \
   --splits train val test
 ```
 
 The hypothesis-name cross-check reads the same normalized sidecar. When a
 record carries no context indices at all, the check is disabled rather than
 reporting every index as absent from the state.
+
+Measured on 5187 train rows with version-3 traces, that rebuild resolves
+7572 of 7572 local references to an unmasked graph node with no name
+disagreements, against 4355 argument slots the static arity table expects for
+the same rows.
+
+The model variant is the pointer representation the project now uses, and
+`--sexpr-variant raw` is kept only for the representation ablation. The two are
+not interchangeable supervision sources: once a hypothesis records a context
+index, the graph builder makes the hypothesis *name* node an `sconst` and moves
+selectability to the `FV` node. The regex-and-arity path loses the name node it
+was accidentally pointing at, and its coverage on the same rows drops from
+34.05% to 9.90%, with most of the difference reappearing as
+`local_present_but_masked`. That drop is the expected consequence of the
+representation change rather than a regression, and it is why a single corpus
+cannot serve both schemes.
 
 For a controlled pilot, first create one deterministic theorem-level
 selection before S-expression extraction. It needs no raw cache. It stratifies

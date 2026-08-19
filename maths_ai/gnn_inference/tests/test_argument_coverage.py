@@ -413,26 +413,32 @@ class StructuredArgumentCoverageAuditTests(unittest.TestCase):
             shutil.rmtree(self.root)
         self.prepared_root = self.root / "prepared"
         self.output_dir = self.root / "report"
-        (self.prepared_root / "vocab").mkdir(parents=True)
-        (self.prepared_root / "manifests").mkdir(parents=True)
-        (self.prepared_root / "vocab" / "node_vocab.json").write_text(
-            json.dumps(self.NODE_VOCAB), encoding="utf-8"
+        self._prepare_corpus_root(self.prepared_root, node_vocab=self.NODE_VOCAB)
+
+    def _prepare_corpus_root(self, root: Path, *, node_vocab: dict[str, int]) -> None:
+        # Only the audited split is created here.  An audit must not demand the
+        # sibling manifests it never reads: a partially rebuilt corpus has none,
+        # and fabricating empty ones to satisfy the loader would also hide a
+        # genuinely missing artifact directory.
+        (root / "vocab").mkdir(parents=True)
+        (root / "manifests").mkdir(parents=True)
+        (root / "vocab" / "node_vocab.json").write_text(
+            json.dumps(node_vocab), encoding="utf-8"
         )
-        (self.prepared_root / "vocab" / "tactic_vocab.json").write_text(
+        (root / "vocab" / "tactic_vocab.json").write_text(
             json.dumps({"<UNK_TACTIC>": 0, "exact": 1}), encoding="utf-8"
         )
-        for split in ("train", "val", "test"):
-            (self.prepared_root / split / "pyg").mkdir(parents=True)
-            (self.prepared_root / "manifests" / f"{split}.json").write_text(
-                json.dumps({"artifact_paths": {"pyg_dir": f"{split}/pyg"}}),
-                encoding="utf-8",
-            )
+        (root / "train" / "pyg").mkdir(parents=True)
+        (root / "manifests" / "train.json").write_text(
+            json.dumps({"artifact_paths": {"pyg_dir": "train/pyg"}}),
+            encoding="utf-8",
+        )
 
     def tearDown(self) -> None:
         if self.root.exists():
             shutil.rmtree(self.root)
 
-    def _save_graph(self, row_index: int) -> None:
+    def _save_graph(self, row_index: int, *, root: Path | None = None) -> None:
         data = Data(
             x=torch.tensor([1, 2, 3], dtype=torch.long),
             edge_index=torch.zeros((2, 0), dtype=torch.long),
@@ -445,7 +451,10 @@ class StructuredArgumentCoverageAuditTests(unittest.TestCase):
         data.row_index = row_index
         data.theorem = "Demo.result"
         write_pyg_artifact(
-            self.prepared_root, split="train", row_index=row_index, data=data
+            root if root is not None else self.prepared_root,
+            split="train",
+            row_index=row_index,
+            data=data,
         )
 
     def _save_raw_record(self, row_index: int) -> dict:
@@ -481,7 +490,9 @@ class StructuredArgumentCoverageAuditTests(unittest.TestCase):
         )
         return raw_record
 
-    def _save_structured_trace(self, row_index: int) -> None:
+    def _save_structured_trace(
+        self, row_index: int, *, extra_children: tuple[dict, ...] = ()
+    ) -> None:
         raw_record = self._save_raw_record(row_index)
         SourceSyntaxTraceCache(self.prepared_root).save(
             "train",
@@ -513,6 +524,7 @@ class StructuredArgumentCoverageAuditTests(unittest.TestCase):
                             "semanticRole": "local",
                             "contextIndex": 0,
                         },
+                        *extra_children,
                     ],
                 },
                 "syntax_args": [],
@@ -589,6 +601,127 @@ class StructuredArgumentCoverageAuditTests(unittest.TestCase):
 
         report = (self.output_dir / "summary.md").read_text(encoding="utf-8")
         self.assertIn("--sexpr-variant model", report)
+
+    def test_audit_reads_one_split_without_the_sibling_manifests(self) -> None:
+        self._save_graph(7)
+        self._save_structured_trace(7)
+        self.assertFalse((self.prepared_root / "manifests" / "val.json").exists())
+        self.assertFalse((self.prepared_root / "manifests" / "test.json").exists())
+
+        summary = run_argument_coverage_audit(
+            ArgumentCoverageConfig(
+                prepared_root=self.prepared_root,
+                output_dir=self.output_dir,
+                splits=("train",),
+                structured_traces=True,
+            )
+        )
+
+        self.assertEqual(summary["splits"]["train"]["structured"]["row_count"], 1)
+
+    def test_sidecars_may_live_outside_the_audited_prepared_root(self) -> None:
+        # Rebuilding a corpus with a different representation produces a new
+        # prepared root, while the costly S-expression and trace sidecars stay
+        # where they were extracted.  The audit has to read across the two roots
+        # without copies or symlinks standing in for the missing option.
+        rebuilt_root = self.root / "rebuilt"
+        self._prepare_corpus_root(rebuilt_root, node_vocab=self.NODE_VOCAB)
+        self._save_graph(7, root=rebuilt_root)
+        self._save_structured_trace(7)
+
+        summary = run_argument_coverage_audit(
+            ArgumentCoverageConfig(
+                prepared_root=rebuilt_root,
+                output_dir=self.output_dir,
+                splits=("train",),
+                structured_traces=True,
+                sexpr_cache_root=self.prepared_root,
+            )
+        )
+
+        structured = summary["splits"]["train"]["structured"]
+        self.assertEqual(
+            summary["sexpr_cache_root"], str(self.prepared_root.resolve())
+        )
+        self.assertEqual(structured["categories"], {"local_selectable": 1})
+
+        with self.assertRaisesRegex(FileNotFoundError, "action_trace_v3"):
+            run_argument_coverage_audit(
+                ArgumentCoverageConfig(
+                    prepared_root=rebuilt_root,
+                    output_dir=self.output_dir,
+                    splits=("train",),
+                    structured_traces=True,
+                    force=True,
+                )
+            )
+
+    def test_unchecked_globals_are_excluded_from_resolved_coverage(self) -> None:
+        self._save_graph(7)
+        self._save_structured_trace(
+            7,
+            extra_children=(
+                {
+                    "tag": "identifier",
+                    "source": "Demo.f",
+                    "sourceStart": 8,
+                    "sourceEnd": 14,
+                    "semanticRole": "global",
+                    "name": "Demo.f",
+                },
+            ),
+        )
+        corpus_dir = self.root / "lemmas"
+        corpus_dir.mkdir(parents=True)
+        (corpus_dir / "lemmas.jsonl").write_text(
+            json.dumps(
+                {
+                    "lemma_id": 1,
+                    "name": "Demo.f",
+                    "statement": "True",
+                    "namespace": "Demo",
+                    "module": "Demo",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        unchecked = run_argument_coverage_audit(
+            ArgumentCoverageConfig(
+                prepared_root=self.prepared_root,
+                output_dir=self.output_dir,
+                splits=("train",),
+                structured_traces=True,
+            )
+        )["splits"]["train"]["structured"]
+        checked = run_argument_coverage_audit(
+            ArgumentCoverageConfig(
+                prepared_root=self.prepared_root,
+                output_dir=self.root / "report_checked",
+                splits=("train",),
+                structured_traces=True,
+                lemma_corpus=corpus_dir,
+            )
+        )["splits"]["train"]["structured"]
+
+        # Without a candidate pool the global reference is unverifiable, so the
+        # row is not fully resolved and only the local slot counts as resolved.
+        self.assertEqual(
+            unchecked["categories"], {"global_unchecked": 1, "local_selectable": 1}
+        )
+        self.assertEqual(unchecked["resolved_reference_coverage"], 0.5)
+        self.assertEqual(unchecked["fully_resolved_row_count"], 0)
+        self.assertIn(
+            "excluded from the resolved coverage",
+            (self.output_dir / "summary.md").read_text(encoding="utf-8"),
+        )
+
+        self.assertEqual(
+            checked["categories"], {"global_library_lemma": 1, "local_selectable": 1}
+        )
+        self.assertEqual(checked["resolved_reference_coverage"], 1.0)
+        self.assertEqual(checked["fully_resolved_row_count"], 1)
 
     def test_audit_requires_structured_sidecars_when_asked_for_them(self) -> None:
         self._save_graph(7)

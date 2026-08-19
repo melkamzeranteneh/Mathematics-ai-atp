@@ -7,6 +7,7 @@ import json
 import os
 import random
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -505,7 +506,18 @@ def load_pointer_config(
     return PointerConfig.from_dict(payload)
 
 
-def load_prepared_metadata(prepared_root: str | Path) -> PreparedMetadata:
+def load_prepared_metadata(
+    prepared_root: str | Path,
+    *,
+    splits: Sequence[str] | None = None,
+) -> PreparedMetadata:
+    """Load vocabularies and split manifests from a prepared dataset root.
+
+    Training requires all three canonical splits, which is the default.  Tools
+    that legitimately inspect a single split -- an audit of a partially rebuilt
+    corpus, for instance -- pass ``splits`` so a missing sibling manifest is not
+    an error and no placeholder manifest has to be fabricated to satisfy one.
+    """
     root = Path(prepared_root)
     if not root.exists():
         raise FileNotFoundError(f"Prepared dataset root '{root}' does not exist.")
@@ -532,7 +544,14 @@ def load_prepared_metadata(prepared_root: str | Path) -> PreparedMetadata:
         )
 
     manifests: dict[str, dict[str, object]] = {}
-    for split in CANONICAL_SPLITS:
+    required_splits = (
+        CANONICAL_SPLITS
+        if splits is None
+        else tuple(canonicalize_split_name(split) for split in splits)
+    )
+    if not required_splits:
+        raise ValueError("At least one split is required.")
+    for split in required_splits:
         manifest_path = root / "manifests" / f"{split}.json"
         if not manifest_path.exists():
             raise FileNotFoundError(f"Prepared dataset is missing manifest '{manifest_path}'.")

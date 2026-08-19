@@ -64,7 +64,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "force": False,
         "use_sexpr": False,
         "sexpr_cache_root": None,
-        "sexpr_variant": "raw",
+        "sexpr_variant": "model",
         "project_path": "maths_ai/lean_mathlib",
     },
 
@@ -229,7 +229,7 @@ def run_prepare(config: dict[str, Any]) -> dict[str, Any]:
             if prepare_cfg.get("sexpr_cache_root")
             else None
         ),
-        sexpr_variant=prepare_cfg.get("sexpr_variant", "raw"),
+        sexpr_variant=prepare_cfg.get("sexpr_variant", "model"),
         project_path=prepare_cfg.get("project_path", "maths_ai/lean_mathlib"),
         selection_manifest=(
             Path(prepare_cfg["selection_manifest"])

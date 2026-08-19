@@ -24,6 +24,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Lemma index directory containing lemma_names.json, or the names JSON itself.",
     )
     parser.add_argument(
+        "--sexpr-cache-root",
+        type=Path,
+        default=None,
+        help=(
+            "Root holding the S-expression and trace sidecars, when they live "
+            "outside the prepared root being audited. Defaults to --prepared-root."
+        ),
+    )
+    parser.add_argument(
         "--structured-traces",
         action="store_true",
         help=(
@@ -55,6 +64,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 lemma_corpus=args.lemma_corpus,
                 lemma_index=args.lemma_index,
+                sexpr_cache_root=args.sexpr_cache_root,
                 structured_traces=args.structured_traces,
                 max_items_per_split=args.max_items_per_split,
                 sample_limit_per_category=args.sample_limit_per_category,
