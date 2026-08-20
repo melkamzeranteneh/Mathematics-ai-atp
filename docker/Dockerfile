@@ -47,6 +47,7 @@ RUN git config --global http.lowSpeedLimit 0 && \
 # Uses BuildKit cache mount for .lake directory
 RUN elan toolchain install leanprover/lean4:v4.15.0
 RUN --mount=type=cache,target=/opt/lean_project/.lake \
+    rm -rf /opt/lean_project/.lake/packages/mathlib && \
     lake update && lake exe cache get
 RUN --mount=type=cache,target=/opt/lean_project/.lake \
     lake build --verbose
