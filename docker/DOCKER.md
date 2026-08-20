@@ -5,7 +5,7 @@
 This project uses a multi-stage Dockerfile with a shared base stage and three service-specific targets:
 
 - **base** — Shared dependencies: Lean 4.15.0 + Mathlib4, SWI-Prolog 9.3+, petta, uv venv
-- **core** — Core service: always-running proof/inference server
+- **core** — Core batch service: runs the joint prover
 - **experimental** — Experimental service: sandbox for experiments on demand
 - **training** — Training service: batch job, GPU-optional, different lifecycle
 
@@ -14,7 +14,7 @@ This project uses a multi-stage Dockerfile with a shared base stage and three se
 ### Build Images
 
 ```bash
-# Build core service (production proof/inference server)
+# Build core image (joint prover)
 docker build --target core -t maths_ai-core -f docker/Dockerfile .
 
 # Build experimental service (includes experiments/)
@@ -27,11 +27,11 @@ docker build --target training -t maths_ai-training -f docker/Dockerfile .
 ### Run Services
 
 ```bash
-# Core service (health-checked, always running)
-docker run -d --name maths_ai-core \
-  -p 8000:8000 \
+# Core proof run
+docker run --rm --name maths_ai-core \
   -v $(pwd)/data:/data \
-  maths_ai-core
+  maths_ai-core \
+  --goal_statement "forall (p q: Prop), Or p q -> Or q p"
 
 # Experimental service (interactive)
 docker run -it --rm \
@@ -39,10 +39,10 @@ docker run -it --rm \
   -v $(pwd)/experiments:/workspace/experiments \
   maths_ai-experimental
 
-# Training service (batch, with GPU support)
+# Training service (batch, NVIDIA GPU required)
 docker run --rm --gpus all \
   -v $(pwd)/data:/data \
-  maths_ai-training python -m maths_ai.gnn_inference.train
+  maths_ai-training python -m maths_ai.gnn_inference.scripts.run_training --device cuda
 ```
 
 ## Architecture
@@ -118,25 +118,32 @@ All targets use `/entrypoint.sh` which:
 2. Executes passed command or defaults to service-specific entry
 
 ```bash
-# Override entrypoint
-docker run maths_ai-core python -m maths_ai.hybrid_reasoner.repl
+# Run a proof with a custom goal
+docker run --rm maths_ai-core \
+  python -m maths_ai.hybrid_reasoner.joint_inference \
+  --goal_statement "forall (p q: Prop), Or p q -> Or q p"
 ```
 
-## Health Check (core target)
+## Health Check
 
 ```bash
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-  CMD python -m maths_ai.healthcheck || exit 1
+python -m maths_ai.healthcheck
 ```
 
 ## GPU Support (training target)
 
 ```bash
 # NVIDIA GPU
-docker run --rm --gpus all maths_ai-training python -m maths_ai.gnn_inference.train
+docker run --rm --gpus all maths_ai-training \
+  python -m maths_ai.gnn_inference.scripts.run_training --device cuda
 
 # Specific GPU
-docker run --rm --gpus '"device=0,1"' maths_ai-training ...
+docker run --rm --gpus '"device=0,1"' maths_ai-training \
+  python -m maths_ai.gnn_inference.scripts.run_training --device cuda
+
+`--gpus` requires an NVIDIA driver and NVIDIA Container Toolkit on the host.
+It is a Docker runtime option, separate from the training script's `--device`
+option. Use `--device cpu` and omit `--gpus all` on CPU-only hosts.
 ```
 
 ## Troubleshooting

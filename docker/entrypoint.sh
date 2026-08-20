@@ -46,4 +46,10 @@ if [ "${1:-}" = "skip-fetch" ]; then
     shift
 fi
 
+if [ "$#" -eq 0 ]; then
+    echo "ERROR: no command provided. Pass a command such as:" >&2
+    echo "  python -m maths_ai.hybrid_reasoner.joint_inference --goal_statement '...'" >&2
+    exit 2
+fi
+
 exec "$@"

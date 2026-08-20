@@ -103,11 +103,8 @@ USER root
 RUN chmod +x /entrypoint.sh && chmod +x /workspace/docker/commands/*.sh
 USER maths_ai
 
-# Health check: trivial proof/inference call
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -m maths_ai.healthcheck || exit 1
-
 ENTRYPOINT ["/entrypoint.sh"]
+CMD ["python", "-m", "maths_ai.hybrid_reasoner.joint_inference"]
 
 # ---------- experimental ----------
 # Experimental service: sandbox for experiments/, on demand
