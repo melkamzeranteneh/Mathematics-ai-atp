@@ -7,7 +7,7 @@
 #   - training: batch job service for training (profile: training)
 #
 # Usage:
-#   docker compose up                                   # asset-fetch, then core stays up
+#   docker compose up                                   # asset-fetch, then run the core proof job
 #   docker compose --profile experimental up experimental
 #   docker compose run --rm training prepare-dataset ...
 #   docker compose run --rm training train --stages baseline,pointer

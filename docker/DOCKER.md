@@ -31,13 +31,14 @@ docker build --target training -t maths_ai-training -f docker/Dockerfile .
 docker run --rm --name maths_ai-core \
   -v $(pwd)/data:/data \
   maths_ai-core \
+  python -m maths_ai.hybrid_reasoner.joint_inference \
   --goal_statement "forall (p q: Prop), Or p q -> Or q p"
 
 # Experimental service (interactive)
 docker run -it --rm \
   -v $(pwd)/data:/data \
   -v $(pwd)/experiments:/workspace/experiments \
-  maths_ai-experimental
+  maths_ai-experimental bash
 
 # Training service (batch, NVIDIA GPU required)
 docker run --rm --gpus all \
@@ -132,6 +133,49 @@ python -m maths_ai.healthcheck
 
 ## GPU Support (training target)
 
+### NVIDIA Host Setup
+
+GPU support must be configured on the host before starting the training
+container. The image does not install NVIDIA drivers.
+
+1. Install a compatible NVIDIA driver for the host operating system and
+  confirm that the driver works:
+
+```bash
+nvidia-smi
+```
+
+2. Install the NVIDIA Container Toolkit. On Ubuntu or Debian, the official
+  repository setup is:
+
+```bash
+distribution=$(. /etc/os-release; echo "$ID$VERSION_ID")
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+  | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -fsSL "https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list" \
+  | sed 's#^deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+  | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt-get update
+sudo apt-get install -y nvidia-container-toolkit
+```
+
+3. Configure Docker to use the NVIDIA runtime and restart Docker:
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+4. Verify the host integration with a CUDA smoke test before running this
+  project's training image:
+
+```bash
+docker run --rm --gpus all nvidia/cuda:12.9.1-base-ubuntu22.04 nvidia-smi
+```
+
+The CUDA image tag is only a smoke-test example. Use a tag compatible with
+the installed driver and the CUDA version required by the project.
+
 ```bash
 # NVIDIA GPU
 docker run --rm --gpus all maths_ai-training \
@@ -141,10 +185,19 @@ docker run --rm --gpus all maths_ai-training \
 docker run --rm --gpus '"device=0,1"' maths_ai-training \
   python -m maths_ai.gnn_inference.scripts.run_training --device cuda
 
+```
+
 `--gpus` requires an NVIDIA driver and NVIDIA Container Toolkit on the host.
 It is a Docker runtime option, separate from the training script's `--device`
-option. Use `--device cpu` and omit `--gpus all` on CPU-only hosts.
+option. On a CPU-only host, use `--device cpu` and omit `--gpus all`:
+
+```bash
+docker run --rm maths_ai-training \
+  python -m maths_ai.gnn_inference.scripts.run_training --device cpu
 ```
+
+Core and training are batch jobs. They exit when the proof or training run
+finishes; they are not HTTP services.
 
 ## Troubleshooting
 
