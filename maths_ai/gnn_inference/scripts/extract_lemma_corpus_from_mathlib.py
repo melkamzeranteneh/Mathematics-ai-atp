@@ -19,7 +19,11 @@ Usage::
         --pantograph-repl maths_ai/_support_files/sexpr_environment/Pantograph/.lake/build/bin/repl \
         --output-dir maths_ai/_support_files/artifacts/lemmas/v2/corpus
 
-Expect roughly 319000 declarations, about 14 minutes, and an output near 130 MB.
+A measured full run wrote 318953 records in about 14 minutes for 143 MB, with no
+inspect failures and no unsafe declarations skipped.  Run one instance at a time:
+two writing the same output directory leave a partially written ``lemmas.jsonl``
+that the audit reads as a small corpus rather than a broken one.
+
 Pass ``--names-only`` to skip ``env.inspect`` entirely and write just the name
 list that ``audit_argument_coverage --lemma-index`` consumes; that mode finishes
 in seconds and is enough to label decoder targets, but carries no statements and

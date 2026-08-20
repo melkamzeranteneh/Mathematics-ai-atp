@@ -158,16 +158,24 @@ python -m maths_ai.gnn_inference.scripts.extract_lemma_corpus_from_mathlib \
   --output-dir maths_ai/_support_files/artifacts/lemmas/v2/corpus
 ```
 
-`env.catalog` returns roughly 319000 constants -- 219626 theorems, 88434
-definitions, and the constructors, inductives and recursors that tactics also
-cite -- each prefixed with one character naming its kind. `env.inspect` supplies
-the type used as the statement at about 2.7 ms per declaration, so a full run
-takes some 14 minutes and writes around 130 MB against the 9.8 MB of the v1
-corpus. Importing all of Mathlib overflows the default 8 MiB stack, which Lean
-reports as `Stack overflow detected`; the script raises its own limit before
-spawning the REPL, so no `ulimit -s` wrapper is needed. Because Mathlib imports
-Lean core and Batteries transitively, no separate pass is required for those.
-Pass `--names-only` to write just the `lemma_names.json` that `--lemma-index`
+`env.catalog` returns 318953 constants -- 219626 theorems, 88434 definitions, and
+the constructors, inductives and recursors that tactics also cite -- each
+prefixed with one character naming its kind. `env.inspect` supplies the type used
+as the statement at about 2.7 ms per declaration. A full run took some 14 minutes
+and wrote all 318953 records into 143 MB, against the 9.8 MB of the v1 corpus,
+with no inspect failures and no unsafe declarations to skip. Auditing the same
+5187 rows against it reports `global_library_lemma` 9528, no
+`global_outside_corpus`, and resolved reference coverage of 96.1109% with 4043
+rows (85.9481%) fully resolved -- against 63.84% and 1448 rows for the v1 pool.
+
+Importing all of Mathlib overflows the default 8 MiB stack, which Lean reports as
+`Stack overflow detected`; the script raises its own limit before spawning the
+REPL, so no `ulimit -s` wrapper is needed. Because Mathlib imports Lean core and
+Batteries transitively, no separate pass is required for those. Run one instance
+at a time: two processes writing the same output directory leave a partially
+written `lemmas.jsonl`, and the audit reads that as a small corpus rather than a
+broken one, reporting a low coverage figure that looks like a result. Pass
+`--names-only` to write just the `lemma_names.json` that `--lemma-index`
 consumes: that finishes in seconds and is enough to label decoder targets, but
 carries no statements and so cannot feed embeddings.
 
