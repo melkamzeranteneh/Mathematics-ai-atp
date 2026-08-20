@@ -139,9 +139,37 @@ Supply a candidate pool as well. Every `GLOBAL` and `CONSTRUCTOR` position is
 classified `global_unchecked` without one, and that category is excluded from
 `resolved_reference_coverage` rather than assumed resolvable, because "Lean gave
 us a name" is not evidence that the name can be selected. With a pool the same
-positions split into `global_library_lemma` and `global_outside_corpus`. Note
-that the shipped pool holds the theorems that appear as proof *targets*, so a
-lemma the corpus only ever cites can legitimately fall outside it.
+positions split into `global_library_lemma` and `global_outside_corpus`.
+
+Which pool is used decides that split. `artifacts/lemmas/v1/corpus` was built
+from the theorems the benchmark *proves* -- `extract_lemma_corpus_from_hf.py`
+reads `row.theorem` and never looks at `row.tactic` -- but a tactic cites
+lemmas, and the most frequently cited ones are the simplest. `mul_comm`,
+`lt_of_le_of_lt` and `Set.inter_subset_left` are all proved in term mode, own no
+traced tactic row, and therefore cannot appear in a target-derived corpus at any
+row count. Measured over the 5187 train rows carrying a version-3 trace, that
+corpus covered 2308 of 9528 lemma citations (24.22%), while the Mathlib
+environment covers 9528 of 9528. Build the environment corpus instead:
+
+```bash
+python -m maths_ai.gnn_inference.scripts.extract_lemma_corpus_from_mathlib \
+  --source-root maths_ai/_support_files/sexpr_environment/mathlib4 \
+  --pantograph-repl maths_ai/_support_files/sexpr_environment/Pantograph/.lake/build/bin/repl \
+  --output-dir maths_ai/_support_files/artifacts/lemmas/v2/corpus
+```
+
+`env.catalog` returns roughly 319000 constants -- 219626 theorems, 88434
+definitions, and the constructors, inductives and recursors that tactics also
+cite -- each prefixed with one character naming its kind. `env.inspect` supplies
+the type used as the statement at about 2.7 ms per declaration, so a full run
+takes some 14 minutes and writes around 130 MB against the 9.8 MB of the v1
+corpus. Importing all of Mathlib overflows the default 8 MiB stack, which Lean
+reports as `Stack overflow detected`; the script raises its own limit before
+spawning the REPL, so no `ulimit -s` wrapper is needed. Because Mathlib imports
+Lean core and Batteries transitively, no separate pass is required for those.
+Pass `--names-only` to write just the `lemma_names.json` that `--lemma-index`
+consumes: that finishes in seconds and is enough to label decoder targets, but
+carries no statements and so cannot feed embeddings.
 
 With `--structured-traces`, both metrics are computed over exactly the rows that
 have a version-3 sidecar, so the comparison is not contaminated by rows only one
