@@ -30,6 +30,8 @@ services:
       - MATHS_AI_DATA_ROOT=/data
       - MATHS_AI_MODEL_CONFIG=/workspace/maths_ai/config/models/premise_gnn.yaml
       - MATHS_AI_CORPUS_CONFIG=/workspace/maths_ai/config/corpus/lemma_corpus_v1.yaml
+      # Required while the HF repos are private; read from the host environment.
+      - HF_TOKEN=${HF_TOKEN:-}
     entrypoint: ["python", "scripts/fetch_assets.py"]
     networks:
       - maths_ai_network

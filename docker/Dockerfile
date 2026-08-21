@@ -59,11 +59,14 @@ ENV MATHS_AI_LEAN_PROJECT=/opt/lean_project
 ENV MATHS_AI_DATA_ROOT=/data
 
 # Set up workspace and install Python dependencies
+# UV_PROJECT_ENVIRONMENT makes `uv sync` install into /opt/venv instead of
+# creating a separate /workspace/.venv that nothing on PATH would use.
 WORKDIR /workspace
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 COPY pyproject.toml uv.lock /workspace/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv --seed /opt/venv && \
-    uv sync --no-dev && \
+    uv sync --no-dev --inexact --no-install-project && \
     uv pip install --python /opt/venv/bin/python -e . --no-deps
 
 # Install petta into the project virtualenv, not the system Python
