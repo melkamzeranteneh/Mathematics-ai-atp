@@ -33,8 +33,16 @@ a replacement goal and never executes the dataset tactics.  Ambiguous matches
 are failures rather than guessed cache entries.  Row caches are atomic and the
 command is resumable.
 
-After raw extraction, generate normalized sidecars without changing any raw
-record:
+A row is the unit of failure.  A row that matches no invocation, or matches two
+that disagree, says nothing about its neighbours, so it is recorded as a
+one-row failure and the other rows of its theorem are still committed.  Only a
+failure that genuinely loses every row of a group stays group-wide: a commit
+mismatch, a file that did not compile, and a theorem with no compilation unit.
+`failure_phases` therefore counts rows lost, not theorem-sized blocks.
+
+After raw extraction, normalized sidecars can be added on their own, without
+changing any raw record (see *One compile per file* below for the cheaper way to
+get both at once):
 
 ```bash
 python -m maths_ai.gnn_inference.scripts.generate_sexprs \
@@ -91,6 +99,37 @@ carries the meaning Lean resolved for it: a stable local-context index, a
 tactic-scoped binding, a global constant, or a constructor. Elaborated
 expressions are deliberately not stored, only their byte ranges, so the
 kernel-term blowup cannot return through the cache.
+
+### One compile per file, not one per generation
+
+The unit of work is a Mathlib file elaboration, not a row, and Pantograph
+returns every payload on each invocation: the raw S-expression, the normalized
+model one, and the compact annotated syntax. The output flags therefore combine,
+and combining them is what a full extraction should do -- three separate passes
+recompile the same files three times:
+
+```bash
+python -m maths_ai.gnn_inference.scripts.generate_sexprs \
+  --prepared-root maths_ai/_support_files/artifacts/prepared/v1 \
+  --source-root maths_ai/_support_files/sexpr_environment/mathlib4 \
+  --pantograph-repl maths_ai/_support_files/sexpr_environment/Pantograph/.lake/build/bin/repl \
+  --splits train \
+  --model-sexprs --source-syntax-traces
+```
+
+`--action-traces` and `--source-syntax-traces` are the one pair that cannot be
+combined, because both write an action-trace sidecar; run those in separate
+passes.
+
+In a combined run the raw record is produced by the same compile when it is
+missing -- a compile that can build a sidecar can also build the record the
+sidecar hangs off -- and an existing validated raw record is never overwritten.
+Resume requires *every* enabled output, so an interrupted run re-derives only
+what is genuinely absent. Reports go to each enabled generation's own root
+(`sexpr_extraction`, `model_sexpr_extraction_v2`, `action_trace_extraction_v3`),
+each manifest naming the failure log in its own tree and listing
+`enabled_targets`; the counts are shared because a row either produced all its
+enabled outputs or failed.
 
 Before implementing or training a decoder, compile and audit the available
 structured targets:
@@ -281,3 +320,8 @@ The `--train-rows` target is the total source pool before holdout, so the
 logical training partition is approximately 26,000 rows. Such scores are
 internal ablation measurements and must not be reported as official benchmark
 validation/test accuracy.
+
+`--require-cached-train` selects whole theorems, so it skips a theorem whose
+rows are only partly cached. That is the one place per-row failure is visible:
+the partial rows are still valid caches and every other consumer reads them row
+by row, they are simply not eligible for this selector.

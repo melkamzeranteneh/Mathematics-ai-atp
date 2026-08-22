@@ -452,50 +452,64 @@ def _capture_signature(candidate: dict[str, object]) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _align_row(
+    row: DatasetRow, candidates: list[dict[str, object]]
+) -> dict[str, object]:
+    """Return the one invocation that reproduces this row, or raise."""
+    matches = [
+        (item, kind)
+        for item in candidates
+        if (kind := _invocation_match_kind(row, item)) is not None
+    ]
+    if not matches:
+        raise SourceExtractionError(
+            "No original tactic invocation matches state + tactic + target_state.",
+            phase="invocation_alignment",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        )
+    exact = [(item, kind) for item, kind in matches if kind == "exact"]
+    preferred = exact or matches
+    usable = [
+        (item, kind)
+        for item, kind in preferred
+        if not (
+            isinstance(item["invocation"], dict)
+            and item["invocation"].get("captureError")
+        )
+    ]
+    preferred = usable or preferred
+
+    signatures = {_capture_signature(item) for item, _kind in preferred}
+    if len(signatures) > 1:
+        raise SourceExtractionError(
+            "More than one invocation with a different serialized input goal "
+            "matches this dataset row; refusing a guessed cache.",
+            phase="ambiguous_invocation",
+            theorem=row.theorem,
+            row_index=row.row_index,
+        )
+    selected, match_kind = min(preferred, key=lambda pair: int(pair[0]["ordinal"]))
+    selected = dict(selected)
+    selected["alignment_kind"] = match_kind
+    return selected
+
+
 def _align_rows(
     rows: list[DatasetRow], candidates: list[dict[str, object]]
-) -> list[dict[str, object]]:
-    aligned: list[dict[str, object]] = []
-    for row in rows:
-        matches = [
-            (item, kind)
-            for item in candidates
-            if (kind := _invocation_match_kind(row, item)) is not None
-        ]
-        if not matches:
-            raise SourceExtractionError(
-                "No original tactic invocation matches state + tactic + target_state.",
-                phase="invocation_alignment",
-                theorem=row.theorem,
-                row_index=row.row_index,
-            )
-        exact = [(item, kind) for item, kind in matches if kind == "exact"]
-        preferred = exact or matches
-        usable = [
-            (item, kind)
-            for item, kind in preferred
-            if not (
-                isinstance(item["invocation"], dict)
-                and item["invocation"].get("captureError")
-            )
-        ]
-        preferred = usable or preferred
+) -> list[dict[str, object] | SourceExtractionError]:
+    """Align every row independently, returning the error for those that fail.
 
-        signatures = {_capture_signature(item) for item, _kind in preferred}
-        if len(signatures) > 1:
-            raise SourceExtractionError(
-                "More than one invocation with a different serialized input goal "
-                "matches this dataset row; refusing a guessed cache.",
-                phase="ambiguous_invocation",
-                theorem=row.theorem,
-                row_index=row.row_index,
-            )
-        selected, match_kind = min(
-            preferred, key=lambda pair: int(pair[0]["ordinal"])
-        )
-        selected = dict(selected)
-        selected["alignment_kind"] = match_kind
-        aligned.append(selected)
+    A row that matches no invocation, or matches two that disagree, says nothing
+    about its neighbours, so the failure is returned instead of raised and the
+    caller keeps the rows that did align.
+    """
+    aligned: list[dict[str, object] | SourceExtractionError] = []
+    for row in rows:
+        try:
+            aligned.append(_align_row(row, candidates))
+        except SourceExtractionError as error:
+            aligned.append(error)
     return aligned
 
 
@@ -933,6 +947,77 @@ def _row_is_action_cached(
     return True
 
 
+def _row_targets_cached(
+    raw_cache: SExprCache,
+    row: DatasetRow,
+    *,
+    model_cache: ModelSExprCache | None,
+    action_cache: ActionTraceCache | None,
+) -> bool:
+    """True when every cache this run writes already holds a valid record."""
+    if not _row_is_cached(raw_cache, row):
+        return False
+    if model_cache is not None and not _row_is_model_cached(
+        raw_cache, model_cache, row
+    ):
+        return False
+    if action_cache is not None and not _row_is_action_cached(
+        raw_cache, action_cache, row
+    ):
+        return False
+    return True
+
+
+def _build_records(
+    row: DatasetRow,
+    candidate: dict[str, object],
+    *,
+    raw_cache: SExprCache,
+    model_cache: ModelSExprCache | None,
+    action_cache: ActionTraceCache | None,
+    resume: bool,
+) -> list[tuple[object, dict[str, object]]]:
+    """Build every enabled record for one row out of one elaboration.
+
+    Pantograph returns all the payloads on every invocation -- the raw
+    S-expression, the normalized model one, and the compact annotated syntax --
+    so requesting several generations costs one file compile rather than one
+    each.
+
+    The raw record is the digest anchor the sidecars are bound to.  It is built
+    here when absent and reused when already cached, so a validated raw record
+    survives untouched; ``resume=False`` rebuilds it along with everything else,
+    which is what re-extraction means.  A sidecar of a generation this run did
+    not enable then fails its digest check and is regenerated on its own next
+    run, rather than being read as though it still described the raw record.
+    """
+    pending: list[tuple[object, dict[str, object]]] = []
+    raw_record = (
+        raw_cache.load_for_row(row, extractor_version=EXTRACTION_VERSION)
+        if resume
+        else None
+    )
+    if raw_record is None:
+        raw_record = _make_record(row, candidate)
+        pending.append((raw_cache, raw_record))
+    if model_cache is not None and (
+        not resume
+        or model_cache.load_for_raw_record(row.split, row.row_index, raw_record) is None
+    ):
+        pending.append((model_cache, _make_model_record(row, candidate, raw_record)))
+    if action_cache is not None and (
+        not resume
+        or action_cache.load_for_raw_record(row.split, row.row_index, raw_record) is None
+    ):
+        make_action_record = (
+            _make_source_syntax_trace_record
+            if isinstance(action_cache, SourceSyntaxTraceCache)
+            else _make_action_trace_record
+        )
+        pending.append((action_cache, make_action_record(row, candidate, raw_record)))
+    return pending
+
+
 def _failure_record(exc: Exception, file_path: str, theorem: str, rows: list[DatasetRow]) -> dict[str, object]:
     return {
         "file_path": file_path,
@@ -947,18 +1032,26 @@ def _failure_record(exc: Exception, file_path: str, theorem: str, rows: list[Dat
     }
 
 
-def _report_root(
+def _report_roots(
     prepared_root: Path,
     *,
     model_cache: ModelSExprCache | None,
     action_cache: ActionTraceCache | None,
-) -> Path:
-    """Keep every cache generation's reports in its own directory."""
-    if action_cache is not None:
-        return Path(prepared_root) / action_cache.REPORT_ROOT
+) -> list[Path]:
+    """One reports directory per enabled generation.
+
+    Each consumer reads the manifest from its own generation's root -- the
+    structured target audit opens ``{root}/manifests/{split}.json`` -- so a run
+    that writes several generations writes the same counts into each of them.
+    That is accurate rather than duplicated bookkeeping: a row either produced
+    every output the run enabled or it failed.
+    """
+    roots = [Path(prepared_root) / SExprCache.REPORT_ROOT]
     if model_cache is not None:
-        return Path(prepared_root) / model_cache.REPORT_ROOT
-    return Path(prepared_root) / SExprCache.REPORT_ROOT
+        roots.append(Path(prepared_root) / model_cache.REPORT_ROOT)
+    if action_cache is not None:
+        roots.append(Path(prepared_root) / action_cache.REPORT_ROOT)
+    return roots
 
 
 def _sidecar_versions(
@@ -971,6 +1064,20 @@ def _sidecar_versions(
     if model_cache is not None:
         return ModelSExprCache.SCHEMA_VERSION, ModelSExprCache.NORMALIZATION
     return SExprCache.SCHEMA_VERSION, EXTRACTION_VERSION
+
+
+def _target_names(
+    *,
+    model_cache: ModelSExprCache | None,
+    action_cache: ActionTraceCache | None,
+) -> list[str]:
+    """Name every cache this run writes, for the manifest."""
+    names = ["raw"]
+    if model_cache is not None:
+        names.append("model_sexpr_v2")
+    if action_cache is not None:
+        names.append(action_cache.SIDECAR_DIR)
+    return names
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -1020,11 +1127,9 @@ async def _extract_file_with_client(
     action_cache: ActionTraceCache | None = None,
 ) -> dict[str, object]:
     def row_is_cached(row: DatasetRow) -> bool:
-        if action_cache is not None:
-            return _row_is_action_cached(cache, action_cache, row)
-        if model_cache is not None:
-            return _row_is_model_cached(cache, model_cache, row)
-        return _row_is_cached(cache, row)
+        return _row_targets_cached(
+            cache, row, model_cache=model_cache, action_cache=action_cache
+        )
 
     file_rows = [
         row for theorem_rows in theorem_groups.values() for row in theorem_rows
@@ -1072,67 +1177,46 @@ async def _extract_file_with_client(
                     phase="theorem_identity",
                     theorem=theorem,
                 )
-            aligned = _align_rows(theorem_rows, candidates)
-            if model_cache is None and action_cache is None:
-                records = [
-                    _make_record(row, candidate)
-                    for row, candidate in zip(theorem_rows, aligned)
-                ]
-            else:
-                raw_records = [
-                    cache.load_for_row(row, extractor_version=EXTRACTION_VERSION)
-                    for row in theorem_rows
-                ]
-                missing_raw = [
-                    row.row_index
-                    for row, raw_record in zip(theorem_rows, raw_records)
-                    if raw_record is None
-                ]
-                if missing_raw:
-                    raise SourceExtractionError(
-                        "Normalized enrichment requires validated raw records; "
-                        f"missing rows: {missing_raw}",
-                        phase="raw_cache_missing",
-                        theorem=theorem,
-                    )
-                if action_cache is not None:
-                    make_action_record = (
-                        _make_source_syntax_trace_record
-                        if isinstance(action_cache, SourceSyntaxTraceCache)
-                        else _make_action_trace_record
-                    )
-                    records = [
-                        make_action_record(row, candidate, raw_record)
-                        for row, candidate, raw_record in zip(
-                            theorem_rows, aligned, raw_records
-                        )
-                        if raw_record is not None
-                    ]
-                else:
-                    records = [
-                        _make_model_record(row, candidate, raw_record)
-                        for row, candidate, raw_record in zip(
-                            theorem_rows, aligned, raw_records
-                        )
-                        if raw_record is not None
-                    ]
-            # Validate every row in the theorem before committing any of them,
-            # so a capture error cannot leave a partial group.
-            uncached_indices = {row.row_index for row in uncached_rows}
-            for row, record in zip(theorem_rows, records):
-                if row.row_index in uncached_indices:
-                    if action_cache is not None:
-                        action_cache.save(row.split, row.row_index, record)
-                    elif model_cache is None:
-                        cache.save(row.split, row.row_index, record)
-                    else:
-                        model_cache.save(row.split, row.row_index, record)
-                    extracted_rows += 1
         except Exception as caught:
+            # Nothing was compiled, or the theorem has no compilation unit at
+            # all, so every one of its rows is genuinely lost.  These are the
+            # only failures that still cost a whole group.
             failure = _failure_record(caught, file_path, theorem, uncached_rows)
             failures.append(failure)
             failed_rows += len(uncached_rows)
             failure_phases[str(failure["phase"])] += len(uncached_rows)
+            continue
+
+        aligned = _align_rows(uncached_rows, candidates)
+        for row, candidate in zip(uncached_rows, aligned):
+            try:
+                if isinstance(candidate, SourceExtractionError):
+                    raise candidate
+                # Build every enabled record before saving any of them, so a
+                # capture error cannot leave one row half written.  The theorem
+                # is deliberately no longer the unit: one unalignable row used
+                # to void all of its neighbours, which is how 20658 otherwise
+                # extractable rows were lost.  Whole-theorem selection is still
+                # available to callers that need it -- build_sexpr_pilot's
+                # --require-cached-train skips a partly cached theorem, exactly
+                # as it already skipped a theorem holding a failed row.
+                records = _build_records(
+                    row,
+                    candidate,
+                    raw_cache=cache,
+                    model_cache=model_cache,
+                    action_cache=action_cache,
+                    resume=resume,
+                )
+                for target_cache, record in records:
+                    target_cache.save(row.split, row.row_index, record)
+            except Exception as caught:
+                failure = _failure_record(caught, file_path, theorem, [row])
+                failures.append(failure)
+                failed_rows += 1
+                failure_phases[str(failure["phase"])] += 1
+            else:
+                extracted_rows += 1
 
     return {
         "compiled": compiled,
@@ -1157,34 +1241,34 @@ async def extract_split_with_client(
     model_cache: ModelSExprCache | None = None,
     action_cache: ActionTraceCache | None = None,
 ) -> dict[str, object]:
-    if model_cache is not None and action_cache is not None:
-        raise ValueError("model_cache and action_cache are mutually exclusive.")
     clients = list(client) if isinstance(client, (list, tuple)) else [client]
     if not clients:
         raise ValueError("At least one Pantograph client is required.")
-    report_root = _report_root(
+    report_roots = _report_roots(
         prepared_root, model_cache=model_cache, action_cache=action_cache
     )
-    failure_path = report_root / "failures" / f"{split}.jsonl"
-    failure_path.parent.mkdir(parents=True, exist_ok=True)
-    failure_path.write_text("", encoding="utf-8")
+    failure_paths = [root / "failures" / f"{split}.jsonl" for root in report_roots]
+    for path in failure_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
 
     try:
         file_groups = _group_rows_by_file(rows)
     except Exception as exc:
         file_groups = {}
         failure = _failure_record(exc, "", getattr(exc, "theorem", ""), rows)
-        failure_path.write_text(json.dumps(failure, ensure_ascii=False) + "\n", encoding="utf-8")
+        for path in failure_paths:
+            path.write_text(
+                json.dumps(failure, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
         failure_phases = Counter({str(failure["phase"]): len(rows)})
         cached_rows = extracted_rows = compiled_files = 0
         failed_rows = len(rows)
     else:
         def row_is_cached(row: DatasetRow) -> bool:
-            if action_cache is not None:
-                return _row_is_action_cached(cache, action_cache, row)
-            if model_cache is not None:
-                return _row_is_model_cached(cache, model_cache, row)
-            return _row_is_cached(cache, row)
+            return _row_targets_cached(
+                cache, row, model_cache=model_cache, action_cache=action_cache
+            )
 
         cached_rows = sum(1 for row in rows if resume and row_is_cached(row))
         extracted_rows = failed_rows = compiled_files = 0
@@ -1276,8 +1360,10 @@ async def extract_split_with_client(
                 failed_rows += int(result["failed_rows"])
                 failure_phases.update(result["failure_phases"])
                 for failure in result["failures"]:
-                    with failure_path.open("a", encoding="utf-8") as handle:
-                        handle.write(json.dumps(failure, ensure_ascii=False, sort_keys=True) + "\n")
+                    encoded = json.dumps(failure, ensure_ascii=False, sort_keys=True)
+                    for path in failure_paths:
+                        with path.open("a", encoding="utf-8") as handle:
+                            handle.write(encoded + "\n")
                     console_print(
                         f"  [{split}] failed {failure['theorem']}: "
                         f"{failure['phase']}: {failure['error']}"
@@ -1303,6 +1389,9 @@ async def extract_split_with_client(
     manifest: dict[str, object] = {
         "schema_version": schema_version,
         "extractor_version": extractor_version,
+        "enabled_targets": _target_names(
+            model_cache=model_cache, action_cache=action_cache
+        ),
         "dataset": rows[0].dataset_name if rows else None,
         "source_commit": expected_commit,
         "split": split,
@@ -1318,9 +1407,16 @@ async def extract_split_with_client(
         "covered_rows": covered_rows,
         "coverage": covered_rows / attempted_rows if attempted_rows else 0.0,
         "failure_phases": dict(sorted(failure_phases.items())),
-        "failure_log": str(failure_path),
+        "failure_log": str(failure_paths[0]),
+        "failure_logs": [str(path) for path in failure_paths],
     }
-    _write_json(report_root / "manifests" / f"{split}.json", manifest)
+    for root, path in zip(report_roots, failure_paths):
+        # Each generation's manifest points at the failure log in its own tree,
+        # so a consumer reading one root never has to look inside another.
+        _write_json(
+            root / "manifests" / f"{split}.json",
+            {**manifest, "failure_log": str(path)},
+        )
     return manifest
 
 
@@ -1337,19 +1433,10 @@ def _git_head(source_root: Path) -> str:
 async def extract_sexpressions(
     config: SExprExtractionConfig, *, client_factory=None
 ) -> dict[str, object]:
-    enabled_modes = [
-        name
-        for name, enabled in (
-            ("model_sexprs", config.model_sexprs),
-            ("action_traces", config.action_traces),
-            ("source_syntax_traces", config.source_syntax_traces),
-        )
-        if enabled
-    ]
-    if len(enabled_modes) > 1:
+    if config.action_traces and config.source_syntax_traces:
         raise ValueError(
-            "model_sexprs, action_traces and source_syntax_traces are mutually "
-            f"exclusive; received: {enabled_modes}."
+            "action_traces and source_syntax_traces both write an action-trace "
+            "sidecar and cannot be combined; run them in separate passes."
         )
     if config.selection_manifest is not None and config.sample_per_split is not None:
         raise ValueError(
@@ -1479,6 +1566,9 @@ async def extract_sexpressions(
     summary: dict[str, object] = {
         "schema_version": schema_version,
         "extractor_version": extractor_version,
+        "enabled_targets": _target_names(
+            model_cache=model_cache, action_cache=action_cache
+        ),
         "dataset": config.dataset_name,
         "source_root": str(source_root),
         "source_commit": config.expected_commit,
@@ -1499,9 +1589,9 @@ async def extract_sexpressions(
             else None
         ),
     }
-    report_root = _report_root(
+    for report_root in _report_roots(
         config.prepared_root, model_cache=model_cache, action_cache=action_cache
-    )
-    _write_json(report_root / "summary.json", summary)
-    _write_summary_markdown(report_root / "summary.md", summary)
+    ):
+        _write_json(report_root / "summary.json", summary)
+        _write_summary_markdown(report_root / "summary.md", summary)
     return summary

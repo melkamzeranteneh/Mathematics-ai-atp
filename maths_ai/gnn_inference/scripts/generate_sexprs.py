@@ -28,7 +28,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Compile each original Mathlib file and cache the authentic "
-            "S-expression state recorded at every matched tactic invocation."
+            "S-expression state recorded at every matched tactic invocation. "
+            "The output flags combine: Pantograph returns every payload on each "
+            "invocation, so --model-sexprs and --source-syntax-traces together "
+            "cost one file compile rather than one each."
         )
     )
     parser.add_argument(
@@ -106,8 +109,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Compile with the fork's Lean-native normalizer and write versioned "
-            "model_sexpr_v2 sidecars. Existing validated raw caches are required "
-            "and are never overwritten."
+            "model_sexpr_v2 sidecars. The raw record they are bound to is "
+            "produced by the same compile when it is missing, and an existing "
+            "validated raw cache is never overwritten."
         ),
     )
     parser.add_argument(
@@ -115,8 +119,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Write digest-bound action_trace_v2 sidecars containing Lean-elaborated "
-            "tactic-term trees and stable local-context indices. Existing validated "
-            "raw caches are required and are never overwritten."
+            "tactic-term trees and stable local-context indices. Cannot be "
+            "combined with --source-syntax-traces, which writes the other "
+            "action-trace generation."
         ),
     )
     parser.add_argument(
@@ -133,19 +138,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    enabled_modes = [
-        flag
-        for flag, enabled in (
-            ("--model-sexprs", args.model_sexprs),
-            ("--action-traces", args.action_traces),
-            ("--source-syntax-traces", args.source_syntax_traces),
-        )
-        if enabled
-    ]
-    if len(enabled_modes) > 1:
+    if args.action_traces and args.source_syntax_traces:
         print(
-            "S-expression extraction failed: "
-            f"{', '.join(enabled_modes)} are mutually exclusive."
+            "S-expression extraction failed: --action-traces and "
+            "--source-syntax-traces both write an action-trace sidecar and "
+            "cannot be combined; run them in separate passes."
         )
         return 1
     config = SExprExtractionConfig(

@@ -151,6 +151,43 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
             }
         ]
 
+    def _traced_units(self) -> tuple[list[dict[str, object]], str]:
+        """Units carrying the payloads the derived generations read."""
+        source_syntax = json.dumps(
+            {
+                "tag": "node",
+                "kind": "Lean.Parser.Tactic.exact",
+                "source": "exact p",
+                "sourceStart": 40,
+                "sourceEnd": 47,
+                "children": [
+                    {"tag": "atom", "source": "exact", "sourceStart": 40, "sourceEnd": 45},
+                    {
+                        "tag": "identifier",
+                        "source": "p",
+                        "semanticRole": "local",
+                        "contextIndex": 0,
+                        "sourceStart": 46,
+                        "sourceEnd": 47,
+                    },
+                ],
+            },
+            separators=(",", ":"),
+        )
+        units = self._units()
+        for invocation in units[0]["invocations"]:
+            invocation["sourceSyntax"] = source_syntax
+            invocation["terms"] = [
+                {
+                    "source": "p",
+                    "syntaxKind": "ident",
+                    "sourceStart": 46,
+                    "sourceEnd": 47,
+                    "actionSexp": "(:local FV0)",
+                }
+            ]
+        return units, source_syntax
+
     async def _extract(self, client: _FakeClient, rows=None, *, resume=True):
         return await extract_split_with_client(
             client,
@@ -317,39 +354,7 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_source_syntax_enrichment_keeps_compact_tree_beside_v2_traces(self):
-        source_syntax = json.dumps(
-            {
-                "tag": "node",
-                "kind": "Lean.Parser.Tactic.exact",
-                "source": "exact p",
-                "sourceStart": 40,
-                "sourceEnd": 47,
-                "children": [
-                    {"tag": "atom", "source": "exact", "sourceStart": 40, "sourceEnd": 45},
-                    {
-                        "tag": "identifier",
-                        "source": "p",
-                        "semanticRole": "local",
-                        "contextIndex": 0,
-                        "sourceStart": 46,
-                        "sourceEnd": 47,
-                    },
-                ],
-            },
-            separators=(",", ":"),
-        )
-        units = self._units()
-        for invocation in units[0]["invocations"]:
-            invocation["sourceSyntax"] = source_syntax
-            invocation["terms"] = [
-                {
-                    "source": "p",
-                    "syntaxKind": "ident",
-                    "sourceStart": 46,
-                    "sourceEnd": 47,
-                    "actionSexp": "(:local FV0)",
-                }
-            ]
+        units, source_syntax = self._traced_units()
         await self._extract(_FakeClient(units))
         raw_before = self.cache.load("train", 10)
         v2_cache = ActionTraceCache(self.root / "prepared")
@@ -431,7 +436,7 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manifest["failure_phases"], {"source_syntax_capture": 2})
         self.assertIsNone(v3_cache.load("train", 10))
 
-    async def test_action_enrichment_requires_validated_raw_records(self):
+    async def test_action_enrichment_produces_the_raw_record_it_binds_to(self):
         action_cache = ActionTraceCache(self.root / "prepared")
         manifest = await extract_split_with_client(
             _FakeClient(self._units()),
@@ -443,9 +448,115 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
             split="train",
         )
 
-        self.assertEqual(manifest["failed_rows"], 2)
-        self.assertEqual(manifest["failure_phases"], {"raw_cache_missing": 2})
-        self.assertIsNone(action_cache.load("train", 10))
+        # The elaboration that yields a sidecar also yields the raw record the
+        # sidecar is bound to, so a missing raw cache is no longer a failure.
+        self.assertEqual(manifest["failed_rows"], 0)
+        self.assertEqual(manifest["extracted_rows"], 2)
+        raw_record = self.cache.load("train", 10)
+        self.assertIsNotNone(raw_record)
+        self.assertIsNotNone(action_cache.load_for_raw_record("train", 10, raw_record))
+
+    async def test_one_compile_writes_raw_and_both_derived_generations(self):
+        units, source_syntax = self._traced_units()
+        client = _FakeClient(units)
+        model_cache = ModelSExprCache(self.root / "prepared")
+        v3_cache = SourceSyntaxTraceCache(self.root / "prepared")
+
+        manifest = await extract_split_with_client(
+            client,
+            rows=self.rows,
+            cache=self.cache,
+            model_cache=model_cache,
+            action_cache=v3_cache,
+            prepared_root=self.root / "prepared",
+            source_root=self.source_root,
+            split="train",
+        )
+
+        # Pantograph returns every payload on each invocation, so the three
+        # generations cost one file compile between them rather than one each.
+        self.assertEqual(client.files, [self.file_path])
+        self.assertEqual(manifest["compiled_files"], 1)
+        self.assertEqual(manifest["extracted_rows"], 2)
+        self.assertEqual(manifest["failed_rows"], 0)
+        self.assertEqual(
+            manifest["enabled_targets"], ["raw", "model_sexpr_v2", "action_trace_v3"]
+        )
+        for row_index in (10, 11):
+            raw_record = self.cache.load("train", row_index)
+            self.assertIsNotNone(raw_record)
+            model_sidecar = model_cache.load_for_raw_record(
+                "train", row_index, raw_record
+            )
+            v3_sidecar = v3_cache.load_for_raw_record("train", row_index, raw_record)
+            # Both sidecars are bound to the raw record this same pass wrote.
+            self.assertIsNotNone(model_sidecar)
+            self.assertIsNotNone(v3_sidecar)
+            digest = ModelSExprCache.raw_record_sha256(raw_record)
+            self.assertEqual(model_sidecar["raw_record_sha256"], digest)
+            self.assertEqual(v3_sidecar["raw_record_sha256"], digest)
+        self.assertEqual(
+            v3_cache.load("train", 10)["source_syntax"], json.loads(source_syntax)
+        )
+
+    async def test_combined_run_reports_into_every_enabled_root(self):
+        units, _ = self._traced_units()
+        model_cache = ModelSExprCache(self.root / "prepared")
+        v3_cache = SourceSyntaxTraceCache(self.root / "prepared")
+
+        await extract_split_with_client(
+            _FakeClient(units),
+            rows=self.rows,
+            cache=self.cache,
+            model_cache=model_cache,
+            action_cache=v3_cache,
+            prepared_root=self.root / "prepared",
+            source_root=self.source_root,
+            split="train",
+        )
+
+        # Each consumer reads the manifest from its own generation's root, so a
+        # combined run has to write the same counts into all of them.
+        for report_root in (
+            SExprCache.REPORT_ROOT,
+            ModelSExprCache.REPORT_ROOT,
+            SourceSyntaxTraceCache.REPORT_ROOT,
+        ):
+            manifest_path = (
+                self.root / "prepared" / report_root / "manifests" / "train.json"
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["covered_rows"], 2)
+            self.assertEqual(
+                manifest["enabled_targets"],
+                ["raw", "model_sexpr_v2", "action_trace_v3"],
+            )
+            # The failure log a manifest names lives in the manifest's own tree.
+            self.assertEqual(
+                Path(manifest["failure_log"]),
+                self.root / "prepared" / report_root / "failures" / "train.jsonl",
+            )
+            self.assertTrue(Path(manifest["failure_log"]).exists())
+
+    async def test_combined_run_never_rewrites_a_validated_raw_record(self):
+        units, _ = self._traced_units()
+        await self._extract(_FakeClient(units))
+        raw_path = self.root / "prepared" / "train" / "sexpr" / "000000010.json"
+        raw_before = raw_path.read_text(encoding="utf-8")
+
+        manifest = await extract_split_with_client(
+            _FakeClient(units),
+            rows=self.rows,
+            cache=self.cache,
+            model_cache=ModelSExprCache(self.root / "prepared"),
+            action_cache=SourceSyntaxTraceCache(self.root / "prepared"),
+            prepared_root=self.root / "prepared",
+            source_root=self.source_root,
+            split="train",
+        )
+
+        self.assertEqual(manifest["extracted_rows"], 2)
+        self.assertEqual(raw_path.read_text(encoding="utf-8"), raw_before)
 
     async def test_target_state_change_invalidates_cache_and_alignment(self):
         await self._extract(_FakeClient(self._units()))
@@ -554,25 +665,64 @@ class SExprExtractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(self.cache.load("train", 10))
         self.assertIsNotNone(self.cache.load("train", 11))
 
-    async def test_capture_failure_commits_no_partial_theorem(self):
+    async def test_capture_failure_costs_only_its_own_row(self):
         units = self._units()
         units[0]["invocations"][1]["goalsBefore"][0]["target"].pop("sexp")
         manifest = await self._extract(_FakeClient(units))
 
-        self.assertEqual(manifest["failed_rows"], 2)
-        self.assertEqual(manifest["failure_phases"], {"sexpr_capture": 2})
-        self.assertIsNone(self.cache.load("train", 10))
+        # The theorem is not the unit of failure: the row whose state could not
+        # be serialized is lost, and its neighbour is still committed.
+        self.assertEqual(manifest["extracted_rows"], 1)
+        self.assertEqual(manifest["failed_rows"], 1)
+        self.assertEqual(manifest["failure_phases"], {"sexpr_capture": 1})
+        self.assertIsNotNone(self.cache.load("train", 10))
         self.assertIsNone(self.cache.load("train", 11))
 
-    async def test_reported_pantograph_capture_error_commits_no_partial_theorem(self):
+    async def test_reported_pantograph_capture_error_costs_only_its_own_row(self):
         units = self._units()
         units[0]["invocations"][1]["captureError"] = "synthetic serializer failure"
         manifest = await self._extract(_FakeClient(units))
 
-        self.assertEqual(manifest["failed_rows"], 2)
-        self.assertEqual(manifest["failure_phases"], {"sexpr_capture": 2})
-        self.assertIsNone(self.cache.load("train", 10))
+        self.assertEqual(manifest["extracted_rows"], 1)
+        self.assertEqual(manifest["failed_rows"], 1)
+        self.assertEqual(manifest["failure_phases"], {"sexpr_capture": 1})
+        self.assertIsNotNone(self.cache.load("train", 10))
         self.assertIsNone(self.cache.load("train", 11))
+
+    async def test_unalignable_row_does_not_void_its_neighbours(self):
+        third = DatasetRow(
+            **{
+                **self.rows[1].__dict__,
+                "state": "p : Prop\n⊢ Third p",
+                "target_state": "p : Prop\n⊢ Fourth p",
+                "tactic": "conclude",
+                "row_index": 12,
+            }
+        )
+        rows = [self.rows[0], third, self.rows[1]]
+        manifest = await self._extract(_FakeClient(self._units()), rows)
+
+        self.assertEqual(manifest["extracted_rows"], 2)
+        self.assertEqual(manifest["failed_rows"], 1)
+        self.assertEqual(manifest["failure_phases"], {"invocation_alignment": 1})
+        self.assertIsNotNone(self.cache.load("train", 10))
+        self.assertIsNotNone(self.cache.load("train", 11))
+        self.assertIsNone(self.cache.load("train", 12))
+        failures = [
+            json.loads(line)
+            for line in (
+                self.root
+                / "prepared"
+                / "sexpr_extraction"
+                / "failures"
+                / "train.jsonl"
+            )
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line
+        ]
+        self.assertEqual([failure["row_indices"] for failure in failures], [[12]])
+        self.assertEqual(failures[0]["failed_row_count"], 1)
 
     async def test_wrong_dataset_commit_is_rejected_before_compile(self):
         wrong = [DatasetRow(**{**self.rows[0].__dict__, "repo_commit": "wrong"})]
