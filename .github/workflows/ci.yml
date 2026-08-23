@@ -29,10 +29,21 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Install Lean
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | \
+            sh -s -- -y --default-toolchain leanprover/lean4:v4.29.1
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Lean installation
+        run: |
+          command -v lake
+          lake --version
+
       - name: Install dependencies
         run: uv sync --no-dev 
         
       - name: Install project 
         run: uv pip install -e . --no-deps 
       - name: Run tests
-        run: uv run pytest tests maths_ai -v --tb=short   
+        run: uv run pytest maths_ai -v --tb=short
