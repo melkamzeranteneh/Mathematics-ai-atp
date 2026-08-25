@@ -1,0 +1,114 @@
+# Mathematics AI ATP - Docker Compose Configuration
+#
+# Architecture:
+#   - asset-fetch: init service that downloads model+corpus from HF Hub once
+#   - core: batch joint-prover service
+#   - experimental: on-demand sandbox for experiments/ (profile: experimental)
+#   - training: batch job service for training (profile: training)
+#
+# Usage:
+#   docker compose up                                   # asset-fetch, then run the core proof job
+#   docker compose --profile experimental up experimental
+#   docker compose run --rm training prepare-dataset ...
+#   docker compose run --rm training train --stages baseline,pointer
+#
+# Volume layout:
+#   - models-corpus-cache: shared volume for model+corpus (read-only for core/experimental)
+#   - training-output: separate volume for training outputs
+
+services:
+  # Asset fetch service - runs once, downloads model+corpus from HuggingFace Hub
+  asset-fetch:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: core
+    container_name: maths_ai-asset-fetch
+    volumes:
+      - models-corpus-cache:/data
+    environment:
+      - MATHS_AI_DATA_ROOT=/data
+      - MATHS_AI_MODEL_CONFIG=/workspace/maths_ai/config/models/premise_gnn.yaml
+      - MATHS_AI_CORPUS_CONFIG=/workspace/maths_ai/config/corpus/lemma_corpus_v1.yaml
+      # Required while the HF repos are private; read from the host environment.
+      - HF_TOKEN=${HF_TOKEN:-}
+    entrypoint: ["python", "scripts/fetch_assets.py"]
+    networks:
+      - maths_ai_network
+
+  # Core service - batch joint prover
+  core:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: core
+    container_name: maths_ai-core
+    depends_on:
+      asset-fetch:
+        condition: service_completed_successfully
+    volumes:
+      - models-corpus-cache:/data:ro
+    environment:
+      - MATHS_AI_DATA_ROOT=/data
+      - MATHS_AI_MODEL_CONFIG=/workspace/maths_ai/config/models/premise_gnn.yaml
+      - MATHS_AI_CORPUS_CONFIG=/workspace/maths_ai/config/corpus/lemma_corpus_v1.yaml
+      - MATHS_AI_LEAN_PROJECT=/opt/lean_project
+    networks:
+      - maths_ai_network
+
+  # Experimental service - sandbox for experiments/, on demand
+  experimental:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: experimental
+    container_name: maths_ai-experimental
+    profiles:
+      - experimental
+    volumes:
+      - models-corpus-cache:/data:ro
+    environment:
+      - MATHS_AI_DATA_ROOT=/data
+      - MATHS_AI_MODEL_CONFIG=/workspace/maths_ai/config/models/premise_gnn.yaml
+      - MATHS_AI_CORPUS_CONFIG=/workspace/maths_ai/config/corpus/lemma_corpus_v1.yaml
+      - MATHS_AI_LEAN_PROJECT=/opt/lean_project
+    networks:
+      - maths_ai_network
+
+  # Training service - batch job, GPU-optional
+  training:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: training
+    container_name: maths_ai-training
+    profiles:
+      - training
+    volumes:
+      - models-corpus-cache:/data:ro
+      - training-output:/output
+    environment:
+      - MATHS_AI_DATA_ROOT=/data
+      - MATHS_AI_MODEL_CONFIG=/workspace/maths_ai/config/models/premise_gnn.yaml
+      - MATHS_AI_CORPUS_CONFIG=/workspace/maths_ai/config/corpus/lemma_corpus_v1.yaml
+      - MATHS_AI_LEAN_PROJECT=/opt/lean_project
+      - MATHS_AI_OUTPUT_DIR=/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - maths_ai_network
+
+volumes:
+  models-corpus-cache:
+    name: maths_ai-models-corpus-cache
+  training-output:
+    name: maths_ai-training-output
+
+networks:
+  maths_ai_network:
+    driver: bridge

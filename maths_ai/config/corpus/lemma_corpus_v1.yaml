@@ -1,0 +1,6 @@
+name: lemma_corpus_v1
+source: huggingface
+repo_type: dataset
+repo_id: iCog-Labs/LemmaCorpus-v1
+revision: v1.0.0
+local_subdir: gnn_inference/runs/lemma_corpus_v1

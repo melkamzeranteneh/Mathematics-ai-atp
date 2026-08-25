@@ -1,0 +1,6 @@
+name: pointer_gnn
+source: huggingface
+repo_type: model
+repo_id: iCog-Labs/PointerGNN
+revision: v1.0.0
+local_subdir: gnn_inference/runs/pointer_gnn
