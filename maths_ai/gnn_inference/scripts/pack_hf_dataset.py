@@ -285,6 +285,50 @@ def _iter_split_rows(
         yield _build_row(raw, model, trace)
 
 
+def _completed_shards(
+    split_root: Path, split: str, shard_rows: int
+) -> tuple[list[Path], int]:
+    """Existing full shards for a split, and the row count they already cover.
+
+    Packing a large split is a single long pass, so an interrupted run must not
+    force the whole split to be redone. Shards are only ever appended, and
+    ``_iter_split_rows`` walks row indices in sorted order, so a shard holding
+    exactly ``shard_rows`` rows is a complete, reusable prefix. A trailing short
+    shard is by definition the one that was being written when the run died: its
+    contents are a prefix of what the next shard should hold, but it cannot be
+    appended to, so it is discarded and rebuilt.
+    """
+    shards = sorted(split_root.glob(f"{split}-*.parquet"))
+    if not shards:
+        return [], 0
+
+    complete: list[Path] = []
+    for index, path in enumerate(shards):
+        try:
+            rows = pq.ParquetFile(path).metadata.num_rows
+        except Exception:
+            # Unreadable, most likely truncated mid-write.
+            rows = -1
+        if rows == shard_rows:
+            complete.append(path)
+            continue
+        if index != len(shards) - 1:
+            raise SystemExit(
+                f"{path.name} holds {rows} rows, expected {shard_rows}, and it "
+                "is not the last shard. Only the final shard may be short, so "
+                "this set was written with a different --shard-rows or is "
+                f"corrupt; delete {split_root} and pack this split again."
+            )
+        # The final shard is either short because the split ended there or
+        # truncated because the run was killed mid-write. The two are
+        # indistinguishable from disk, so it is always discarded and rebuilt.
+        path.unlink()
+
+    for path in shards[len(complete) :]:
+        path.unlink(missing_ok=True)
+    return complete, len(complete) * shard_rows
+
+
 def pack_split(
     prepared_root: Path,
     output_root: Path,
@@ -293,6 +337,7 @@ def pack_split(
     shard_rows: int,
     batch_rows: int,
     compression: str,
+    resume: bool,
 ) -> dict[str, object]:
     stats = {
         "emitted": 0,
@@ -303,10 +348,19 @@ def pack_split(
     split_root = output_root / split
     split_root.mkdir(parents=True, exist_ok=True)
 
-    # Shards are named with a placeholder total and renamed once the final count
-    # is known, because the Hugging Face convention encodes the total in the
-    # filename and the row count is not known before the walk completes.
-    shard_paths: list[Path] = []
+    if resume:
+        shard_paths, resumed_rows = _completed_shards(split_root, split, shard_rows)
+    else:
+        for stale in split_root.glob(f"{split}-*.parquet"):
+            stale.unlink()
+        shard_paths, resumed_rows = [], 0
+    if resumed_rows:
+        print(
+            f"{split}: resuming after {resumed_rows} rows in "
+            f"{len(shard_paths)} complete shards",
+            flush=True,
+        )
+
     writer: pq.ParquetWriter | None = None
     rows_in_shard = 0
     batch: list[dict[str, object]] = []
@@ -329,13 +383,19 @@ def pack_split(
         writer = None
         rows_in_shard = 0
 
+    partial_path: Path | None = None
     try:
         for row in _iter_split_rows(prepared_root, split, stats):
+            # Rows already covered by complete shards are re-read but not
+            # rewritten. Re-reading them is the price of not tracking a
+            # separate cursor that could disagree with the shards on disk.
+            if stats["emitted"] <= resumed_rows:
+                continue
             if writer is None:
-                shard_path = split_root / f"shard-{len(shard_paths):05d}.parquet"
-                shard_paths.append(shard_path)
+                partial_path = split_root / f"{split}-{len(shard_paths):05d}.parquet"
+                shard_paths.append(partial_path)
                 writer = pq.ParquetWriter(
-                    shard_path, SCHEMA, compression=compression
+                    partial_path, SCHEMA, compression=compression
                 )
             batch.append(row)
             rows_in_shard += 1
@@ -343,34 +403,33 @@ def pack_split(
                 flush_batch()
             if rows_in_shard >= shard_rows:
                 close_shard()
+                partial_path = None
             if stats["emitted"] % 25_000 == 0:
                 print(f"{split}: packed {stats['emitted']} rows", flush=True)
         close_shard()
+        partial_path = None
     except BaseException:
-        # A half-written shard is worse than no shard: it would be uploaded and
-        # read as a short split. Remove it and let the caller re-run.
+        # Leave only complete shards behind. A truncated shard would otherwise
+        # be counted as complete on the next resume and silently drop rows.
         if writer is not None:
             writer.close()
-            shard_paths[-1].unlink(missing_ok=True)
+        if partial_path is not None:
+            partial_path.unlink(missing_ok=True)
         raise
 
-    total = len(shard_paths)
-    final_names = []
-    for index, path in enumerate(shard_paths):
-        final = split_root / f"{split}-{index:05d}-of-{total:05d}.parquet"
-        path.replace(final)
-        final_names.append(final.name)
-
-    bytes_written = sum((split_root / name).stat().st_size for name in final_names)
+    shard_names = sorted(path.name for path in split_root.glob(f"{split}-*.parquet"))
+    bytes_written = sum(
+        (split_root / name).stat().st_size for name in shard_names
+    )
     print(
-        f"{split}: {stats['emitted']} rows in {total} shards "
+        f"{split}: {stats['emitted']} rows in {len(shard_names)} shards "
         f"({bytes_written / 1e9:.2f} GB)",
         flush=True,
     )
     return {
         "split": split,
         "rows": stats["emitted"],
-        "shards": final_names,
+        "shards": shard_names,
         "bytes": bytes_written,
         "skipped": {
             key: value for key, value in stats.items() if key != "emitted"
@@ -427,6 +486,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["zstd", "snappy", "gzip", "brotli", "none"],
         help="Parquet codec. S-expression text is repetitive, so zstd wins.",
     )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help=(
+            "Repack from scratch, discarding existing shards. By default an "
+            "interrupted run resumes from its complete shards, which matters "
+            "because packing a large split is a single long pass."
+        ),
+    )
     return parser
 
 
@@ -450,6 +518,7 @@ def main(argv: list[str] | None = None) -> int:
                 shard_rows=args.shard_rows,
                 batch_rows=args.batch_rows,
                 compression=args.compression,
+                resume=not args.no_resume,
             )
         )
 
