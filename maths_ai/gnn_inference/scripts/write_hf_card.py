@@ -311,6 +311,34 @@ def build_card(
         manifest = manifests.get(split)
         if not manifest:
             continue
+        attempted = int(manifest.get("attempted_rows", 0))
+        upstream = upstream_sizes.get(split, 0)
+        if upstream and attempted and attempted != upstream:
+            # A manifest is written per extraction run. If it attempted a
+            # different number of rows than the split holds, it describes some
+            # earlier partial run, and its phase counts are measured on a
+            # sample of unknown shape. Publishing them as the split's taxonomy
+            # would understate the missing rows by whatever factor the two
+            # counts differ by, so the table is withheld instead.
+            print(
+                f"Warning: manifest for '{split}' attempted {attempted:,} rows "
+                f"but the split has {upstream:,}; it is from an earlier run, so "
+                "its failure taxonomy is withheld from the card."
+            )
+            out += [
+                f"#### `{split}` -- per-phase breakdown unavailable",
+                "",
+                f"This split was extracted over several runs, and the manifest "
+                f"left on disk covers only {attempted:,} of its {upstream:,} "
+                "rows. Rather than report phase counts measured on that "
+                "fraction as if they described the split, they are omitted. The "
+                "aggregate coverage above is measured from the published rows "
+                "themselves and is exact; the causes listed under Coverage all "
+                "apply here, `goal_cardinality` and `file_compile` foremost, but "
+                "their relative sizes for this split are not established.",
+                "",
+            ]
+            continue
         phases = manifest.get("failure_phases") or {}
         if not phases:
             continue
