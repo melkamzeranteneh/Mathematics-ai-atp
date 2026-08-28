@@ -37,6 +37,7 @@ from maths_ai.api.schemas import (
     ProveRequest,
     ProveResponse,
 )
+from maths_ai.core.config import settings
 from maths_ai.pln_inference.model import PLNResult
 
 logger = logging.getLogger(__name__)
@@ -116,12 +117,30 @@ def create_app(service_factory: Optional[ServiceFactory] = None) -> FastAPI:
     @app.post("/prove", response_model=ProveResponse)
     async def prove(payload: ProveRequest, request: Request) -> ProveResponse:
         service = _get_service(request)
+        
+        # Use request timeout if provided, otherwise use service default
+        timeout = payload.timeout if payload.timeout is not None else settings.api_default_prove_timeout
+        
         try:
             graph = await service.prove(
                 payload.goal,
                 payload.hypotheses,
                 max_depth=payload.max_depth,
                 max_nodes=payload.max_nodes,
+                timeout=timeout,
+            )
+            return ProveResponse.from_graph(graph, timeout=False)
+        except asyncio.TimeoutError:
+            # For timeout, we return a 200 with timeout termination reason
+            # rather than a 408 error, so the client gets a proper response
+            # The proof lock has already been released by the service layer
+            from maths_ai.api.schemas import ProofTerminationReason
+            return ProveResponse(
+                solved=False,
+                exhausted=False,
+                termination_reason=ProofTerminationReason.TIMEOUT,
+                proof_trace=None,
+                summary={"error": "timeout"},
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"invalid goal or hypotheses: {exc}") from exc
@@ -129,7 +148,6 @@ def create_app(service_factory: Optional[ServiceFactory] = None) -> FastAPI:
             raise
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"proof search failed: {exc}") from exc
-        return ProveResponse.from_graph(graph)
 
     @app.post("/gnn/predict_tactic", response_model=PredictTacticResponse)
     async def predict_tactic(payload: PredictTacticRequest, request: Request) -> PredictTacticResponse:

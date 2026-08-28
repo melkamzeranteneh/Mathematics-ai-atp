@@ -219,6 +219,32 @@ def test_prove_persists_dts_state_after_search(api):
     assert api.dts_state_path.exists()
 
 
+def test_prove_timeout_returns_timeout_termination_reason(api):
+    import asyncio
+
+    async def slow_prove(goal, *, hypotheses=None):
+        await asyncio.sleep(0.05)
+        return api.reasoner.graph
+
+    api.reasoner.prove = slow_prove
+
+    response = api.client.post("/prove", json={"goal": "Or q p", "timeout": 0.01})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["solved"] is False
+    assert body["exhausted"] is False
+    assert body["termination_reason"] == "timeout"
+    assert body["proof_trace"] is None
+    assert body["summary"] == {"error": "timeout"}
+
+
+def test_prove_rejects_non_positive_timeout(api):
+    response = api.client.post("/prove", json={"goal": "Or q p", "timeout": 0})
+
+    assert response.status_code == 422
+
+
 def test_prove_rejects_empty_goal(api):
     for bad_goal in ("", "   "):
         response = api.client.post("/prove", json={"goal": bad_goal})

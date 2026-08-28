@@ -1,5 +1,6 @@
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Optional
 import os
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
@@ -83,5 +84,11 @@ class Settings:
     dts_state_file: Path = DTS_STATE_FILE
     dts_default_c: float = DTS_DEFAULT_C
     dts_default_seed: int = DTS_DEFAULT_SEED
+    
+    # API server settings
+    api_host: str = os.getenv("MATHS_AI_API_HOST", "0.0.0.0")
+    api_port: int = int(os.getenv("MATHS_AI_API_PORT", "8000"))
+    api_prove_timeout: Optional[float] = None  # Per-request prove timeout (None = no timeout)
+    api_default_prove_timeout: float = float(os.getenv("MATHS_AI_API_PROVE_TIMEOUT", "60.0"))
 
 settings = Settings()

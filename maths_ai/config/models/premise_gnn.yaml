@@ -3,4 +3,4 @@ source: huggingface
 repo_type: model
 repo_id: Melkamzer/iCog-Labs
 revision: v1.0.0
-local_subdir: gnn_inference/runs/premise_gnn
+local_subdir: gnn_inference/runs/sexpr_pointer_pipeline/premise_gnn

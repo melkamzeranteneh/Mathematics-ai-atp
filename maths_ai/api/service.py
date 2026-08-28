@@ -5,10 +5,10 @@ PLN chainer and Pantograph executor all loaded once at startup) and adds the
 concurrency machinery the HTTP surface needs:
 
 * a single shared Pantograph ``Server`` process — proof searches are
-  serialized behind an asyncio lock because the server's goal-state handles
-  and the DTS sampler are stateful and not safe to interleave. Individual
-  GNN/PLN calls are read-only with respect to that state and run in worker
-  threads instead;
+  serialized behind a proof/runtime asyncio lock because the server's goal-state
+  handles and the DTS sampler are stateful and not safe to interleave;
+* separate GNN and PLN locks for component-scoped synchronization, allowing
+  standalone GNN/PLN calls to proceed concurrently with proof searches;
 * concurrency-safe access to the DTS state file: every persist/load goes
   through its own lock, so concurrent ``/prove`` requests can't corrupt it.
 
@@ -34,11 +34,27 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class InferenceService:
-    """Owns the loaded inference components plus the API-level locks."""
+    """Owns the loaded inference components plus the API-level locks.
+    
+    Concurrency contract:
+    - ``proof_lock``: held start-to-finish around each ``/prove`` call, including
+      all GNN/PLN search iterations and DTS persistence. Protects the shared
+      Pantograph Server and DTS sampler state.
+    - ``gnn_lock``: protects GNN model inference; acquired by standalone
+      ``/gnn/predict_tactic`` and by proof search when calling GNN.
+    - ``pln_lock``: protects PLN inference; acquired by standalone ``/pln/evaluate``
+      and by proof search when calling PLN.
+    - ``dts_lock``: protects atomic DTS state file writes.
+    
+    This allows standalone GNN/PLN calls to proceed during proof searches
+    (subject to their component locks), while proof searches cannot overlap.
+    """
 
     reasoner: Any  # HybridReasoner; typed loosely so fakes can stand in
     dts_state_path: Path = field(default_factory=lambda: settings.dts_state_file)
-    prove_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    proof_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    gnn_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    pln_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     dts_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def prove(
@@ -47,30 +63,73 @@ class InferenceService:
         hypotheses: Optional[List[str]] = None,
         max_depth: Optional[int] = None,
         max_nodes: Optional[int] = None,
+        timeout: Optional[float] = None,
     ):
         """Run one full hybrid proof search, serially.
 
         Per-request depth/node-budget overrides are applied inside the lock
         and restored afterwards — safe because searches never overlap.
+        
+        The proof_lock is held for the entire duration, including GNN/PLN
+        calls and DTS persistence, because the shared Pantograph Server and
+        DTS sampler are stateful and cannot be safely interleaved.
+        
+        Args:
+            goal: Lean goal expression to prove.
+            hypotheses: Optional list of hypothesis strings.
+            max_depth: Per-request override of the search branch-depth bound.
+            max_nodes: Per-request override of the total hypergraph-size bound.
+            timeout: Optional per-request timeout in seconds. If provided,
+                the proof search will be cancelled if it exceeds this duration.
+                Note: this is cooperative - in-flight thread operations will
+                complete before cancellation takes effect.
+        
+        Returns:
+            ProofHypergraph with the search results.
+        
+        Raises:
+            asyncio.TimeoutError: If the proof search exceeds the timeout.
         """
-        async with self.prove_lock:
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive")
+        
+        async with self.proof_lock:
             saved = (self.reasoner.max_depth, self.reasoner.max_nodes)
             try:
                 if max_depth is not None:
                     self.reasoner.max_depth = max_depth
                 if max_nodes is not None:
                     self.reasoner.max_nodes = max_nodes
-                graph = await self.reasoner.prove(goal, hypotheses=hypotheses)
+                
+                if timeout is not None:
+                    graph = await asyncio.wait_for(
+                        self.reasoner.prove(goal, hypotheses=hypotheses),
+                        timeout=timeout,
+                    )
+                else:
+                    graph = await self.reasoner.prove(goal, hypotheses=hypotheses)
             finally:
                 self.reasoner.max_depth, self.reasoner.max_nodes = saved
         await self.persist_dts_state()
         return graph
 
     async def predict_tactics(self, goal: str, top_k: int) -> List[TacticCandidate]:
-        return await asyncio.to_thread(self.reasoner.gnn_engine.inference, goal, top_k=top_k)
+        """Predict tactics for a goal using the GNN engine.
+        
+        Uses the GNN lock to prevent concurrent access to the shared
+        torch/model object.
+        """
+        async with self.gnn_lock:
+            return await asyncio.to_thread(self.reasoner.gnn_engine.inference, goal, top_k=top_k)
 
     async def evaluate(self, expression: str, hypotheses: Optional[List[str]] = None) -> PLNResult:
-        return await asyncio.to_thread(self.reasoner.petta_chainer.evaluate, expression, hypotheses=hypotheses)
+        """Evaluate an expression using PLN inference.
+        
+        Uses the PLN lock to prevent concurrent access to the shared
+        PLN inference state (fallback RNG, subprocess-facing state).
+        """
+        async with self.pln_lock:
+            return await asyncio.to_thread(self.reasoner.petta_chainer.evaluate, expression, hypotheses=hypotheses)
 
     async def persist_dts_state(self) -> None:
         """Persist the DTS sampler under the state-file lock.

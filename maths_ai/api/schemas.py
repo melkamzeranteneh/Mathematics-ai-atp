@@ -6,11 +6,23 @@ of duplicating them: API consumers see exactly the shapes the inference
 components exchange internally.
 """
 
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
 from maths_ai.data_models.proof_components import STV, TacticCandidate
+
+
+class ProofTerminationReason(str, Enum):
+    """Explicit termination reason for a proof search."""
+    
+    SOLVED = "solved"              # Proof found successfully
+    EXHAUSTED = "exhausted"        # All branches exhausted, no solution
+    BUDGET_EXHAUSTED = "budget_exhausted"  # Hit max_nodes limit
+    DEPTH_EXHAUSTED = "depth_exhausted"  # Hit max_depth limit
+    TIMEOUT = "timeout"            # Per-request timeout exceeded
+    OPEN = "open"                  # Search incomplete, frontier not empty
 
 
 def _strip_or_raise(value: str, field_name: str) -> str:
@@ -41,6 +53,12 @@ class ProveRequest(BaseModel):
         default=None,
         ge=1,
         description="Per-request override of the total hypergraph-size bound.",
+    )
+    timeout: Optional[float] = Field(
+        default=None,
+        ge=0.001,
+        le=3600,
+        description="Per-request timeout in seconds. If not provided, uses the service default timeout.",
     )
 
     @field_validator("goal", mode="after")
@@ -80,19 +98,55 @@ class ProveResponse(BaseModel):
     ``proof_trace`` is ``None`` unless ``solved`` is true; ``summary``
     carries the full hypergraph dump (nodes/edges with statuses, ranks and
     STVs) for inspection when the search ended unsolved or hit its budget.
+    
+    ``termination_reason`` provides an explicit, authoritative reason for why
+    the search stopped, distinct from the inferred ``solved``/``exhausted``
+    flags. This is especially important for distinguishing between different
+    failure modes (e.g., timeout vs. budget exhaustion vs. open frontier).
     """
 
     solved: bool
     exhausted: bool
+    termination_reason: ProofTerminationReason
     proof_trace: Optional[ProofTraceNode] = None
     summary: Dict[str, Any]
 
     @classmethod
-    def from_graph(cls, graph: Any) -> "ProveResponse":
+    def from_graph(
+        cls, 
+        graph: Any, 
+        timeout: bool = False,
+    ) -> "ProveResponse":
+        """Construct a ProveResponse from a proof graph.
+        
+        Args:
+            graph: The ProofHypergraph from the search.
+            timeout: Whether the search was terminated due to a timeout.
+        
+        Returns:
+            A ProveResponse with appropriate termination reason.
+        """
         trace = graph.proof_trace()
+        solved = graph.is_solved()
+        exhausted = graph.is_exhausted()
+        
+        # Determine termination reason
+        if timeout:
+            termination_reason = ProofTerminationReason.TIMEOUT
+        elif solved:
+            termination_reason = ProofTerminationReason.SOLVED
+        elif exhausted:
+            # Check if we hit budget limits (this would need graph to expose this info)
+            # For now, we use EXHAUSTED as the default for exhausted searches
+            termination_reason = ProofTerminationReason.EXHAUSTED
+        else:
+            # Search stopped with open frontier (not exhausted, not solved)
+            termination_reason = ProofTerminationReason.OPEN
+        
         return cls(
-            solved=graph.is_solved(),
-            exhausted=graph.is_exhausted(),
+            solved=solved,
+            exhausted=exhausted,
+            termination_reason=termination_reason,
             proof_trace=ProofTraceNode.model_validate(trace) if trace is not None else None,
             summary=graph.summary(),
         )
