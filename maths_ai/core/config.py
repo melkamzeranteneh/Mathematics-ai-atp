@@ -32,19 +32,19 @@ DATA_DIR = ROOT_DIR / "data"
 # Defaults mirror the paths the CLI prover (joint_inference.py) historically
 # hardcoded; every one can be overridden via its environment variable (e.g. in
 # Docker or by the API service) instead of assuming CLI-relative locations.
-GNN_RUNS_DIR = DATA_ROOT / "gnn_inference" / "runs"
+GNN_RUNS_DIR = DATA_ROOT / "maths_ai" / "gnn_inference" / "runs"
 
 GNN_CONFIG_PATH = Path(
     os.getenv(
         "MATHS_AI_GNN_CONFIG",
-        str(GNN_RUNS_DIR / "pointer_gnn" / "best_run" / "config.json"),
+        str(GNN_RUNS_DIR / "sexpr_pointer_pipeline" / "pointer_gnn" / "config.json"),
     )
 )
 TACTIC_MODEL_PATH = Path(
-    os.getenv("MATHS_AI_TACTIC_MODEL", str(GNN_RUNS_DIR / "pointer_gnn" / "best_run" / "best.pt"))
+    os.getenv("MATHS_AI_TACTIC_MODEL", str(GNN_RUNS_DIR / "sexpr_pointer_pipeline" / "pointer_gnn" / "best.pt"))
 )
 ARGUMENT_MODEL_PATH = Path(
-    os.getenv("MATHS_AI_ARGUMENT_MODEL", str(GNN_RUNS_DIR / "premise_gnn" / "best_run" / "best.pt"))
+    os.getenv("MATHS_AI_ARGUMENT_MODEL", str(GNN_RUNS_DIR / "sexpr_pointer_pipeline" / "premise_gnn" / "best.pt"))
 )
 LEMMA_INDEX_PATH = Path(os.getenv("MATHS_AI_LEMMA_INDEX", str(GNN_RUNS_DIR / "lemma_index_v1")))
 LEMMA_CORPUS_PATH = Path(
