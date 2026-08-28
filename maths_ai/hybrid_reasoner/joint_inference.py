@@ -140,11 +140,12 @@ class HybridReasoner:
 
     def __init__(
         self,
-        config_path: Path,
-        tactic_model_path: Path,
-        argument_model_path: Path,
+        config_path: Optional[Path] = None,
+        tactic_model_path: Optional[Path] = None,
+        argument_model_path: Optional[Path] = None,
         *,
         executor: PantographExecutor,
+        bundle_dir: Optional[Path] = None,
         index_path: Optional[Path] = None,
         corpus_path: Optional[Path] = None,
         top_k_tactics: int = 3,
@@ -155,10 +156,14 @@ class HybridReasoner:
         dts_c: float = None,
         dts_random_seed: Optional[int] = None,
     ) -> None:
+        # Passing bundle_dir is preferred: a bundle carries the node and tactic
+        # vocabularies the weights were trained against and verifies them by
+        # hash, so no prepared dataset has to be present on the serving machine.
         self.gnn_engine = GNNModelEngine(
             config_path=config_path,
             tactic_predictor_model_path=tactic_model_path,
             argument_predictor_model_path=argument_model_path,
+            bundle_dir=bundle_dir,
             index_path=index_path,
             corpus_path=corpus_path,
         )

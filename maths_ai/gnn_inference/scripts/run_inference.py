@@ -14,19 +14,29 @@ if __package__ in {None, ""}:
         sys.path.insert(0, repo_root_str)
 
 from atp_lean_gnn.cli import DEMO_STATE
+from atp_lean_gnn.bundle import (
+    load_baseline_weights_into_pointer,
+    load_pointer_bundle,
+    load_state_dict_checked,
+)
 from atp_lean_gnn.inference import InferencePipeline
 from atp_lean_gnn.lemma_index import LemmaIndex
-from atp_lean_gnn.training import load_prepared_metadata, load_baseline_config, build_model
+from atp_lean_gnn.training import (
+    PreparedMetadata,
+    detect_state_dict_model_type,
+    load_baseline_config,
+    load_prepared_metadata,
+)
 from atp_lean_gnn.premise_scoring import PremiseScorer
 from atp_lean_gnn.lemma_corpus import load_lemma_corpus
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Interactive Tactic Inference")
-    parser.add_argument("--config", type=str, required=True, help="Path to config.json (e.g. from runs/baseline_gnn/run_*/config.json)")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to best.pt checkpoint (backbone + tactic model)")
+    parser.add_argument("--bundle", type=str, default=None, help="Path to an exported model bundle directory (preferred: it carries and verifies its own vocabularies, so no prepared dataset is needed)")
+    parser.add_argument("--config", type=str, default=None, help="Path to config.json (e.g. from runs/baseline_gnn/run_*/config.json). Not needed with --bundle.")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to best.pt checkpoint (backbone + tactic model). Not needed with --bundle.")
     parser.add_argument("--scorer-checkpoint", type=str, default=None, help="Path to a premise scorer checkpoint (best.pt from a premise_selection run). If omitted, the scorer uses random weights.")
-    parser.add_argument("--scorer-mode", type=str, default="dot", choices=["dot", "mlp"], help="Scorer mode")
     parser.add_argument("--index-path", type=str, help="Path to FAISS index. If missing, retrieval will return nothing.")
     parser.add_argument("--corpus-path", type=str, help="Path to lemmas.jsonl for decoding retrieved lemma IDs to names.")
     parser.add_argument("--k", type=int, default=500, help="Number of lemmas to retrieve")
@@ -36,62 +46,135 @@ def main(argv: list[str] | None = None) -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Loading on {device}...")
 
-    # Load baseline config and metadata
-    config_path = Path(args.config)
-    if not config_path.exists():
-        print(f"ERROR: config file not found: {config_path}")
-        return 1
+    scorer: PremiseScorer | None = None
+    if args.bundle:
+        bundle_dir = Path(args.bundle)
+        if not bundle_dir.exists():
+            print(f"ERROR: bundle directory not found: {bundle_dir}")
+            return 1
+        # A baseline bundle is wrapped into a pointer shell here, because
+        # InferencePipeline reaches through model.backbone.
+        loaded = load_pointer_bundle(bundle_dir, device=device)
+        model = loaded.model
+        metadata = loaded.metadata
+        hidden_dim = int(loaded.config.model.hidden_dim)
+        scorer = loaded.scorer
+        if loaded.randomly_initialized:
+            print(
+                f"WARNING: {bundle_dir} has no trained argument head; "
+                f"{', '.join(loaded.randomly_initialized)} is randomly initialized."
+            )
+    else:
+        if not args.config or not args.checkpoint:
+            print("ERROR: pass --bundle, or both --config and --checkpoint.")
+            return 1
 
-    config = load_baseline_config(config_path)
-    metadata = load_prepared_metadata(config.prepared_root)
+        config_path = Path(args.config)
+        if not config_path.exists():
+            print(f"ERROR: config file not found: {config_path}")
+            return 1
 
-    # Build and load model
-    from atp_lean_gnn.argument_selector import TacticWithArgsClassifier
-    
-    model = TacticWithArgsClassifier(
-        num_node_labels=len(metadata.node_vocab),
-        num_tactics=len(metadata.tactic_vocab),
-        hidden_dim=config.model.hidden_dim,
-        num_layers=config.model.num_layers,
-        dropout=config.model.dropout,
-        use_node_type=config.use_node_type,
-        max_args=getattr(config, "max_args", 3),
-    )
-    
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-    
-    # Adjust state dict keys if they come from a pure baseline (GraphSAGEStateClassifier)
-    # The pure baseline keys don't have the "backbone." prefix.
-    adjusted_state_dict = {}
-    for k, v in state_dict.items():
-        if not k.startswith("backbone.") and not k.startswith("tactic_embedding.") and not k.startswith("argument_selector."):
-            adjusted_state_dict[f"backbone.{k}"] = v
+        config = load_baseline_config(config_path)
+        hidden_dim = int(config.model.hidden_dim)
+
+        ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+
+        # Vocabularies come from the checkpoint when it has them; the config's
+        # prepared_root is a path from the training machine, which may be absent
+        # here or may now hold a rebuilt corpus whose vocabulary is a different
+        # mapping of the same size -- that loads without error and mislabels
+        # every prediction.
+        embedded_node_vocab = ckpt.get("node_vocab") if isinstance(ckpt, dict) else None
+        embedded_tactic_vocab = ckpt.get("tactic_vocab") if isinstance(ckpt, dict) else None
+        if isinstance(embedded_node_vocab, dict) and isinstance(embedded_tactic_vocab, dict):
+            metadata = PreparedMetadata.from_vocabs(
+                node_vocab={str(k): int(v) for k, v in embedded_node_vocab.items()},
+                tactic_vocab={str(k): int(v) for k, v in embedded_tactic_vocab.items()},
+            )
         else:
-            adjusted_state_dict[k] = v
-            
-    model.load_state_dict(adjusted_state_dict, strict=False)
-    model = model.to(device)
+            try:
+                metadata = load_prepared_metadata(config.prepared_root)
+            except (FileNotFoundError, ValueError) as exc:
+                print(
+                    f"ERROR: checkpoint '{args.checkpoint}' does not carry its "
+                    "vocabularies and they could not be read from the prepared dataset "
+                    f"at '{config.prepared_root}': {exc}\n"
+                    "Export a bundle with scripts/export_model_bundle.py and pass "
+                    "--bundle instead."
+                )
+                return 1
+
+        from atp_lean_gnn.argument_selector import TacticWithArgsClassifier
+
+        model = TacticWithArgsClassifier(
+            num_node_labels=len(metadata.node_vocab),
+            num_tactics=len(metadata.tactic_vocab),
+            hidden_dim=config.model.hidden_dim,
+            num_layers=config.model.num_layers,
+            dropout=config.model.dropout,
+            use_node_type=config.use_node_type,
+            max_args=getattr(config, "max_args", 3),
+            gnn_type=config.gnn_type,
+            heads=getattr(config.model, "heads", 8),
+            readout=getattr(config.model, "readout", "state"),
+        )
+
+        # Decide from the weights' own key structure whether this is a baseline
+        # to be wrapped or a pointer to be loaded as-is, then load strictly. The
+        # previous version prefixed whatever did not look like a pointer key and
+        # loaded with strict=False, which turned an architecture mismatch, a
+        # renaming bug, and an intended partial transfer into the same silent
+        # success.
+        try:
+            if detect_state_dict_model_type(state_dict) == "baseline":
+                randomly_initialized = load_baseline_weights_into_pointer(model, state_dict)
+                if randomly_initialized:
+                    print(
+                        f"WARNING: '{args.checkpoint}' is a baseline checkpoint; "
+                        f"{', '.join(randomly_initialized)} is randomly initialized, so "
+                        "argument selection is not a prediction."
+                    )
+            else:
+                load_state_dict_checked(model, state_dict)
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            return 1
+        model = model.to(device)
+
+    model.eval()
 
     # Build scorer and load trained weights
-    scorer = PremiseScorer(hidden_dim=config.model.hidden_dim, mode=args.scorer_mode).to(device)
-    if args.scorer_checkpoint:
-        scorer_ckpt_path = Path(args.scorer_checkpoint)
-        if scorer_ckpt_path.exists():
-            scorer_ckpt = torch.load(scorer_ckpt_path, map_location=device, weights_only=False)
-            # Checkpoints from train_scorer save under 'scorer_state_dict'
-            if "scorer_state_dict" in scorer_ckpt:
-                scorer.load_state_dict(scorer_ckpt["scorer_state_dict"])
-                print(f"Loaded trained scorer weights from {scorer_ckpt_path}")
+    if scorer is None:
+        if args.scorer_checkpoint:
+            scorer_ckpt_path = Path(args.scorer_checkpoint)
+            if scorer_ckpt_path.exists():
+                scorer_ckpt = torch.load(scorer_ckpt_path, map_location=device, weights_only=False)
+                # Checkpoints from train_scorer save under 'scorer_state_dict'
+                scorer_state = scorer_ckpt.get("scorer_state_dict", scorer_ckpt)
+                # The scoring mode is determined by the weights: only mode="mlp"
+                # creates a "scorer" submodule. Reading it beats taking it as a
+                # flag, which can disagree with the file it is describing.
+                scorer_mode = (
+                    "mlp"
+                    if any(str(key).startswith("scorer.") for key in scorer_state)
+                    else "dot"
+                )
+                scorer = PremiseScorer(hidden_dim=hidden_dim, mode=scorer_mode)
+                try:
+                    load_state_dict_checked(scorer, scorer_state)
+                except ValueError as exc:
+                    print(f"ERROR: {exc}")
+                    return 1
+                scorer = scorer.to(device)
+                print(f"Loaded trained {scorer_mode} scorer weights from {scorer_ckpt_path}")
             else:
-                # Fallback: the file itself may be a raw state dict
-                scorer.load_state_dict(scorer_ckpt)
-                print(f"Loaded scorer weights (raw state dict) from {scorer_ckpt_path}")
+                print(f"WARNING: scorer checkpoint not found at {scorer_ckpt_path} — using random weights.")
+                scorer = PremiseScorer(hidden_dim=hidden_dim, mode="dot").to(device)
         else:
-            print(f"WARNING: scorer checkpoint not found at {scorer_ckpt_path} — using random weights.")
-    else:
-        print("WARNING: No --scorer-checkpoint provided. PremiseScorer is using RANDOM weights.")
-    
+            print("WARNING: No --scorer-checkpoint provided. PremiseScorer is using RANDOM weights.")
+            scorer = PremiseScorer(hidden_dim=hidden_dim, mode="dot").to(device)
+    scorer.eval()
     # Load index if provided
     lemma_index = None
     if args.index_path:
@@ -106,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
         # Create an empty index as fallback
         import faiss
         import numpy as np
-        d = config.model.hidden_dim
+        d = hidden_dim
         lemma_index = LemmaIndex(
             index=faiss.IndexFlatL2(d),
             lemma_ids=[],

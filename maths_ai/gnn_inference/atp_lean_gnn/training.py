@@ -7,7 +7,7 @@ import json
 import os
 import random
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -417,6 +417,36 @@ class PreparedMetadata:
     manifests: dict[str, dict[str, object]]
     state_label_id: int
     unknown_tactic_id: int
+
+    @classmethod
+    def from_vocabs(
+        cls,
+        *,
+        node_vocab: dict[str, int],
+        tactic_vocab: dict[str, int],
+        root: Path | None = None,
+    ) -> "PreparedMetadata":
+        """Build metadata from vocabularies alone, with no dataset on disk.
+
+        Inference needs only the two vocabularies: they fix the sizes of the
+        label embedding and the tactic classifier, and both derived IDs below
+        come from them.  ``manifests`` is read only by :meth:`split_manifest`
+        and :meth:`split_pyg_dir`, which are training paths, so leaving it empty
+        is what lets a published model be served without shipping the corpus it
+        was trained on.
+        """
+        if "State" not in node_vocab:
+            raise ValueError("Node vocab does not contain the required 'State' token.")
+        if UNKNOWN_TACTIC not in tactic_vocab:
+            raise ValueError(f"Tactic vocab does not contain '{UNKNOWN_TACTIC}'.")
+        return cls(
+            root=Path(root) if root is not None else Path("."),
+            node_vocab=dict(node_vocab),
+            tactic_vocab=dict(tactic_vocab),
+            manifests={},
+            state_label_id=node_vocab["State"],
+            unknown_tactic_id=tactic_vocab[UNKNOWN_TACTIC],
+        )
 
     def split_manifest(self, split: str) -> dict[str, object]:
         canonical_split = canonicalize_split_name(split)
@@ -1207,6 +1237,19 @@ def build_pointer_model(metadata: PreparedMetadata, config: PointerConfig) -> Ta
     )
 
 
+def detect_state_dict_model_type(state_dict: Mapping[str, Any]) -> str:
+    """Return ``"pointer"`` or ``"baseline"`` for a checkpoint's weights.
+
+    Neither ``BaselineConfig.to_dict`` nor ``PointerConfig.to_dict`` records the
+    model type, so the weights are the only reliable witness.  A
+    ``TacticWithArgsClassifier`` holds its baseline in ``self.backbone``, so that
+    prefix is present in a pointer state dict and absent from a baseline one.
+    """
+    if any(str(key).startswith("backbone.") for key in state_dict):
+        return "pointer"
+    return "baseline"
+
+
 def _stable_vocab_sha256(vocab: dict[str, int]) -> str:
     payload = json.dumps(
         vocab,
@@ -1266,7 +1309,7 @@ def initialize_pointer_from_baseline_checkpoint(
             f"Baseline initialization checkpoint '{source_path}' is missing "
             "a model_state_dict."
         )
-    if any(str(key).startswith("backbone.") for key in state_dict):
+    if detect_state_dict_model_type(state_dict) == "pointer":
         raise ValueError(
             f"Pointer initialization checkpoint '{source_path}' contains a pointer "
             "model, not a baseline model. Use --resume-run-dir to resume a pointer run."
@@ -1319,22 +1362,50 @@ def initialize_pointer_from_baseline_checkpoint(
             + "; ".join(incompatibilities)
         )
 
-    try:
-        baseline_metadata = load_prepared_metadata(baseline_config.prepared_root)
-    except (FileNotFoundError, ValueError) as exc:
-        raise ValueError(
-            "Cannot validate baseline checkpoint vocabularies because its prepared "
-            f"dataset is unavailable or invalid at '{baseline_config.prepared_root}': {exc}"
-        ) from exc
+    # Where the baseline's vocabularies come from decides how trustworthy this
+    # check is.  A checkpoint that carries its own vocabularies states what the
+    # weights were actually trained against; falling back to the prepared root
+    # only reads what happens to sit at that path today, which may have been
+    # rebuilt since.  Prefer the embedded copy, accept the path for checkpoints
+    # written before they were embedded, and name which was used in any error so
+    # a mismatch is attributable.
+    embedded_node_vocab = checkpoint.get("node_vocab")
+    embedded_tactic_vocab = checkpoint.get("tactic_vocab")
+    if isinstance(embedded_node_vocab, dict) and isinstance(embedded_tactic_vocab, dict):
+        baseline_node_vocab = {
+            str(key): int(value) for key, value in embedded_node_vocab.items()
+        }
+        baseline_tactic_vocab = {
+            str(key): int(value) for key, value in embedded_tactic_vocab.items()
+        }
+        vocab_source = f"the vocabularies embedded in '{source_path}'"
+        baseline_metadata = PreparedMetadata.from_vocabs(
+            node_vocab=baseline_node_vocab,
+            tactic_vocab=baseline_tactic_vocab,
+            root=baseline_config.prepared_root,
+        )
+    else:
+        try:
+            baseline_metadata = load_prepared_metadata(baseline_config.prepared_root)
+        except (FileNotFoundError, ValueError) as exc:
+            raise ValueError(
+                "Baseline checkpoint does not carry its own vocabularies, so they must "
+                "be read from its prepared dataset, which is unavailable or invalid at "
+                f"'{baseline_config.prepared_root}': {exc}"
+            ) from exc
+        vocab_source = (
+            f"the prepared dataset at '{baseline_config.prepared_root}' (the checkpoint "
+            "predates embedded vocabularies)"
+        )
     if baseline_metadata.node_vocab != metadata.node_vocab:
         raise ValueError(
-            "Baseline and pointer node vocabularies differ; refusing to transfer "
-            "label embeddings with incompatible token IDs."
+            f"Baseline and pointer node vocabularies differ, according to {vocab_source}; "
+            "refusing to transfer label embeddings with incompatible token IDs."
         )
     if baseline_metadata.tactic_vocab != metadata.tactic_vocab:
         raise ValueError(
-            "Baseline and pointer tactic vocabularies differ; refusing to transfer "
-            "the tactic classifier with incompatible class IDs."
+            f"Baseline and pointer tactic vocabularies differ, according to {vocab_source}; "
+            "refusing to transfer the tactic classifier with incompatible class IDs."
         )
 
     baseline_model = build_baseline_model(baseline_metadata, baseline_config)
@@ -1360,6 +1431,11 @@ def initialize_pointer_from_baseline_checkpoint(
         "source_checkpoint_sha256": _file_sha256(source_path),
         "source_epoch": int(checkpoint.get("epoch", 0)),
         "source_prepared_root": str(baseline_config.prepared_root),
+        "source_vocab_origin": (
+            "checkpoint"
+            if isinstance(checkpoint.get("node_vocab"), dict)
+            else "prepared_root"
+        ),
         "source_node_vocab_sha256": _stable_vocab_sha256(
             baseline_metadata.node_vocab
         ),
@@ -1624,9 +1700,22 @@ def _save_checkpoint(
     model: GraphSAGEStateClassifier | TacticWithArgsClassifier,
     optimizer: AdamW,
     config: BaselineConfig | PointerConfig,
+    metadata: PreparedMetadata,
     epoch: int,
     val_metrics: dict[str, float | int],
 ) -> Path:
+    """Write a resumable checkpoint that also carries its own vocabularies.
+
+    Weights alone are not a model.  Node IDs index the label embedding and
+    tactic IDs index the classifier, and both are assigned by position in a
+    sorted set, so weights are meaningless without the exact mapping they were
+    trained against.  A config records the prepared root only as a path, which
+    is worthless once the checkpoint moves to another machine and dangerous if
+    that path now holds a rebuilt corpus: a vocabulary of the same length but a
+    different order loads cleanly and mislabels every prediction.  Embedding the
+    vocabularies and their hashes makes the checkpoint self-describing and makes
+    that mismatch detectable instead of silent.
+    """
     torch.save(
         {
             "epoch": epoch,
@@ -1634,6 +1723,10 @@ def _save_checkpoint(
             "model_state_dict": _unwrap_model(model).state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "val_metrics": val_metrics,
+            "node_vocab": metadata.node_vocab,
+            "tactic_vocab": metadata.tactic_vocab,
+            "node_vocab_sha256": _stable_vocab_sha256(metadata.node_vocab),
+            "tactic_vocab_sha256": _stable_vocab_sha256(metadata.tactic_vocab),
         },
         path,
     )
@@ -1834,6 +1927,7 @@ def train_baseline(
             model=model,
             optimizer=optimizer,
             config=config,
+            metadata=metadata,
             epoch=epoch,
             val_metrics=val_metrics,
         )
@@ -1850,6 +1944,7 @@ def train_baseline(
                 model=model,
                 optimizer=optimizer,
                 config=config,
+                metadata=metadata,
                 epoch=epoch,
                 val_metrics=val_metrics,
             )
@@ -2145,6 +2240,7 @@ def train_pointer(
             model=model,
             optimizer=optimizer,
             config=config,
+            metadata=metadata,
             epoch=epoch,
             val_metrics=val_metrics,
         )
@@ -2161,6 +2257,7 @@ def train_pointer(
                 model=model,
                 optimizer=optimizer,
                 config=config,
+                metadata=metadata,
                 epoch=epoch,
                 val_metrics=val_metrics,
             )

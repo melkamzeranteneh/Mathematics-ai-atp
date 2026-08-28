@@ -26,12 +26,21 @@ if __package__ in {None, ""}:
     if repo_root_str not in sys.path:
         sys.path.insert(0, repo_root_str)
 
+from maths_ai.gnn_inference.atp_lean_gnn.bundle import (
+    load_baseline_weights_into_pointer,
+    load_state_dict_checked,
+)
 from maths_ai.gnn_inference.atp_lean_gnn.lemma_index import LemmaIndex
 from maths_ai.gnn_inference.atp_lean_gnn.logger import TrainingLogger
 from maths_ai.gnn_inference.atp_lean_gnn.premise_scoring import PremiseScorer, PremiseScorerConfig
 from maths_ai.gnn_inference.atp_lean_gnn.premise_training import evaluate_model_with_premises, train_one_epoch_with_premises
 from maths_ai.gnn_inference.atp_lean_gnn.reporting import console_print
-from maths_ai.gnn_inference.atp_lean_gnn.training import build_dataloaders, load_pointer_config, load_prepared_metadata
+from maths_ai.gnn_inference.atp_lean_gnn.training import (
+    build_dataloaders,
+    detect_state_dict_model_type,
+    load_pointer_config,
+    load_prepared_metadata,
+)
 
 
 def _create_run_dir(run_root: Path) -> Path:
@@ -88,27 +97,37 @@ def main(argv: list[str] | None = None) -> int:
         dropout=config.model.dropout,
         use_node_type=config.use_node_type,
         max_args=getattr(config, "max_args", 3),
+        gnn_type=config.gnn_type,
+        heads=getattr(config.model, "heads", 8),
+        readout=getattr(config.model, "readout", "state"),
     )
-    
+
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-    
-    # Adjust state dict keys if they come from a pure baseline (GraphSAGEStateClassifier)
-    adjusted_state_dict = {}
-    for k, v in state_dict.items():
-        if not k.startswith("backbone.") and not k.startswith("tactic_embedding.") and not k.startswith("argument_selector."):
-            adjusted_state_dict[f"backbone.{k}"] = v
-        else:
-            adjusted_state_dict[k] = v
-            
-    model.load_state_dict(adjusted_state_dict, strict=False)
 
-    has_trained_tactic_embedding = any(
-        k.startswith("tactic_embedding.") for k in adjusted_state_dict
-    )
-    if not has_trained_tactic_embedding:
-        with torch.no_grad():
-            model.tactic_embedding.weight.copy_(model.backbone.classifier.weight)
+    # Decide from the weights' own key structure whether this is a baseline that
+    # has to be wrapped into the pointer shell or a pointer to load as-is, then
+    # load strictly either way. The previous version prefixed anything that did
+    # not look like a pointer key and loaded with strict=False, which made an
+    # architecture mismatch and an intended partial transfer indistinguishable --
+    # a checkpoint trained on a different vocabulary would have started training
+    # from partly random weights without a word.
+    if detect_state_dict_model_type(state_dict) == "baseline":
+        randomly_initialized = load_baseline_weights_into_pointer(model, state_dict)
+        console_print(
+            f"Initialized from baseline checkpoint {args.checkpoint}; "
+            f"tactic_embedding seeded from the baseline classifier"
+            + (
+                f", {', '.join(randomly_initialized)} randomly initialized."
+                if randomly_initialized
+                else "."
+            )
+        )
+    else:
+        load_state_dict_checked(model, state_dict)
+        if not any(str(k).startswith("tactic_embedding.") for k in state_dict):
+            with torch.no_grad():
+                model.tactic_embedding.weight.copy_(model.backbone.classifier.weight)
 
     # Freeze the GNN backbone (keeps embeddings compatible with FAISS index)
     for param in model.backbone.parameters():
@@ -188,11 +207,19 @@ def main(argv: list[str] | None = None) -> int:
 
         if val_metrics["premise_mrr"] > best_val_mrr:
             best_val_mrr = val_metrics["premise_mrr"]
+            # The config and both vocabularies ride along for the same reason
+            # _save_checkpoint carries them: this checkpoint holds a fine-tuned
+            # pointer whose tactic IDs and node IDs are only meaningful against
+            # the exact vocabularies it trained on, and a path to the prepared
+            # root is not a substitute for the mapping itself.
             torch.save({
                 "epoch": epoch,
+                "config": config.to_dict(),
                 "model_state_dict": model.state_dict(),
                 "scorer_state_dict": scorer.state_dict(),
                 "val_metrics": val_metrics,
+                "node_vocab": metadata.node_vocab,
+                "tactic_vocab": metadata.tactic_vocab,
             }, run_dir / "best.pt")
 
         logger.log_epoch(
