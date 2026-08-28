@@ -32,11 +32,54 @@ _NO_ARGS_TACTICS = frozenset({"constructor", "assumption", "trivial", "omega", "
 # Everything else (exact, apply, refine, rw, simp, ...): accept unified pool
 
 
-def _resolve_local_node_name(node: GraphNode, dag: DAGBuilder) -> str:
-    """Attempt to extract a readable hypothesis or variable name from a node."""
+_FV_LABEL_RE = re.compile(r"^FV(\d+)$")
+
+
+def _local_names_by_fv_label(dag: DAGBuilder) -> dict[str, str]:
+    """Map each ``FV{i}`` pointer label to the Lean name of the local it denotes.
+
+    Structured hypothesis nodes are ``Hyp(FV{i}, name, HypRole:role, type)``, so
+    the graph already carries the correspondence and no side table has to be
+    threaded in from the caller.  Legacy two-child ``Hyp(name, type)`` nodes have
+    no ``FV{i}`` child and contribute nothing.
+    """
+    names: dict[str, str] = {}
+    for node in dag.nodes:
+        if node.label != "Hyp" or len(node.children) != 4:
+            continue
+        context_label = dag.nodes[node.children[0]].label
+        if _FV_LABEL_RE.match(context_label):
+            names[context_label] = dag.nodes[node.children[1]].label
+    return names
+
+
+def _resolve_local_node_name(
+    node: GraphNode,
+    dag: DAGBuilder,
+    local_names: dict[str, str] | None = None,
+) -> str:
+    """Extract a Lean-usable name for a selected local-context node.
+
+    Both shapes of hypothesis node appear, and the name sits at a different
+    child index in each: structured nodes are ``Hyp(FV{i}, name, HypRole:role,
+    type)`` and legacy ones are ``Hyp(name, type)``.  Reading ``children[0]``
+    unconditionally returns ``"FV3"`` for a structured node, which is not Lean.
+
+    The pointer head can also select a bare ``FV{i}`` node directly, since those
+    are premise-selectable in their own right.  ``local_names`` — from
+    ``_local_names_by_fv_label`` — resolves those back to a name.
+
+    A name the model cannot use still comes back as-is: an anonymous local is
+    ``"_"``, and a local whose inaccessible marker was sanitized upstream may be
+    ``"p✝"``.  Neither is valid in a tactic, and neither is filtered here,
+    because dropping arguments silently would change the arity a caller gets
+    back.
+    """
     if node.label == "Hyp" and node.children:
-        name_node = dag.nodes[node.children[0]]
-        return name_node.label
+        name_index = 1 if len(node.children) == 4 else 0
+        return dag.nodes[node.children[name_index]].label
+    if local_names and _FV_LABEL_RE.match(node.label):
+        return local_names.get(node.label, node.label)
     return node.label
 
 
@@ -169,14 +212,18 @@ class InferencePipeline:
 
     @torch.no_grad()
     def predict_from_goal_state(self, goal_state, *, top_k: int = 1) -> InferenceResult:
-        """Predict tactics from a Pantograph GoalState with S-expressions.
+        """Predict tactics from a Pantograph ``GoalState``.
 
-        This method extracts S-expressions from the GoalState (requires
-        patch_pantograph_for_sexp() to have been called) and builds the DAG
-        directly from S-expressions for both goal and hypothesis types.
+        The DAG is built from the goal's and hypotheses' model S-expressions
+        rather than from parsed text, which is what the model was trained on.
+        Requires ``patch_pantograph_for_sexp()`` to have been called before the
+        state was parsed, and the server to have been created with
+        ``MODEL_SEXPR_SERVER_OPTIONS``.
+
+        ``goal_state`` must come from a tactic application; see
+        ``goal_state_to_proof_state`` for why a state from ``goal_start`` does
+        not carry the fields this needs.
         """
-        from .graph import goal_state_to_proof_state, proof_state_to_dag
-        
         text_state, hyp_sexps, goal_sexp = goal_state_to_proof_state(goal_state)
         dag = proof_state_to_dag(text_state, goal_sexp=goal_sexp, hyp_sexps=hyp_sexps)
         return self._predict_from_dag(dag, top_k=top_k)
@@ -222,6 +269,9 @@ class InferencePipeline:
             k=self.k,
         )
         pool = pools[0]
+        # Built once: the pointer head may select the same `FV{i}` node for
+        # several tactic candidates, and the walk is over every node in the DAG.
+        local_names = _local_names_by_fv_label(dag)
 
         top_tactic_predictions: list[dict[str, object]] = []
         for candidate in top_candidates:
@@ -293,7 +343,7 @@ class InferencePipeline:
                     idx = int(idx)
                     cid = pool.candidate_ids[idx]
                     node = dag.nodes[cid]
-                    arg_str = _resolve_local_node_name(node, dag)
+                    arg_str = _resolve_local_node_name(node, dag, local_names)
                     arguments.append(arg_str)
                     score_val = float(local_scores[local_sorted[rank]].item()) if len(local_indices) > 0 else 0.0
                     selected_argument_details.append(
@@ -330,7 +380,7 @@ class InferencePipeline:
 
                 if source == "local":
                     node = dag.nodes[cid]
-                    arg_str = _resolve_local_node_name(node, dag)
+                    arg_str = _resolve_local_node_name(node, dag, local_names)
                 else:
                     if self.lemma_corpus and cid in self.lemma_corpus:
                         arg_str = self.lemma_corpus[cid].name
@@ -371,17 +421,3 @@ class InferencePipeline:
             selected_argument_details=list(top1["selected_argument_details"]) if top1 else [],
             top_tactic_predictions=top_tactic_predictions,
         )
-
-    def predict_from_goal_state(
-        self, goal_state, *, top_k: int = 1
-    ) -> InferenceResult:
-        """Predict tactics from a Pantograph GoalState using S-expressions.
-
-        Requires Pantograph to be patched with `patch_pantograph_for_sexp()`
-        and Server created with `options={'printExprAST': True}`.
-        """
-        from .graph import goal_state_to_proof_state, proof_state_to_dag
-
-        text_state, hyp_sexps, goal_sexp = goal_state_to_proof_state(goal_state)
-        dag = proof_state_to_dag(text_state, goal_sexp=goal_sexp, hyp_sexps=hyp_sexps)
-        return self._predict_from_dag(dag, top_k=top_k)

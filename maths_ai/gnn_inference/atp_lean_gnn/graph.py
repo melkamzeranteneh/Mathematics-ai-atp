@@ -11,48 +11,188 @@ from maths_ai.pln_inference.metta.translator.translator_modules.parser import (
 )
 
 
+MODEL_SEXPR_SERVER_OPTIONS: dict[str, bool] = {
+    "printExprAST": True,
+    "printExprModelAST": True,
+}
+"""Server options ``patch_pantograph_for_sexp`` depends on.
+
+``printExprModelAST`` is an option of the fork (``jajos12/Pantograph``, branch
+``gnn-sexpr-v410``); upstream Pantograph does not have it and emits no
+``modelSexp``.  Pass this dict to ``Server.create(options=...)`` so the option
+set and the parser patch that reads its output cannot drift apart.
+"""
+
+
 def patch_pantograph_for_sexp() -> None:
-    """Monkey-patch Pantograph to return S-expressions instead of pretty-printed strings.
+    """Monkey-patch Pantograph so goal states carry S-expressions and pointer metadata.
 
-    After calling this, ``Goal.target`` and ``Variable.t`` will contain the
-    Lean S-expression (e.g. ``((:c Eq) (:c Nat) ...)``) instead of the
-    human-readable ``n = n`` form.
+    Three things change:
 
-    Must be called BEFORE creating a Server instance.
+    - ``parse_expr`` returns the *normalized* model S-expression in preference to
+      the raw one, falling back to the pretty-printed string.  So ``Goal.target``
+      and ``Variable.t`` become what the graph builder wants.
+    - ``Variable.parse`` retains the fields the stock frozen dataclass discards:
+      ``contextIndex``, ``binderRole``, ``isInstance``, ``isLet``, the internal
+      fvar name, and the pretty-printed type.  Without ``contextIndex`` there is
+      no way to build the shared ``FV{i}`` pointer node the model trained on.
+    - ``Goal.parse`` retains the goal's pretty-printed target and model
+      S-expression alongside the parsed ``target``.
+
+    Keeping the pretty-printed text is not optional.  A caller that rebuilds a
+    Lean state by feeding an expression back into ``goal.start`` needs surface
+    syntax; an S-expression there is a parse error.  Both representations
+    therefore travel together instead of one replacing the other, and
+    ``Variable.__str__`` deliberately keeps its pre-patch meaning — ``name :
+    pretty-printed type`` — so existing code that renders a local context as text
+    is unaffected.  A goal's ``target`` is a bare ``str`` with no such seam, so
+    callers needing its surface form must read ``goal.pp``.
+
+    Call this before any goal state is parsed, and create the server with
+    ``MODEL_SEXPR_SERVER_OPTIONS`` — the payload fields these patches read are
+    absent otherwise.  Calling it twice is a no-op.
     """
     import pantograph.expr as expr_mod
     import pantograph.server as server_mod
 
+    if getattr(expr_mod.Goal.parse, "_gnn_sexpr_patch", False):
+        return
+
     def _parse_expr_sexp(payload: dict) -> str:
-        return payload.get("sexp") or payload["pp"]
+        return payload.get("modelSexp") or payload.get("sexp") or payload["pp"]
+
+    @dataclass(frozen=True)
+    class SExprVariable(expr_mod.Variable):
+        """A ``Variable`` retaining the payload fields the stock class drops."""
+
+        pp: str | None = None
+        model_sexp: str | None = None
+        internal_name: str = ""
+        context_index: int | None = None
+        binder_role: str = ":explicit"
+        is_instance: bool = False
+        is_let: bool = False
+
+        def __str__(self) -> str:
+            # Pre-patch behaviour: the pretty-printed line, which is valid Lean
+            # surface syntax. ``self.t`` is the S-expression and is not.
+            name = self.name if self.name else "_"
+            result = f"{name} : {self.pp or self.t}"
+            if self.v:
+                result += f" := {self.v}"
+            return result
+
+    @dataclass(frozen=True)
+    class SExprGoal(expr_mod.Goal):
+        """A ``Goal`` retaining its target's pretty-printed and normalized forms."""
+
+        pp: str | None = None
+        model_sexp: str | None = None
+
+    def _parse_variable(payload: dict) -> expr_mod.Variable:
+        type_payload = payload.get("type") or {}
+        value_payload = payload.get("value")
+        context_index = payload.get("contextIndex")
+        return SExprVariable(
+            t=_parse_expr_sexp(type_payload),
+            v=_parse_expr_sexp(value_payload) if value_payload else None,
+            name=payload.get("userName"),
+            pp=type_payload.get("pp"),
+            model_sexp=type_payload.get("modelSexp"),
+            internal_name=str(payload.get("name") or ""),
+            context_index=context_index if isinstance(context_index, int) else None,
+            binder_role=str(payload.get("binderRole") or ":explicit"),
+            is_instance=bool(payload.get("isInstance", False)),
+            is_let=bool(payload.get("isLet", False)),
+        )
+
+    # Delegate to upstream so the ``sibling_dep`` derivation stays in one place
+    # and cannot drift; only widen the result.  Captured before patching, so the
+    # idempotence guard above is what stops a chain of wrappers accumulating.
+    original_goal_parse = expr_mod.Goal.parse
+
+    def _parse_goal(payload: dict, sibling_map: dict[str, int]) -> expr_mod.Goal:
+        goal = original_goal_parse(payload, sibling_map)
+        target_payload = payload.get("target") or {}
+        return SExprGoal(
+            id=goal.id,
+            variables=goal.variables,
+            target=goal.target,
+            sibling_dep=goal.sibling_dep,
+            name=goal.name,
+            mode=goal.mode,
+            pp=target_payload.get("pp"),
+            model_sexp=target_payload.get("modelSexp"),
+        )
+
+    _parse_goal._gnn_sexpr_patch = True
 
     expr_mod.parse_expr = _parse_expr_sexp
     server_mod.parse_expr = _parse_expr_sexp
+    expr_mod.Variable.parse = staticmethod(_parse_variable)
+    expr_mod.Goal.parse = staticmethod(_parse_goal)
 
 
-def goal_state_to_proof_state(goal_state) -> tuple[str, list[tuple[str, str | None]], str | None]:
-    """Extract proof state components from a Pantograph GoalState.
+def goal_state_to_proof_state(
+    goal_state,
+) -> tuple[str, list[dict] | list[tuple[str, str | None]], str | None]:
+    """Extract proof state components from a Pantograph ``GoalState``.
 
-    Returns (text_state, hyp_sexps, goal_sexp) where:
+    Returns ``(text_state, hyp_sexps, goal_sexp)``, the triple
+    ``proof_state_to_dag`` takes, where:
 
-    - ``text_state``: human-readable text for the proof state (backward compat)
-    - ``hyp_sexps``: list of ``(name, type_sexp)`` for each hypothesis
-    - ``goal_sexp``: S-expression of the goal type, or None
+    - ``text_state`` is the pretty-printed proof state.  It is only a fallback
+      for callers that still parse text; the graph is built from the other two.
+    - ``hyp_sexps`` is one entry per local, in local-context order.  Each entry
+      is a dict carrying ``name``, ``internal_name``, ``context_index``,
+      ``binder_role``, ``is_instance``, ``is_let`` and ``sexp`` — the same shape
+      the extractor writes into ``model_sexpr_v2`` records, so the graph gets the
+      ``FV{i}`` pointer nodes the model trained on.  A local whose
+      ``context_index`` is missing degrades to the legacy ``(name, type_sexp)``
+      tuple, which builds a two-child ``Hyp`` node instead.
+    - ``goal_sexp`` is the model S-expression of the goal type, or ``None``.
 
-    Requires ``patch_pantograph_for_sexp()`` to have been called first.
+    Requires ``patch_pantograph_for_sexp()`` to have been called first, and the
+    server to have been created with ``MODEL_SEXPR_SERVER_OPTIONS``; without
+    both, every ``context_index`` is absent and every entry degrades.
+
+    ``goal_state`` must come from a tactic application.  ``Server.goal_start``
+    does not parse a REPL response at all — it fabricates a goal whose target is
+    the input string and whose local context is empty — so a state straight out
+    of ``goal_start`` yields no hypotheses and a ``goal_sexp`` that is Lean
+    source text, not an S-expression.
     """
     if not goal_state.goals:
         return "", [], None
 
     goal = goal_state.goals[0]
-    goal_sexp = goal.target  # Already an S-expression after patching
-    hyp_sexps = [(v.name or "_", v.t) for v in goal.variables]
+    goal_sexp = getattr(goal, "model_sexp", None) or goal.target
 
-    # Build text representation for backward compatibility
-    lines = []
-    for v in goal.variables:
-        lines.append(f"{v.name or '_'} : {v.t}")
-    text_state = "\n".join(lines) + f"\n⊢ {goal_sexp}" if lines else f"⊢ {goal_sexp}"
+    hyp_sexps: list = []
+    lines: list[str] = []
+    for variable in goal.variables:
+        name = variable.name or "_"
+        context_index = getattr(variable, "context_index", None)
+        if isinstance(context_index, int):
+            hyp_sexps.append(
+                {
+                    "name": name,
+                    "internal_name": getattr(variable, "internal_name", ""),
+                    "context_index": context_index,
+                    "binder_role": getattr(variable, "binder_role", ":explicit"),
+                    "is_instance": bool(getattr(variable, "is_instance", False)),
+                    "is_let": bool(getattr(variable, "is_let", False)),
+                    "sexp": getattr(variable, "model_sexp", None) or variable.t,
+                }
+            )
+        else:
+            hyp_sexps.append((name, variable.t))
+        # ``variable.t`` is an S-expression once patched, so prefer the retained
+        # pretty-printed type here; the text state has to stay readable Lean.
+        lines.append(f"{name} : {getattr(variable, 'pp', None) or variable.t}")
+
+    goal_text = getattr(goal, "pp", None) or goal_sexp
+    text_state = "\n".join(lines + [f"⊢ {goal_text}"])
 
     return text_state, hyp_sexps, goal_sexp
 

@@ -36,13 +36,20 @@ class GNNPredictor:
         self.device = device
 
         # Initialize Pantograph server for S-expression extraction
-        from maths_ai.gnn_inference.atp_lean_gnn.graph import patch_pantograph_for_sexp
+        from maths_ai.gnn_inference.atp_lean_gnn.graph import (
+            MODEL_SEXPR_SERVER_OPTIONS,
+            patch_pantograph_for_sexp,
+        )
         from pantograph.server import Server
         patch_pantograph_for_sexp()
+        # Mathlib has to be imported, not just Init: the training corpus was
+        # elaborated against full Mathlib, so with Init alone a large share of
+        # constant labels resolve differently or fall out of the node vocabulary,
+        # where `dag_to_pyg` maps them to `<UNK>` without raising.
         self._pantograph_server = Server.create(
             project_path=pantograph_project_path,
-            imports=["Init"],
-            options={"printExprAST": True},
+            imports=["Init", "Mathlib"],
+            options=dict(MODEL_SEXPR_SERVER_OPTIONS),
         )
 
     @torch.no_grad()
@@ -57,13 +64,19 @@ class GNNPredictor:
                 sorted by probability in descending order.
         """
         import asyncio
-        
+
         async def _predict():
             server = await self._pantograph_server
             goal = await server.goal_start_async(goal_expression)
+            # `goal_start` does not parse a REPL response: it returns a goal whose
+            # target is the input string verbatim and whose local context is
+            # empty, so no S-expression and no `contextIndex` exist yet. One
+            # `skip` costs nothing, leaves the goal unchanged, and makes the REPL
+            # send back a real serialized state that `GoalState.parse` reads.
+            goal = await server.goal_tactic_async(goal, "skip")
             result = self.pipeline.predict_from_goal_state(goal, top_k=top_k)
             return result.top_tactic_predictions
-        
+
         return asyncio.run(_predict())
 
     def close(self):
