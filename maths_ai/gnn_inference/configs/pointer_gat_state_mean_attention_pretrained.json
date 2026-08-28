@@ -9,7 +9,7 @@
   "gnn_type": "gat",
   "max_args": 3,
   "arg_loss_weight": 0.5,
-  "initialization_checkpoint": null,
+  "initialization_checkpoint": "maths_ai/gnn_inference/runs/baseline_gat_state_mean_attention/baseline_gnn/run_20260812_095829/best.pt",
   "model": {
     "hidden_dim": 128,
     "num_layers": 4,
