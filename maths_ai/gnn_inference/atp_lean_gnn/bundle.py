@@ -79,7 +79,11 @@ VALID_WEIGHTS_FORMATS = ("auto", "safetensors", "torch")
 # A pointer model built from baseline weights alone legitimately has these two
 # submodules left at their random initialization: the baseline has no argument
 # head, and its tactic embedding is seeded from the classifier afterwards.
-POINTER_RANDOM_PREFIXES = ("tactic_embedding.", "argument_selector.")
+POINTER_RANDOM_PREFIXES = (
+    "tactic_embedding.",
+    "argument_selector.",
+    "stop_head.",
+)
 
 BUNDLE_FORMAT_VERSION = 1
 
