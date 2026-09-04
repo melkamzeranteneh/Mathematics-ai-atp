@@ -65,6 +65,12 @@ class StateDictModelTypeTests(unittest.TestCase):
             "baseline",
         )
 
+    def test_detects_gru_pointer_state_dict_separately(self) -> None:
+        self.assertEqual(
+            detect_state_dict_model_type({"argument_selector.gru.weight_ih": torch.zeros(2)}),
+            "pointer_gru",
+        )
+
 
 class LoadStateDictCheckedTests(unittest.TestCase):
     def setUp(self) -> None:
