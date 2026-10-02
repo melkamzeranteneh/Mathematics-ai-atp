@@ -1,0 +1,3 @@
+# Use this only on a CPU server or when a CPU-only Laya run is acceptable.
+--index-url https://download.pytorch.org/whl/cpu
+torch>=2.12,<3

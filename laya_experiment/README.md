@@ -34,11 +34,22 @@ continuing:
 .venv/bin/python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
+For a CPU-only server, the repository provides a constrained install file:
+
+```bash
+.venv/bin/pip install -r laya_experiment/requirements-torch-cpu.txt
+```
+
+For a GPU server, install the matching Torch wheel from the official PyTorch
+index for that server's CUDA version instead. Do not install the CPU file on a
+GPU machine if CUDA acceleration is required.
+
 Then install Laya without dependency resolution so pip does not download a
 second, potentially incompatible CUDA stack:
 
 ```bash
 .venv/bin/pip install --no-deps -r laya_experiment/requirements-laya.txt
+.venv/bin/python -c "import torch, laya; print(torch.__version__, torch.cuda.is_available(), 'laya import: ok')"
 ```
 
 The core package dependencies are defined in the repository `pyproject.toml`.
