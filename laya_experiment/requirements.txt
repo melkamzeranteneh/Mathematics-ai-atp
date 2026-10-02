@@ -6,4 +6,4 @@ tqdm
 scikit-learn
 huggingface_hub
 safetensors
-laya
+transformers>=4.48,<5

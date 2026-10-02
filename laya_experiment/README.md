@@ -26,7 +26,26 @@ Use the repository virtual environment:
 .venv/bin/pip install -r laya_experiment/requirements.txt
 ```
 
-The core package dependencies are defined in the repository `pyproject.toml`. Laya is optional until a real reranking run is requested.
+This requirements file intentionally does not install `torch` or `laya`.
+Install a Torch build appropriate for the server first. Verify it before
+continuing:
+
+```bash
+.venv/bin/python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+Then install Laya without dependency resolution so pip does not download a
+second, potentially incompatible CUDA stack:
+
+```bash
+.venv/bin/pip install --no-deps -r laya_experiment/requirements-laya.txt
+```
+
+The core package dependencies are defined in the repository `pyproject.toml`.
+If the server has no compatible Torch build, install the correct CPU or CUDA
+wheel using the official PyTorch index before installing the files above. The
+original failure happened because pip selected a new CUDA Torch wheel and ran
+out of disk space while unpacking it.
 
 ## Lean translation
 

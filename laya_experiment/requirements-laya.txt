@@ -1,0 +1,3 @@
+# Install this file with --no-deps after installing a compatible torch build.
+# This prevents pip from replacing an existing CUDA/CPU Torch installation.
+laya==0.3.23
