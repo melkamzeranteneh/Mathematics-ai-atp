@@ -1,0 +1,9 @@
+numpy
+pandas
+pyarrow
+matplotlib
+tqdm
+scikit-learn
+huggingface_hub
+safetensors
+laya
